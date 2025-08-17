@@ -186,15 +186,20 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
     try:
         # --- Font Setup (Pillow) ---
-        font_path = "fonts/Montserrat-Bold.ttf" # ASSUMED PATH - CHANGE IF NEEDED
-        font_size = 25 # Adjust size as needed
+        font_size = 25  # Adjust size as needed
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        abs_font_path = os.path.normpath(os.path.join(base_dir, "..", "fonts", "Montserrat-Bold.ttf"))
+        font = None
         try:
-            font = ImageFont.truetype(font_path, font_size)
-            print(f"Successfully loaded font: {font_path}")
-        except IOError:
-            print(f"Error: Font file not found at {font_path}. Please check the path.")
-            print("Falling back to default Hershey font.")
-            font = None # Flag to use fallback
+            if os.path.exists(abs_font_path):
+                font = ImageFont.truetype(abs_font_path, font_size)
+                print(f"Successfully loaded font: {abs_font_path}")
+            else:
+                print(f"Font file not found at {abs_font_path}. Using PIL default font.")
+                font = ImageFont.load_default()
+        except Exception as e:
+            print(f"Warning: could not load TTF font at {abs_font_path}: {e}. Using PIL default font.")
+            font = ImageFont.load_default()
         # --- Pre-filter segments ---
         original_segments = transcription_result.get("segments", [])
         filtered_segments = [seg for seg in original_segments if seg.get('text', '').strip() != '[*]']
@@ -247,6 +252,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
             return False
 
         frame_count = 0
+        drawn_any_text = False
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -304,6 +310,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     stroke_width=stroke_width,
                     stroke_fill=stroke_color_rgb
                 )
+                drawn_any_text = True
 
                 # Convert back to OpenCV BGR format
                 frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
@@ -327,8 +334,8 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
         if out and out.isOpened():
             out.release()
 
-        # Proceed with muxing only if frames were processed and temp file exists
-        if frame_count > 0 and os.path.exists(temp_animated_video):
+        # Proceed with muxing only if frames were processed, some text was drawn, and temp file exists
+        if drawn_any_text and frame_count > 0 and os.path.exists(temp_animated_video):
              try:
                  print("Muxing audio into animated video...")
                  ffmpeg_mux_command = [
@@ -346,7 +353,6 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                  ]
                  cmd_string = ' '.join([str(arg) for arg in ffmpeg_mux_command])
                  print(f"Mux Command: {cmd_string}")
-                 # Increased timeout for potentially long muxing operation
                  process = subprocess.run(ffmpeg_mux_command, check=True, capture_output=True, text=True, timeout=300)
                  print(f"Successfully created animated caption video: {output_path}")
                  success = True
@@ -369,6 +375,15 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                          print(f"Removed temporary animated video: {temp_animated_video}")
                      except Exception as e_clean:
                          print(f"Warning: Could not remove temp animated file: {e_clean}")
+        elif frame_count > 0 and os.path.exists(temp_animated_video):
+             print("No text was drawn on any frame; skipping audio muxing for animated captions.")
+             success = False
+             # Cleanup temp animated video file
+             try:
+                 os.remove(temp_animated_video)
+                 print(f"Removed temporary animated video: {temp_animated_video}")
+             except Exception as e_clean:
+                 print(f"Warning: Could not remove temp animated file: {e_clean}")
         elif not os.path.exists(temp_animated_video) and frame_count > 0:
              print(f"Error: Temp animated video file {temp_animated_video} not found, cannot mux audio.")
              success = False

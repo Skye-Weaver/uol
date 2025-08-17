@@ -56,37 +56,31 @@ def download_youtube_video(url):
             merged_output_file = os.path.join("videos", f"{yt.title}_merged.mp4")
             output_file = merged_output_file
             
-            # Prepare ffmpeg inputs
-            in_video = ffmpeg.input(video_file)
-            in_audio = ffmpeg.input(audio_file)
-            
-            # Prepare ffmpeg output arguments
-            output_args = {
-                "vcodec": "libx264",
-                "acodec": "aac",
-                "strict": "experimental",
-                "crf": "23", # Reasonable quality
-                "preset": "medium" # Encoding speed
-            }
-            
-            # Add size option ONLY if width and height were found
-            if selected_width and selected_height:
-                print(f"  Setting merge output size to: {selected_width}x{selected_height}")
-                output_args['s'] = f'{selected_width}x{selected_height}'
-            else:
-                print("  Warning: Could not determine resolution from selected stream, merge might use default size.")
-
-            # Create the output stream specification
-            merged_stream = ffmpeg.output(
-                in_video,         # Map video from video file
-                in_audio,         # Map audio from audio file
+            # Быстрое объединение без перекодирования (copy)
+            print("  Выполняется быстрое объединение без перекодирования (copy)...")
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "info",
+                "-y",
+                "-i", video_file,
+                "-i", audio_file,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                "-shortest",
                 merged_output_file,
-                **output_args     # Pass arguments dictionary
-            )
-            
-            # Run the merge command
-            print(f"  Running merge command: {ffmpeg.compile(merged_stream)}")
-            ffmpeg.run(merged_stream, overwrite_output=True)
+            ]
+            print(f"  Запуск команды слияния: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                print("  Ошибка: ffmpeg завершился с ненулевым кодом возврата.")
+                print(f"  Код возврата: {result.returncode}")
+                print(f"  stderr ffmpeg:\n{result.stderr.strip()}")
+                print(f"  Команда: {' '.join(cmd)}")
+                return None
 
             os.remove(video_file)
             os.remove(audio_file)

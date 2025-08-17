@@ -292,25 +292,31 @@ def process_video(url: str = None, local_path: str = None):
                 
                 # 5. Handle Captioning Result
                 if not captioning_success:
-                    print(f"Caption generation failed for highlight {i+1}. Skipping.")
-                    # Cleanup intermediate files 
-                    if os.path.exists(temp_segment): 
-                        try: os.remove(temp_segment)
-                        except Exception as clean_e: 
-                            print(f"Warning: Could not remove temp segment file: {clean_e}")
-                    if os.path.exists(cropped_vertical_temp): # Use correct variable name
-                        try: os.remove(cropped_vertical_temp)
-                        except Exception as clean_e: 
-                            print(f"Warning: Could not remove temp vertical file: {clean_e}")
-                    if os.path.exists(cropped_vertical_final): # Use correct variable name
-                        try: os.remove(cropped_vertical_final)
-                        except Exception as clean_e: 
-                            print(f"Warning: Could not remove final vertical file: {clean_e}")
-                    if segment_audio_path and os.path.exists(segment_audio_path): 
-                        try: os.remove(segment_audio_path)
-                        except Exception as clean_e: 
-                            print(f"Warning: Could not remove segment audio file: {clean_e}")
-                    continue
+                    print(f"Animated caption generation failed for highlight {i+1}. Attempting ASS burn fallback...")
+                    # Try fallback with ASS burning
+                    fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions, start, stop, final_output_with_captions)
+                    if not fallback_success:
+                        print(f"ASS fallback failed for highlight {i+1}. Skipping.")
+                        # Cleanup intermediate files
+                        if os.path.exists(temp_segment):
+                            try: os.remove(temp_segment)
+                            except Exception as clean_e:
+                                print(f"Warning: Could not remove temp segment file: {clean_e}")
+                        if os.path.exists(cropped_vertical_temp): # Use correct variable name
+                            try: os.remove(cropped_vertical_temp)
+                            except Exception as clean_e:
+                                print(f"Warning: Could not remove temp vertical file: {clean_e}")
+                        if os.path.exists(cropped_vertical_final): # Use correct variable name
+                            try: os.remove(cropped_vertical_final)
+                            except Exception as clean_e:
+                                print(f"Warning: Could not remove final vertical file: {clean_e}")
+                        if segment_audio_path and os.path.exists(segment_audio_path):
+                            try: os.remove(segment_audio_path)
+                            except Exception as clean_e:
+                                print(f"Warning: Could not remove segment audio file: {clean_e}")
+                        continue
+                    else:
+                        captioning_success = True
 
                 # --- Success for this highlight --- 
                 print(f"Successfully processed highlight {i+1}.")
