@@ -23,32 +23,35 @@ model = "gemini-2.5-flash"
 # Вспомогательная функция: безопасная сборка конфигурации генерации с поддержкой Thinking (если доступно в SDK)
 def make_generation_config(system_instruction_text: str, temperature: float = 0.2) -> types.GenerateContentConfig:
     """
-    Возвращает конфигурацию генерации с:
-    - системной инструкцией (на русском),
-    - response_mime_type='application/json' для строгого JSON,
-    - попыткой включить режим 'мышления' (Thinking) с бюджетом -1 и без возврата мыслей.
-    Если текущая версия google-genai не поддерживает поля Thinking, они тихо отключаются.
+    Собирает GenerateContentConfig согласно документации google-genai:
+    - system_instruction: строка (может быть Content, но здесь — строка).
+    - response_mime_type='application/json' для строгого JSON.
+    - thinking_config: types.ThinkingConfig(thinking_budget=-1, include_thoughts=False) для Gemini 2.5.
+      Если класс отсутствует или не поддерживается текущей версией SDK — используем конфигурацию без thinking_config.
     """
     base_kwargs = dict(
         temperature=temperature,
         response_mime_type="application/json",
-        system_instruction=[types.Part.from_text(text=system_instruction_text)],
+        system_instruction=system_instruction_text,
     )
-    # Попытка 1: топ‑уровневые параметры
-    try:
-        return types.GenerateContentConfig(**base_kwargs, thinkingBudget=-1, includeThoughts=False)
-    except TypeError:
-        pass
-    # Попытка 2: вложенный объект 'thinking'
-    try:
-        ThinkingConfig = getattr(types, "ThinkingConfig", None)
-        if ThinkingConfig is not None:
-            thinking = ThinkingConfig(budget_tokens=-1, include_thoughts=False)
-            return types.GenerateContentConfig(**base_kwargs, thinking=thinking)
-    except Exception:
-        pass
-    # Фолбэк: без Thinking
-    print("Предупреждение: текущая версия SDK не поддерживает параметры Thinking; режим размышлений отключён.")
+
+    # Предпочтительный путь (Python): вложенный thinking_config с корректными snake_case полями.
+    ThinkingConfig = getattr(types, "ThinkingConfig", None)
+    if ThinkingConfig is not None:
+        try:
+            return types.GenerateContentConfig(
+                **base_kwargs,
+                thinking_config=ThinkingConfig(
+                    thinking_budget=-1,      # динамическое мышление
+                    include_thoughts=False,  # не включать конспекты мыслей в ответ
+                ),
+            )
+        except Exception:
+            # Если валидация SDK не пропускает thinking_config, откатываемся на конфиг без мышления.
+            print("Предупреждение: ThinkingConfig недоступен/не совместим; продолжаю без thinking.")
+            return types.GenerateContentConfig(**base_kwargs)
+
+    # Фолбэк: нет ThinkingConfig в текущем SDK — работаем без мышления.
     return types.GenerateContentConfig(**base_kwargs)
 
 
