@@ -1,114 +1,146 @@
 import os
-from pytubefix import YouTube
-import ffmpeg
 import subprocess
-
-
-def get_video_size(stream):
-    return stream.filesize / (1024 * 1024)
+import glob
+import time
 
 
 def download_youtube_video(url):
+    """
+    Скачивает видео с YouTube устойчивым способом через yt-dlp, гарантируя итоговый MP4 без перекодирования.
+    Возвращает путь к мастер-файлу MP4 или None при ошибке.
+    """
     try:
-        yt = YouTube(url, "WEB")
+        out_dir = "videos"
+        os.makedirs(out_dir, exist_ok=True)
 
-        video_streams = yt.streams.filter(type="video").order_by("resolution").desc()
-        audio_stream = yt.streams.filter(only_audio=True).first()
+        # Основной путь: yt-dlp CLI, без интерактива
+        print("Использую yt-dlp для устойчивой загрузки (mp4+m4a, без перекодирования)…")
 
-        print("Available video streams:")
-        for i, stream in enumerate(video_streams):
-            size = get_video_size(stream)
-            stream_type = "Progressive" if stream.is_progressive else "Adaptive"
-            print(
-                f"{i}. Resolution: {stream.resolution}, Size: {size:.2f} MB, Type: {stream_type}"
-            )
+        format_str = "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+        out_tmpl = os.path.join(out_dir, "master-%(id)s.%(ext)s")
 
-        choice = int(input("Enter the number of the video stream to download: "))
-        selected_stream = video_streams[choice]
-        
-        # DEBUG: Print selected stream info
-        print(f"DEBUG: Selected Stream Info:")
-        print(f"  Resolution: {getattr(selected_stream, 'resolution', 'N/A')}")
-        print(f"  FPS: {getattr(selected_stream, 'fps', 'N/A')}")
-        print(f"  Mime Type: {getattr(selected_stream, 'mime_type', 'N/A')}")
-        print(f"  Is Progressive: {getattr(selected_stream, 'is_progressive', 'N/A')}")
-        # Try accessing width/height directly if available
-        selected_width = getattr(selected_stream, 'width', None)
-        selected_height = getattr(selected_stream, 'height', None)
-        print(f"  Reported Width: {selected_width}")
-        print(f"  Reported Height: {selected_height}")
+        cmd = [
+            "yt-dlp",
+            "-f", format_str,
+            "--merge-output-format", "mp4",
+            "-o", out_tmpl,
+            "--no-playlist",
+            "--no-warnings",
+            "--prefer-ffmpeg",
+            url,
+        ]
 
-        if not os.path.exists("videos"):
-            os.makedirs("videos")
+        start_time = time.time()
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-        print(f"Downloading video: {yt.title}")
-        video_file = selected_stream.download(
-            output_path="videos", filename_prefix="video_"
-        )
+        if result.returncode != 0:
+            print("Ошибка: yt-dlp завершился с ненулевым кодом возврата.")
+            print(f"Код возврата: {result.returncode}")
+            if result.stderr:
+                print("stderr yt-dlp:")
+                print(result.stderr.strip())
+            print("Команда:", " ".join(cmd))
+            print("Не удалось скачать видео даже через yt-dlp. Проверьте доступность URL и ffmpeg в PATH.")
+            return None
 
-        if not selected_stream.is_progressive:
-            print("Downloading audio...")
-            audio_file = audio_stream.download(
-                output_path="videos", filename_prefix="audio_"
-            )
+        # Поиск созданного мастер-файла mp4 (noplaylist=True -> один файл)
+        candidates = [
+            p for p in glob.glob(os.path.join(out_dir, "master-*.mp4"))
+            if os.path.getmtime(p) >= (start_time - 1.0)
+        ]
 
-            print("Merging video and audio...")
-            merged_output_file = os.path.join("videos", f"{yt.title}_merged.mp4")
-            output_file = merged_output_file
-            
-            # Быстрое объединение без перекодирования (copy)
-            print("  Выполняется быстрое объединение без перекодирования (copy)...")
-            cmd = [
+        if len(candidates) >= 1:
+            candidates.sort(key=os.path.getmtime, reverse=True)
+            final_path = candidates[0]
+            print(f"Загрузка через yt-dlp завершена. Итоговый файл: {final_path}")
+            return final_path
+
+        # Редкий случай: yt-dlp не объединил дорожки автоматически — пробуем быстрый merge
+        video_parts = [
+            p for p in glob.glob(os.path.join(out_dir, "master-*.mp4"))
+            if os.path.getmtime(p) >= (start_time - 1.0)
+        ]
+        audio_parts = [
+            p for p in glob.glob(os.path.join(out_dir, "master-*.m4a"))
+            if os.path.getmtime(p) >= (start_time - 1.0)
+        ]
+
+        # Сопоставляем по префиксу 'master-<id>'
+        def stem(path):
+            base = os.path.basename(path)
+            return os.path.splitext(base)[0]  # master-<id>
+
+        video_map = {stem(p): p for p in video_parts}
+        audio_map = {stem(p): p for p in audio_parts}
+        common = sorted(set(video_map.keys()) & set(audio_map.keys()), key=lambda s: os.path.getmtime(video_map[s]), reverse=True)
+
+        if common:
+            key = common[0]
+            v = video_map[key]
+            a = audio_map[key]
+            merged_final = os.path.join(out_dir, f"{key}.mp4")
+            tmp_out = merged_final + ".tmp"
+
+            print("Автослияние дорожек через ffmpeg (без перекодирования, copy)…")
+            merge_cmd = [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "info",
                 "-y",
-                "-i", video_file,
-                "-i", audio_file,
+                "-i", v,
+                "-i", a,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 "-shortest",
-                merged_output_file,
+                tmp_out,
             ]
-            print(f"  Запуск команды слияния: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if result.returncode != 0:
-                print("  Ошибка: ffmpeg завершился с ненулевым кодом возврата.")
-                print(f"  Код возврата: {result.returncode}")
-                print(f"  stderr ffmpeg:\n{result.stderr.strip()}")
-                print(f"  Команда: {' '.join(cmd)}")
+            print("Запуск команды слияния:", " ".join(merge_cmd))
+            mres = subprocess.run(merge_cmd, capture_output=True, text=True)
+            if mres.returncode != 0:
+                print("Ошибка: ffmpeg завершился с ненулевым кодом возврата.")
+                print(f"Код возврата: {mres.returncode}")
+                if mres.stderr:
+                    print("stderr ffmpeg:")
+                    print(mres.stderr.strip())
+                print("Команда:", " ".join(merge_cmd))
+                print("Не удалось объединить дорожки. Проверьте ffmpeg в PATH.")
                 return None
 
-            os.remove(video_file)
-            os.remove(audio_file)
-        else:
-            output_file = video_file
+            # Переименовываем временный файл в финальный
+            try:
+                if os.path.exists(merged_final):
+                    os.remove(merged_final)
+                os.replace(tmp_out, merged_final)
+                # Чистим части
+                try:
+                    os.remove(v)
+                except Exception:
+                    pass
+                try:
+                    os.remove(a)
+                except Exception:
+                    pass
+                print(f"Загрузка через yt-dlp завершена. Итоговый файл: {merged_final}")
+                return merged_final
+            except Exception as ren_e:
+                print(f"Ошибка при переименовании итогового файла: {ren_e}")
+                return None
 
-        print(f"Downloaded: {yt.title} to 'videos' folder")
-        print(f"File path: {output_file}")
-        return output_file
+        print("yt-dlp не создал финальный MP4 и не найдены пары mp4+m4a для слияния.")
+        return None
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        print(
-            "Please make sure you have the latest version of pytube and ffmpeg-python installed."
-        )
-        print("You can update them by running:")
-        print("pip install --upgrade pytube ffmpeg-python")
-        print(
-            "Also, ensure that ffmpeg is installed on your system and available in your PATH."
-        )
+        print(f"Непредвиденная ошибка при скачивании: {e}")
+        print("Не удалось скачать видео даже через yt-dlp. Проверьте доступность URL и ffmpeg в PATH.")
         return None
 
 
 if __name__ == "__main__":
     youtube_url = input("Enter YouTube video URL: ")
-    # Just call the download function for direct testing
     downloaded_file = download_youtube_video(youtube_url)
-    
     if downloaded_file:
         print(f"\nDownload finished. File available at: {downloaded_file}")
     else:
