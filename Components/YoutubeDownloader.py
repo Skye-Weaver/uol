@@ -108,7 +108,11 @@ def download_youtube_video(url):
 
             try:
                 print(f"Фолбэк: {lib} — пытаюсь скачать прогрессивный MP4…")
-                yt = YouTube(src_url)
+                # Имитируем поведение WEB‑клиента (для pytubefix) и отключаем OAuth/кэш.
+                if lib == "pytubefix":
+                    yt = YouTube(src_url, client="WEB", use_oauth=False, allow_oauth_cache=False)
+                else:
+                    yt = YouTube(src_url, use_oauth=False, allow_oauth_cache=False)
                 # Прогрессивный (видео+аудио в одном mp4)
                 stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
                 if stream:
