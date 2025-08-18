@@ -1,5 +1,5 @@
 from google import genai
-from typing import TypedDict, List, Optional, Any
+from typing import TypedDict, List, Optional, Any, Tuple, Dict
 import json
 import os
 import re # Import regex for parsing transcription
@@ -573,21 +573,81 @@ BATCH_METADATA_SYSTEM_PROMPT = """Ты — эксперт по SMM и продв
 Пример Выхода:
 [{"id":"seg_1","title":"Нейросеть находит лучшие моменты в видео?","description":"Смотрите, как ИИ анализирует ролики для создания шортсов.","hashtags":["#shorts","#ИИ","#нейросети","#видеомонтаж"]}]"""
 
+def _build_retry_prompt(
+    validation_tracker: Dict[str, Dict[str, Any]],
+    items_to_retry: Optional[List[dict]] = None,
+    *,
+    max_snippet_len: int = 500
+) -> str:
+    """
+    Строит user prompt для повторной отправки проблемных элементов.
+
+    Параметры:
+    - validation_tracker: словарь статусов вида {id: {"status","data","reason","original_item"}}
+    - items_to_retry: список исходных элементов {"id","text"} для повтора; если None — берутся со статусами pending/failed
+    - max_snippet_len: ограничение длины включаемого текста
+
+    Возвращает:
+    - Строку, которую следует передать как пользовательский prompt.
+    """
+    try:
+        if items_to_retry is None:
+            items_to_retry = []
+            for _id, st in validation_tracker.items():
+                if st and st.get("status") in ("pending", "failed"):
+                    orig = st.get("original_item") or {}
+                    if "id" not in orig:
+                        orig = {**orig, "id": _id}
+                    items_to_retry.append(orig)
+    except Exception:
+        items_to_retry = items_to_retry or []
+
+    lines: List[str] = []
+    lines.append("Нужно исправить ошибки для указанных id. Верни строго JSON-массив объектов с корректированными данными для этих id.")
+    lines.append("")
+    lines.append("Требования к каждому объекту ответа:")
+    lines.append("• Сохраняй поле id без изменений.")
+    lines.append("• Поля: title, description, hashtags.")
+    lines.append("• title: 40–70 символов (после тримминга).")
+    lines.append("• description: максимум 150 символов.")
+    lines.append("• hashtags: массив из 3–5 строк; первый элемент строго '#shorts'; все элементы начинаются с '#'.")
+    lines.append("")
+    lines.append("Проблемные элементы (id, причина и исходный текст):")
+    lines.append("")
+
+    for it in items_to_retry:
+        _id = str(it.get("id", ""))
+        st = validation_tracker.get(_id, {}) or {}
+        reason = st.get("reason") or "Причина не указана — см. требования валидации."
+        text = str(it.get("text", "") or "")
+        snippet = text.strip()
+        if len(snippet) > max_snippet_len:
+            snippet = snippet[:max_snippet_len].rstrip() + "..."
+        lines.append(f"- id: {_id}")
+        lines.append(f"  Причина ошибки: {reason}")
+        lines.append("  Исходный текст:")
+        lines.append(f'  """{snippet}"""')
+        lines.append("")
+
+    lines.append("Верни ТОЛЬКО JSON-массив следующего вида без пояснений:")
+    lines.append('[{"id":"<id>","title":"...","description":"...","hashtags":["#shorts","..."]}]')
+    return "\n".join(lines)
+
 def generate_metadata_batch(items: list[dict], max_attempts: int = 3) -> list[dict]:
     """
-    Пакетная генерация метаданных (title, description, hashtags) для сегментов.
+    Пакетная генерация метаданных (title, description, hashtags) для сегментов с таргетированными повторами.
 
     Параметры:
     - items: список словарей вида {"id": str, "text": str}
-    - max_attempts: количество повторных попыток при ошибках парсинга/валидации
+    - max_attempts: максимальное число итераций (первая — весь батч, далее — только проблемные)
 
     Возврат:
-    - список объектов {"id": str, "title": str, "description": str, "hashtags": list[str]} в исходном порядке items.
+    - список объектов {"id": str, "title": str, "description": str, "hashtags": list[str]} в порядке исходных items.
 
-    Валидация:
+    Валидация (правила НЕ изменены):
     - title: 40–70 символов (после trim)
     - description: длина ≤ 150 символов
-    - hashtags: массив длиной 3–5; первый элемент — "#shorts"; все элементы строки с префиксом "#".
+    - hashtags: массив длиной 3–5; первый элемент — "#shorts"; все элементы — строки, начинающиеся с "#".
     """
     if not items:
         print("Пакетная генерация метаданных: входных сегментов = 0")
@@ -595,7 +655,11 @@ def generate_metadata_batch(items: list[dict], max_attempts: int = 3) -> list[di
 
     print(f"Пакетная генерация метаданных: входных сегментов = {len(items)}")
 
-    generation_config = make_generation_config(BATCH_METADATA_SYSTEM_PROMPT, temperature=cfg.llm.temperature_metadata)
+    # Первая итерация — как и раньше: системный промпт из константы
+    generation_config_first = make_generation_config(
+        BATCH_METADATA_SYSTEM_PROMPT,
+        temperature=cfg.llm.temperature_metadata,
+    )
 
     def _clean_space(s: str) -> str:
         return re.sub(r"\s+", " ", s or "").strip()
@@ -619,69 +683,157 @@ def generate_metadata_batch(items: list[dict], max_attempts: int = 3) -> list[di
             return t[start:end+1].strip()
         return t
 
-    def _validate_item(obj: dict, expected_id: str) -> Optional[dict]:
+    def _validate_item(obj: dict, expected_id: str) -> Tuple[bool, Optional[str], Optional[dict]]:
+        """
+        Проверяет объект метаданных согласно неизменённым правилам.
+
+        Возвращает:
+        - success: bool
+        - reason: текст причины ошибки (рус.), если неуспех
+        - valid_data: нормализованный объект при успехе
+        """
         if not isinstance(obj, dict):
-            return None
+            return False, "Элемент ответа должен быть JSON-объектом (dict).", None
         obj_id = str(obj.get("id", ""))
         if obj_id != expected_id:
-            return None
+            return False, f"Неверный id: ожидалось '{expected_id}', получено '{obj_id}'.", None
+
         title = _clean_space(str(obj.get("title", "")))
         description = _clean_space(str(obj.get("description", "")))
         hashtags = obj.get("hashtags", [])
+
         if not (40 <= len(title) <= 70):
-            return None
+            return False, f"Некорректная длина title: {len(title)} символов; требуется 40–70.", None
         if len(description) > 150:
-            return None
-        if not isinstance(hashtags, list) or not (3 <= len(hashtags) <= 5):
-            return None
+            return False, f"Слишком длинный description: {len(description)} символов; максимум 150.", None
+        if not isinstance(hashtags, list):
+            return False, "hashtags должен быть списком из 3–5 строк.", None
+        if not (3 <= len(hashtags) <= 5):
+            return False, f"Некорректное количество хэштегов: {len(hashtags)}; требуется 3–5.", None
         if any(not isinstance(h, str) or not h.startswith("#") for h in hashtags):
-            return None
+            return False, "Все хэштеги должны быть строками и начинаться с '#'.", None
         if len(hashtags) == 0 or hashtags[0] != "#shorts":
-            return None
-        return {"id": expected_id, "title": title, "description": description, "hashtags": hashtags}
+            return False, "Первый хэштег должен быть '#shorts'.", None
 
-    best_by_id: dict = {}
-    N = len(items)
+        return True, None, {
+            "id": expected_id,
+            "title": title,
+            "description": description,
+            "hashtags": hashtags,
+        }
 
-    for attempt in range(1, max_attempts + 1):
-        print(f"Попытка {attempt} из {max_attempts} для batch-метаданных")
+    # Подготовка входных элементов и трекера валидации
+    items_prepared: List[dict] = []
+    ordered_ids: List[str] = []
+    validation_tracker: Dict[str, Dict[str, Any]] = {}
+
+    for idx, it in enumerate(items):
+        safe = dict(it or {})
+        id_val = safe.get("id")
+        if id_val is None or str(id_val).strip() == "":
+            id_val = f"item_{idx+1}"
+            safe["id"] = id_val
+        id_str = str(id_val)
+        if "text" in safe:
+            safe["text"] = str(safe["text"])
+        items_prepared.append(safe)
+        ordered_ids.append(id_str)
+        validation_tracker[id_str] = {
+            "status": "pending",       # "pending" | "success" | "failed"
+            "data": None,              # валидные данные при успехе
+            "reason": None,            # последняя причина отказа
+            "original_item": safe,     # исходный элемент {"id","text",...}
+        }
+
+    N = len(items_prepared)
+    effective_attempts = cfg.llm.max_attempts_metadata if max_attempts == 3 else max_attempts
+
+    attempt = 0
+    while attempt < effective_attempts:
+        attempt += 1
+
+        # Определяем поднабор для текущей попытки
+        if attempt == 1:
+            to_send = items_prepared
+        else:
+            to_send = [
+                validation_tracker[_id]["original_item"]
+                for _id in ordered_ids
+                if validation_tracker[_id]["status"] in ("pending", "failed")
+            ]
+
+        if not to_send:
+            # Все уже успешно провалидированы
+            break
+
+        print(f"Попытка {attempt} из {effective_attempts} для batch-метаданных ({len(to_send)} элементов)")
         try:
-            user_payload = json.dumps(items, ensure_ascii=False)
-            contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_payload)])]
+            if attempt == 1:
+                # Первая отправка — как раньше: весь вход и основной модель
+                user_payload = json.dumps(to_send, ensure_ascii=False)
+                contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_payload)])]
+                gen_cfg = generation_config_first
+                model_to_use = model
+            else:
+                # Повторы — только проблемные элементы, со вспомогательным prompt и лёгкой моделью
+                retry_prompt = _build_retry_prompt(validation_tracker, to_send)
+                contents = [types.Content(role="user", parts=[types.Part.from_text(text=retry_prompt)])]
+                # Системный промпт остаётся тем же, чтобы зафиксировать схему ответа
+                gen_cfg = make_generation_config(BATCH_METADATA_SYSTEM_PROMPT, temperature=cfg.llm.temperature_metadata)
+                model_to_use = "gemini-2.5-flash-lite"
+
             response = call_llm_with_retry(
-                system_instruction=None,
+                system_instruction=None,  # system_instruction уже в gen_cfg
                 content=contents,
-                generation_config=generation_config,
-                model=model,
+                generation_config=gen_cfg,
+                model=model_to_use,
             )
+
             if not response or not getattr(response, "text", None):
                 print(f"Неудача на попытке {attempt}: пустой ответ от LLM.")
                 continue
+
             raw_text = response.text
             json_str = _extract_json_array(raw_text)
             data = json.loads(json_str)
+
             if not isinstance(data, list):
                 print(f"Неудача на попытке {attempt}: ответ LLM не является JSON‑массивом.")
                 continue
 
-            out_by_id = {}
+            # Соберём кандидатов по id
+            out_by_id: Dict[str, Any] = {}
             for obj in data:
                 if isinstance(obj, dict) and "id" in obj:
                     out_by_id[str(obj["id"])] = obj
 
-            valid_this_attempt = 0
-            for it in items:
-                expected_id = str(it.get("id"))
+            validated_this_attempt = 0
+            expected_ids = [str(it.get("id")) for it in to_send]
+
+            for expected_id in expected_ids:
                 candidate = out_by_id.get(expected_id)
-                normalized = _validate_item(candidate, expected_id) if candidate is not None else None
-                if normalized:
-                    best_by_id[expected_id] = normalized
-                    valid_this_attempt += 1
+                if candidate is None:
+                    validation_tracker[expected_id]["status"] = "failed"
+                    validation_tracker[expected_id]["data"] = None
+                    validation_tracker[expected_id]["reason"] = f"Модель не вернула объект для id '{expected_id}'."
+                    continue
 
-            print(f"Batch-метаданные: успешно сгенерировано {valid_this_attempt} из {N}")
+                ok, reason, normalized = _validate_item(candidate, expected_id)
+                if ok and normalized:
+                    validation_tracker[expected_id]["status"] = "success"
+                    validation_tracker[expected_id]["data"] = normalized
+                    validation_tracker[expected_id]["reason"] = None
+                    validated_this_attempt += 1
+                else:
+                    validation_tracker[expected_id]["status"] = "failed"
+                    validation_tracker[expected_id]["data"] = None
+                    validation_tracker[expected_id]["reason"] = reason or "Нарушение правил валидации."
 
-            if valid_this_attempt == N:
-                return [best_by_id[str(it["id"])] for it in items]
+            total_success = sum(1 for st in validation_tracker.values() if st["status"] == "success")
+            print(f"Batch-метаданные: успешно сгенерировано за попытку {validated_this_attempt}, всего валидных {total_success} из {N}")
+
+            if total_success == N:
+                break
 
         except json.JSONDecodeError:
             print(f"Неудача на попытке {attempt}: некорректный JSON от LLM для batch-метаданных.")
@@ -690,20 +842,25 @@ def generate_metadata_batch(items: list[dict], max_attempts: int = 3) -> list[di
             continue
         except Exception as e:
             if _is_resource_exhausted_error(e):
+                # Внутренняя обёртка уже залогировала и управляла паузами; прекращаем дальнейшие итерации
                 break
             print(f"Неудача на попытке {attempt}: непредвиденная ошибка при batch-метаданных: {e}")
             if 'raw_text' in locals():
                 print(f"Сырой ответ LLM при ошибке: {raw_text}")
             continue
 
-    print("Batch-метаданные: ошибка парсинга/валидации, использованы плейсхолдеры")
-    results = []
-    for it in items:
-        key = str(it.get("id"))
-        if key in best_by_id:
-            results.append(best_by_id[key])
+    # Итоговая сборка по исходному порядку; для неуспехов — плейсхолдеры
+    if any(st["status"] != "success" for st in validation_tracker.values()):
+        print("Batch-метаданные: не все элементы прошли валидацию, для оставшихся будут использованы плейсхолдеры")
+
+    results: List[dict] = []
+    for _id in ordered_ids:
+        st = validation_tracker[_id]
+        if st["status"] == "success" and st["data"]:
+            results.append(st["data"])
         else:
-            results.append({"id": key, "title": "", "description": "", "hashtags": ["#shorts"]})
+            results.append({"id": _id, "title": "", "description": "", "hashtags": ["#shorts"]})
+
     return results
 
 # --- Updated Main Function ---
