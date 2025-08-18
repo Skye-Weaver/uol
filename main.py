@@ -18,6 +18,137 @@ SHORTS_DIR = "shorts"
 # Define the crop percentage for the bottom of the video (useful when there are integrated captions in the original video)
 CROP_PERCENTAGE_BOTTOM = 0
 
+# --- Transcriptions JSON helpers (non-blocking) ---
+def build_transcriptions_dir():
+    from pathlib import Path
+    return Path(__file__).resolve().parent / "transcriptions"
+
+
+def ensure_dir(path_like):
+    from pathlib import Path
+    p = Path(path_like)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
+def sanitize_base_name(name: str) -> str:
+    import re
+    from pathlib import Path
+    try:
+        base = Path(str(name)).stem
+    except Exception:
+        base = str(name)
+    base = base.replace(" ", "_").lower()
+    base = re.sub(r"[^A-Za-z0-9_-]", "", base)
+    return base
+
+
+def save_json_safely(data, path):
+    import json
+    from pathlib import Path
+    p = Path(path)
+    try:
+        ensure_dir(p)
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        try:
+            resolved = p.resolve()
+        except Exception:
+            resolved = str(p)
+        print(f"[WARN] Ошибка при сохранении файла: {resolved} – {e}")
+        return False
+
+
+def _to_float(val, default=None):
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def to_full_segments_payload(segments):
+    result = []
+    for seg in (segments or []):
+        start = 0.0
+        end = 0.0
+        text = ""
+        speaker = None
+        confidence = None
+        if isinstance(seg, dict):
+            start = _to_float(seg.get("start"), 0.0)
+            end = _to_float(seg.get("end"), 0.0)
+            text = str(seg.get("text", ""))
+            speaker_val = seg.get("speaker", None)
+            speaker = str(speaker_val) if speaker_val is not None else None
+            conf_val = seg.get("confidence", seg.get("prob", seg.get("probability", seg.get("score", None))))
+            confidence = _to_float(conf_val, None) if conf_val is not None else None
+        elif isinstance(seg, (list, tuple)) and len(seg) >= 3:
+            text = str(seg[0]) if seg[0] is not None else ""
+            start = _to_float(seg[1], 0.0)
+            end = _to_float(seg[2], 0.0)
+            speaker = None
+            confidence = None
+        else:
+            start = _to_float(getattr(seg, "start", 0.0), 0.0)
+            end = _to_float(getattr(seg, "end", 0.0), 0.0)
+            t = getattr(seg, "text", "")
+            text = str(t) if t is not None else ""
+            sp = getattr(seg, "speaker", None)
+            speaker = str(sp) if sp is not None else None
+            conf_val = getattr(seg, "confidence", None)
+            if conf_val is None:
+                for k in ("prob", "probability", "score"):
+                    if hasattr(seg, k):
+                        conf_val = getattr(seg, k)
+                        break
+            confidence = _to_float(conf_val, None) if conf_val is not None else None
+        result.append({"start": start, "end": end, "text": text, "speaker": speaker, "confidence": confidence})
+    return {"segments": result}
+
+
+def to_words_payload(word_level_result):
+    words = []
+    segments = []
+    if word_level_result is None:
+        return {"words": words}
+    if isinstance(word_level_result, dict):
+        segments = word_level_result.get("segments", [])
+        if not segments and "words" in word_level_result:
+            segments = [{"words": word_level_result.get("words", [])}]
+    else:
+        segments = getattr(word_level_result, "segments", []) or []
+    for seg in segments:
+        seg_words = seg.get("words", []) if isinstance(seg, dict) else getattr(seg, "words", []) or []
+        for w in seg_words:
+            if isinstance(w, dict):
+                start = _to_float(w.get("start", 0.0), 0.0)
+                end = _to_float(w.get("end", 0.0), 0.0)
+                word_val = w.get("word", w.get("text", ""))
+                conf_val = w.get("confidence", w.get("prob", w.get("probability", w.get("score", None))))
+            else:
+                start = _to_float(getattr(w, "start", 0.0), 0.0)
+                end = _to_float(getattr(w, "end", 0.0), 0.0)
+                word_val = getattr(w, "word", getattr(w, "text", ""))
+                conf_val = getattr(w, "confidence", None)
+                if conf_val is None:
+                    for k in ("prob", "probability", "score"):
+                        if hasattr(w, k):
+                            conf_val = getattr(w, k)
+                            break
+            words.append({
+                "start": start,
+                "end": end,
+                "word": str(word_val) if word_val is not None else "",
+                "confidence": _to_float(conf_val, None) if conf_val is not None else None
+            })
+    return {"words": words}
 def process_video(url: str = None, local_path: str = None):
     db = VideoDatabase()
     video_path = None
@@ -127,6 +258,15 @@ def process_video(url: str = None, local_path: str = None):
         transcriptions = transcribeAudio(audio_path)
         if transcriptions:
             db.add_transcription(video_id, transcriptions)
+            # Save full transcription JSON (non-blocking)
+            try:
+                base = sanitize_base_name(os.path.splitext(os.path.basename(video_path))[0])
+                payload = to_full_segments_payload(transcriptions)
+                target = build_transcriptions_dir() / f"{base}_full_segments.json"
+                save_json_safely(payload, target)
+            except Exception:
+                # Never interrupt the pipeline on save errors
+                pass
         else:
             print("Segment-level transcription failed. Cannot proceed.")
             return None
@@ -281,6 +421,15 @@ def process_video(url: str = None, local_path: str = None):
                         segment_audio_path = segment_audio_extracted_path 
                         
                     transcription_result = transcribe_segment_word_level(segment_audio_path)
+                    # Save words-level JSON for this highlight (non-blocking)
+                    try:
+                        base_sanitized = sanitize_base_name(os.path.splitext(os.path.basename(video_path))[0])
+                        words_payload = to_words_payload(transcription_result)
+                        target_words = build_transcriptions_dir() / f"{base_sanitized}_highlight_{i+1}_words.json"
+                        save_json_safely(words_payload, target_words)
+                    except Exception:
+                        # Never interrupt the pipeline on save errors
+                        pass
                     if transcription_result:
                         captioning_success = animate_captions(cropped_vertical_final, temp_segment, transcription_result, final_output_with_captions)
                     else:
@@ -420,3 +569,4 @@ if __name__ == "__main__":
             print(f"\nSuccess! Output saved to: {output}")
     else:
         print("\nProcessing failed or no shorts generated!")
+
