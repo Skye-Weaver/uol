@@ -186,7 +186,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
     try:
         # --- Font Setup (Pillow) ---
-        font_size = 25  # Adjust size as needed
+        font_size = 34  # Adjust size as needed
         base_dir = os.path.dirname(os.path.abspath(__file__))
         abs_font_path = os.path.normpath(os.path.join(base_dir, "..", "fonts", "Montserrat-Bold.ttf"))
         font = None

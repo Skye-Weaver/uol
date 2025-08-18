@@ -1,22 +1,29 @@
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
 from Components.Transcription import transcribeAudio, transcribe_segment_word_level
-from Components.LanguageTasks import GetHighlights
+from Components.LanguageTasks import GetHighlights, build_transcription_prompt
 from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
+from dataclasses import dataclass, field
+from typing import Optional, List
 import os
 import traceback
+from Components.config import get_config, AppConfig
 
-# --- Configuration Flags --- 
+# Load config once
+cfg = get_config()
+print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}")
+
+# --- Configuration Flags ---
 # Set to True to use two words-level animated captions (slower but nicer)
 # Set to False to use the default, faster ASS subtitle burning
-USE_ANIMATED_CAPTIONS = True
+USE_ANIMATED_CAPTIONS = cfg.processing.use_animated_captions
 
 # Define the output directory for final shorts
-SHORTS_DIR = "shorts"
+SHORTS_DIR = cfg.processing.shorts_dir
 
 # Define the crop percentage for the bottom of the video (useful when there are integrated captions in the original video)
-CROP_PERCENTAGE_BOTTOM = 0
+CROP_PERCENTAGE_BOTTOM = cfg.processing.crop_bottom_percent
 
 # --- Transcriptions JSON helpers (non-blocking) ---
 def build_transcriptions_dir():
@@ -126,6 +133,7 @@ def to_words_payload(word_level_result):
         segments = getattr(word_level_result, "segments", []) or []
     for seg in segments:
         seg_words = seg.get("words", []) if isinstance(seg, dict) else getattr(seg, "words", []) or []
+        # Wait: indentation alignment; ensure 8 spaces? We'll keep 8 spaces. We'll correct.
         for w in seg_words:
             if isinstance(w, dict):
                 start = _to_float(w.get("start", 0.0), 0.0)
@@ -149,23 +157,62 @@ def to_words_payload(word_level_result):
                 "confidence": _to_float(conf_val, None) if conf_val is not None else None
             })
     return {"words": words}
-def process_video(url: str = None, local_path: str = None):
-    db = VideoDatabase()
+
+@dataclass
+class ProcessingContext:
+    """
+    Контекст обработки видео для пайплайна.
+
+    Ключевые поля:
+    - cfg: AppConfig
+    - db: VideoDatabase
+    - url/local_path: входной источник
+    - video_path: путь к исходному видео
+    - video_id: идентификатор в БД
+    - audio_path: путь к извлеченному аудио
+    - base_name: базовое имя файла видео
+    - initial_width/initial_height: исходные размеры видео
+    - transcription_segments: список сегментов транскрипции (dict: start, end, text, speaker?)
+    - transcription_text: форматированный текст транскрипции для LLM
+    - outputs: список путей к финальным клипам
+    """
+    cfg: AppConfig
+    db: VideoDatabase
+    url: Optional[str] = None
+    local_path: Optional[str] = None
+    video_path: Optional[str] = None
+    video_id: Optional[str] = None
+    audio_path: Optional[str] = None
+    base_name: Optional[str] = None
+    initial_width: int = 0
+    initial_height: int = 0
+    transcription_segments: List[dict] = field(default_factory=list)
+    transcription_text: Optional[str] = None
+    outputs: List[str] = field(default_factory=list)
+
+
+def init_context(url: Optional[str], local_path: Optional[str]) -> ProcessingContext:
+    """Инициализирует контекст: загружает конфиг, создаёт БД и гарантирует наличие выходных директорий."""
+    cfg_local = get_config()
+    # Ensure directories exist
+    os.makedirs(cfg_local.processing.shorts_dir, exist_ok=True)
+    os.makedirs(cfg_local.processing.videos_dir, exist_ok=True)
+    ctx = ProcessingContext(cfg=cfg_local, db=VideoDatabase(), url=url, local_path=local_path)
+    return ctx
+
+
+def resolve_video_source(ctx: ProcessingContext) -> bool:
+    """Определяет источник видео (URL/локальный), учитывает кэш БД, выставляет ctx.video_path и ctx.video_id."""
+    if not ctx.url and not ctx.local_path:
+        print("Error: Must provide either URL or local path")
+        return False
+
     video_path = None
     video_id = None
-    cached_data = None
-    is_from_cache = False # Flag to track if using cached video path
 
-    # Ensure the final shorts directory exists
-    os.makedirs(SHORTS_DIR, exist_ok=True)
-
-    if not url and not local_path:
-        print("Error: Must provide either URL or local path")
-        return None
-
-    if url:
-        print(f"Processing YouTube URL: {url}")
-        cached_data = db.get_cached_processing(youtube_url=url)
+    if ctx.url:
+        print(f"Processing YouTube URL: {ctx.url}")
+        cached_data = ctx.db.get_cached_processing(youtube_url=ctx.url)
         if cached_data:
             print("Found cached video from URL!")
             video_path = cached_data["video"][2]
@@ -173,55 +220,66 @@ def process_video(url: str = None, local_path: str = None):
             if not os.path.exists(video_path):
                 print(f"Cached video path not found: {video_path}. Re-downloading.")
                 video_path = None
-                cached_data = None
                 video_id = None
-        else:
-                is_from_cache = True # Mark as using cache only if file exists
-        
         if not video_path:
-            video_path = download_youtube_video(url)
+            video_path = download_youtube_video(ctx.url)
             if not video_path:
                 print("Failed to download video")
-                return None
+                return False
             if not video_path.lower().endswith('.mp4'):
-                 base, _ = os.path.splitext(video_path)
-                 new_path = base + ".mp4"
-                 try:
-                     os.rename(video_path, new_path)
-                     video_path = new_path
-                     print(f"Renamed downloaded file to: {video_path}")
-                 except OSError as e:
-                     print(f"Error renaming file to mp4: {e}. Trying conversion.")
-                     pass 
-
+                base, _ = os.path.splitext(video_path)
+                new_path = base + ".mp4"
+                try:
+                    os.rename(video_path, new_path)
+                    video_path = new_path
+                    print(f"Renamed downloaded file to: {video_path}")
+                except OSError as e:
+                    print(f"Error renaming file to mp4: {e}. Trying conversion.")
+                    pass
     else:
-        print(f"Processing local file: {local_path}")
-        if not os.path.exists(local_path):
+        print(f"Processing local file: {ctx.local_path}")
+        if not os.path.exists(ctx.local_path):
             print("Error: Local file does not exist")
-            return None
-        video_path = local_path
-        cached_data = db.get_cached_processing(local_path=local_path)
+            return False
+        video_path = ctx.local_path
+        cached_data = ctx.db.get_cached_processing(local_path=ctx.local_path)
         if cached_data:
             print("Found cached local video!")
             video_id = cached_data["video"][0]
-            is_from_cache = True # Mark as cached if DB entry exists for local path
 
     if not video_path or not os.path.exists(video_path):
         print("No valid video path obtained or file does not exist.")
-        return None
+        return False
 
-    # --- CHECK DIMENSIONS: Initial --- 
+    ctx.video_path = video_path
+    ctx.video_id = video_id
+    ctx.base_name = os.path.splitext(os.path.basename(video_path))[0]
+    return True
+
+
+def validate_dimensions(ctx: ProcessingContext) -> bool:
+    """Проверяет исходные размеры видео и сохраняет их в контекст."""
     print("\n--- Checking Initial Video Dimensions ---")
-    initial_width, initial_height = get_video_dimensions(video_path)
-    if initial_width is None or initial_height is None:
+    w, h = get_video_dimensions(ctx.video_path)
+    if w is None or h is None:
         print("Error: Could not determine initial video dimensions. Aborting.")
-        return None
-    if initial_width < 100 or initial_height < 100: # Basic sanity check
-        print(f"Warning: Initial video dimensions ({initial_width}x{initial_height}) seem very small.")
+        return False
+    ctx.initial_width, ctx.initial_height = int(w), int(h)
+    if ctx.initial_width < ctx.cfg.processing.min_video_dimension_px or ctx.initial_height < ctx.cfg.processing.min_video_dimension_px:
+        print(f"Warning: Initial video dimensions ({ctx.initial_width}x{ctx.initial_height}) seem very small.")
     print("--- Initial Check Done ---")
+    return True
 
-    # --- Audio Processing (Run this *before* any cropping that might drop audio) --- 
+
+def ensure_audio(ctx: ProcessingContext) -> bool:
+    """Извлекает или загружает из кэша аудио. Обновляет БД и ctx.audio_path/ctx.video_id."""
     audio_path = None
+    cached_data = None
+    if ctx.url:
+        cached_data = ctx.db.get_cached_processing(youtube_url=ctx.url)
+    else:
+        cached_data = ctx.db.get_cached_processing(local_path=ctx.local_path or ctx.video_path)
+
     if cached_data and cached_data["video"][3]:
         print("Using cached audio file reference")
         audio_path = cached_data["video"][3]
@@ -230,313 +288,384 @@ def process_video(url: str = None, local_path: str = None):
             audio_path = None
 
     if not audio_path:
-        print(f"Extracting audio from video: {video_path}")
-        audio_path = extractAudio(video_path)
+        print(f"Extracting audio from video: {ctx.video_path}")
+        audio_path = extractAudio(ctx.video_path)
         if not audio_path:
             print("Failed to extract audio")
-            return None
-        if video_id:
-             db.update_video_audio_path(video_id, audio_path)
+            return False
+        if ctx.video_id:
+            ctx.db.update_video_audio_path(ctx.video_id, audio_path)
         else:
-             video_id = db.add_video(url, video_path, audio_path)
+            ctx.video_id = ctx.db.add_video(ctx.url, ctx.video_path, audio_path)
 
-    if not video_id:
-         video_entry = db.get_video(youtube_url=url, local_path=video_path)
-         if video_entry:
-             video_id = video_entry[0]
-         else:
-             print("Error: Video ID could not be determined after processing.")
-             return None 
+    if not ctx.video_id:
+        video_entry = ctx.db.get_video(youtube_url=ctx.url, local_path=ctx.video_path)
+        if video_entry:
+            ctx.video_id = video_entry[0]
+        else:
+            print("Error: Video ID could not be determined after processing.")
+            return False
 
+    ctx.audio_path = audio_path
+    return True
+
+
+def transcribe_or_load(ctx: ProcessingContext) -> bool:
+    """Грузит транскрипцию из БД или вызывает Whisper; сохраняет полную JSON и сегменты в ctx."""
     transcriptions = None
-    if cached_data and cached_data.get("transcription"):
-        print("Using cached segment transcription")
-        transcriptions = cached_data["transcription"]
+    if ctx.video_id:
+        transcriptions = ctx.db.get_transcription(ctx.video_id)
+        if transcriptions:
+            print("Using cached segment transcription")
 
     if not transcriptions:
         print("Generating new segment transcription")
-        transcriptions = transcribeAudio(audio_path)
+        transcriptions = transcribeAudio(ctx.audio_path)
         if transcriptions:
-            db.add_transcription(video_id, transcriptions)
-            # Save full transcription JSON (non-blocking)
+            ctx.db.add_transcription(ctx.video_id, transcriptions)
             try:
-                base = sanitize_base_name(os.path.splitext(os.path.basename(video_path))[0])
+                base = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
                 payload = to_full_segments_payload(transcriptions)
                 target = build_transcriptions_dir() / f"{base}_full_segments.json"
                 save_json_safely(payload, target)
             except Exception:
-                # Never interrupt the pipeline on save errors
                 pass
         else:
             print("Segment-level transcription failed. Cannot proceed.")
+            return False
+
+    segments: List[dict] = []
+    for item in (transcriptions or []):
+        try:
+            text, start, end = item
+        except Exception:
+            text = str(item.get("text", ""))
+            start = float(item.get("start", 0.0))
+            end = float(item.get("end", 0.0))
+        segments.append({"text": str(text), "start": float(start), "end": float(end), "speaker": None})
+    ctx.transcription_segments = segments
+    return True
+
+
+def prepare_transcript_text(ctx: ProcessingContext) -> None:
+    """Формирует текст транскрипции через LanguageTasks.build_transcription_prompt и логирует превью."""
+    TransText = build_transcription_prompt(ctx.transcription_segments)
+    ctx.transcription_text = TransText
+    print(f"\nFirst {cfg.processing.log_transcription_preview_len} characters of transcription:")
+    print(TransText[:cfg.processing.log_transcription_preview_len] + "...")
+
+
+def fetch_highlights(ctx: ProcessingContext) -> list:
+    """Запрашивает у LLM список обогащённых хайлайтов по готовому тексту транскрипции."""
+    print("Generating new highlights")
+    return GetHighlights(ctx.transcription_text or "")
+
+
+def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
+    """Обрабатывает один хайлайт: кропы, субтитры, сохранение; возвращает путь финального файла либо None."""
+    temp_segment = None
+    cropped_vertical_temp = None
+    cropped_vertical_final = None
+    segment_audio_path = None
+    transcription_result = None
+
+    seq = int(item.get("_seq", 1)) if isinstance(item, dict) else 1
+    total = int(item.get("_total", 1)) if isinstance(item, dict) else 1
+
+    try:
+        start = float(item["start"])
+        stop = float(item["end"])
+
+        print(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s ---")
+        if isinstance(item, dict) and "caption_with_hashtags" in item:
+            print(f"Caption: {item['caption_with_hashtags']}")
+
+        # --- Define File Paths ---
+        base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
+        output_base = f"{base_name}_highlight_{seq}"
+        temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_segment.mp4")
+        cropped_vertical_temp = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_temp.mp4")
+        cropped_vertical_final = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_final.mp4")
+        final_output_with_captions = os.path.join(SHORTS_DIR, f"{output_base}_final.mp4")
+        if USE_ANIMATED_CAPTIONS:
+            segment_audio_path = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_audio.wav")
+
+        # 1. Extract Segment (Video + Audio, Original Aspect Ratio)
+        print("1. Extracting segment...")
+        extract_success = crop_video(ctx.video_path, temp_segment, start, stop, ctx.initial_width, ctx.initial_height)
+        if not extract_success:
+            print(f"Failed step 1 for highlight {seq}. Skipping.")
+            if os.path.exists(temp_segment):
+                try:
+                    os.remove(temp_segment)
+                except Exception as clean_e:
+                    print(f"Warning: Could not remove temp segment file: {clean_e}")
             return None
 
-    # Format transcription text
-    TransText = ""
-    for text, start, end in transcriptions:
-        start_time = float(start)
-        end_time = float(end)
-        TransText += f"[{start_time:.2f}] Speaker: {text.strip()} [{end_time:.2f}]\n"
+        # --- CHECK DIMENSIONS: Segment ---
+        print("\n--- Checking Segment Video Dimensions ---")
+        segment_width, segment_height = get_video_dimensions(temp_segment)
+        if segment_width is None or segment_height is None:
+            print("Error: Could not determine segment video dimensions. Skipping highlight.")
+            if os.path.exists(temp_segment):
+                try:
+                    os.remove(temp_segment)
+                except Exception as clean_e:
+                    print(f"Warning: Could not remove temp segment file: {clean_e}")
+            return None
+        if segment_width != ctx.initial_width or segment_height != ctx.initial_height:
+            print(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({ctx.initial_width}x{ctx.initial_height}).")
+        print("--- Segment Check Done ---")
 
-    print("\nFirst 200 characters of transcription:")
-    print(TransText[:200] + "...")
+        # 2. Create Vertical Crop (Based on Average Face Position)
+        print("2. Creating average face centered vertical crop...")
+        vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
+        if not vert_crop_path:
+            print(f"Failed step 2 (average face crop) for highlight {seq}. Skipping.")
+            if os.path.exists(temp_segment):
+                try:
+                    os.remove(temp_segment)
+                except Exception as clean_e:
+                    print(f"Warning: Could not remove temp segment file: {clean_e}")
+            if os.path.exists(cropped_vertical_temp):
+                try:
+                    os.remove(cropped_vertical_temp)
+                except Exception as clean_e:
+                    print(f"Warning: Could not remove temp vertical crop file: {clean_e}")
+            return None
+        cropped_vertical_temp = vert_crop_path
 
-    # Highlight Processing
+        # 3. Crop Bottom Off Vertical Video (Temporary Fix)
+        if CROP_PERCENTAGE_BOTTOM > 0:
+            print("3. Applying bottom crop to vertical video...")
+            bottom_crop_success = crop_bottom_video(cropped_vertical_temp, cropped_vertical_final, CROP_PERCENTAGE_BOTTOM)
+            if not bottom_crop_success:
+                print(f"Failed step 3 for highlight {seq}. Skipping.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception:
+                        pass
+                if os.path.exists(cropped_vertical_temp):
+                    try:
+                        os.remove(cropped_vertical_temp)
+                    except Exception:
+                        pass
+                if os.path.exists(cropped_vertical_final):
+                    try:
+                        os.remove(cropped_vertical_final)
+                    except Exception:
+                        pass
+                return None
+        else:
+            print("No bottom crop applied")
+            cropped_vertical_final = cropped_vertical_temp
+
+        # 4. Choose Captioning Method
+        captioning_success = False
+        if USE_ANIMATED_CAPTIONS:
+            print("Attempting Word-Level Animated Captions...")
+            print(f"Extracting audio for segment {seq}...")
+            segment_audio_extracted_path = extractAudio(temp_segment)
+            if not segment_audio_extracted_path:
+                print("Failed to extract audio from segment. Cannot perform word transcription. Skipping highlight.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove temp segment file: {clean_e}")
+                if os.path.exists(cropped_vertical_temp):
+                    try:
+                        os.remove(cropped_vertical_temp)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove cropped vertical file: {clean_e}")
+                if os.path.exists(cropped_vertical_final):
+                    try:
+                        os.remove(cropped_vertical_final)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove cropped vertical file: {clean_e}")
+                return None
+            else:
+                segment_audio_path = segment_audio_extracted_path
+
+            transcription_result = transcribe_segment_word_level(segment_audio_path)
+            # Save words-level JSON for this highlight (non-blocking)
+            try:
+                base_sanitized = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
+                words_payload = to_words_payload(transcription_result)
+                target_words = build_transcriptions_dir() / f"{base_sanitized}_highlight_{seq}_words.json"
+                save_json_safely(words_payload, target_words)
+            except Exception:
+                pass
+            if transcription_result:
+                captioning_success = animate_captions(cropped_vertical_final, temp_segment, transcription_result, final_output_with_captions)
+            else:
+                print("Word-level transcription failed for segment. Skipping animation.")
+                captioning_success = False
+        else:
+            print("Using Standard ASS Caption Burning...")
+            transcriptions_legacy = [[
+                str(seg.get("text", "")),
+                float(seg.get("start", 0.0)),
+                float(seg.get("end", 0.0)),
+            ] for seg in (ctx.transcription_segments or [])]
+            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, stop, final_output_with_captions)
+
+        # 5. Handle Captioning Result
+        if not captioning_success:
+            print(f"Animated caption generation failed for highlight {seq}. Attempting ASS burn fallback...")
+            transcriptions_legacy = [[
+                str(seg.get("text", "")),
+                float(seg.get("start", 0.0)),
+                float(seg.get("end", 0.0)),
+            ] for seg in (ctx.transcription_segments or [])]
+            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, stop, final_output_with_captions)
+            if not fallback_success:
+                print(f"ASS fallback failed for highlight {seq}. Skipping.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove temp segment file: {clean_e}")
+                if os.path.exists(cropped_vertical_temp):
+                    try:
+                        os.remove(cropped_vertical_temp)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove temp vertical file: {clean_e}")
+                if os.path.exists(cropped_vertical_final):
+                    try:
+                        os.remove(cropped_vertical_final)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove final vertical file: {clean_e}")
+                if segment_audio_path and os.path.exists(segment_audio_path):
+                    try:
+                        os.remove(segment_audio_path)
+                    except Exception as clean_e:
+                        print(f"Warning: Could not remove segment audio file: {clean_e}")
+                return None
+            else:
+                captioning_success = True
+
+        print(f"Successfully processed highlight {seq}.")
+        ctx.outputs.append(final_output_with_captions)
+        print(f"Saving highlight {seq} info to database: {final_output_with_captions}")
+
+        segment_text = item.get('segment_text', '') if isinstance(item, dict) else ''
+        caption = item.get('caption_with_hashtags', '') if isinstance(item, dict) else ''
+
+        ctx.db.add_highlight(
+            ctx.video_id,
+            start,
+            stop,
+            final_output_with_captions,
+            segment_text=segment_text,
+            caption_with_hashtags=caption
+        )
+
+        # --- Cleanup Intermediate Files ---
+        print("Cleaning up intermediate files for this highlight...")
+        if os.path.exists(temp_segment):
+            try:
+                os.remove(temp_segment)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove temp segment file: {clean_e}")
+        if os.path.exists(cropped_vertical_temp):
+            try:
+                os.remove(cropped_vertical_temp)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove temp vertical file: {clean_e}")
+        if os.path.exists(cropped_vertical_final):
+            try:
+                os.remove(cropped_vertical_final)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove final vertical file: {clean_e}")
+        if segment_audio_path and os.path.exists(segment_audio_path):
+            try:
+                os.remove(segment_audio_path)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove segment audio file: {clean_e}")
+
+        return final_output_with_captions
+
+    except Exception:
+        print(f"\n--- Error processing highlight {seq} --- ")
+        traceback.print_exc()
+        print("Continuing to next highlight if available.")
+        if temp_segment and os.path.exists(temp_segment):
+            try:
+                os.remove(temp_segment)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove temp segment file: {clean_e}")
+        if cropped_vertical_temp and os.path.exists(cropped_vertical_temp):
+            try:
+                os.remove(cropped_vertical_temp)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove temp vertical file: {clean_e}")
+        if cropped_vertical_final and os.path.exists(cropped_vertical_final):
+            try:
+                os.remove(cropped_vertical_final)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove final vertical file: {clean_e}")
+        if segment_audio_path and os.path.exists(segment_audio_path):
+            try:
+                os.remove(segment_audio_path)
+            except Exception as clean_e:
+                print(f"Warning: Could not remove segment audio file: {clean_e}")
+        return None
+
+
+def process_all_highlights(ctx: ProcessingContext, items: list) -> List[str]:
+    """Итерирует по сегментам, вызывает process_highlight, накапливает выходы и печатает итоги/ошибки."""
     try:
-        print("Generating new highlights")
-        highlights = GetHighlights(TransText)
+        final_output_paths: List[str] = []
+        total = len(items or [])
+        for i, raw_item in enumerate(items or []):
+            item = dict(raw_item) if isinstance(raw_item, dict) else raw_item
+            if isinstance(item, dict):
+                item["_seq"] = i + 1
+                item["_total"] = total
+            out_path = process_highlight(ctx, item)
+            if out_path:
+                final_output_paths.append(out_path)
+
+        if not final_output_paths:
+            print("\nProcessing finished, but no highlight segments were successfully converted.")
+            return []
+        else:
+            print(f"\nProcessing finished. Generated {len(final_output_paths)} shorts in '{SHORTS_DIR}' directory.")
+            return final_output_paths
+    except Exception as e:
+        print(f"Error in overall highlight processing: {str(e)}")
+        traceback.print_exc()
+        return []
+
+
+def process_video(url: str = None, local_path: str = None):
+    """
+    Координатор пайплайна. Публичная сигнатура сохранена.
+    Возвращает список путей к сгенерированным клипам или None при ошибке/пустом результате.
+    """
+    ctx = init_context(url, local_path)
+    if not resolve_video_source(ctx):
+        return None
+    if not validate_dimensions(ctx):
+        return None
+    if not ensure_audio(ctx):
+        return None
+    if not transcribe_or_load(ctx):
+        return None
+    prepare_transcript_text(ctx)
+
+    try:
+        highlights = fetch_highlights(ctx)
         if not highlights or len(highlights) == 0:
             print("No valid highlights found")
             return None
 
-        # --- Loop through highlights and process each --- 
-        final_output_paths = [] # Store paths of successfully created shorts
-        temp_segment = None
-        cropped_vertical_temp = None # Intermediate vertical crop before bottom crop
-        cropped_vertical_final = None # After bottom crop
-        segment_audio_path = None
-        transcription_result = None
-        
-        for i, highlight_data in enumerate(highlights):
-            # Reset temp file paths for this loop iteration
-            temp_segment = None
-            cropped_vertical_temp = None
-            cropped_vertical_final = None
-            segment_audio_path = None
-            transcription_result = None
-            
-            try:
-                # Extract start and end times from the enriched highlight data
-                start = float(highlight_data["start"])
-                stop = float(highlight_data["end"])
-                
-                print(f"\n--- Processing Highlight {i+1}/{len(highlights)}: Start={start:.2f}s, End={stop:.2f}s ---")
-                if "caption_with_hashtags" in highlight_data:
-                    print(f"Caption: {highlight_data['caption_with_hashtags']}")
-                
-                # --- Define File Paths --- 
-                base_name = os.path.splitext(os.path.basename(video_path))[0]
-                output_base = f"{base_name}_highlight_{i+1}"
-                temp_segment = os.path.join("videos", f"{output_base}_temp_segment.mp4")
-                cropped_vertical_temp = os.path.join("videos", f"{output_base}_vertical_temp.mp4")
-                cropped_vertical_final = os.path.join("videos", f"{output_base}_vertical_final.mp4")
-                final_output_with_captions = os.path.join(SHORTS_DIR, f"{output_base}_final.mp4")
-                segment_audio_path = None # Reset here before checking USE_ANIMATED_CAPTIONS
-                if USE_ANIMATED_CAPTIONS:
-                    segment_audio_path = os.path.join("videos", f"{output_base}_temp_audio.wav")
-                # --- End Define File Paths ---
-                
-                # --- Processing Steps --- 
-                # 1. Extract Segment (Video + Audio, Original Aspect Ratio)
-                print(f"1. Extracting segment...")
-                extract_success = crop_video(video_path, temp_segment, start, stop, initial_width, initial_height)
-                if not extract_success:
-                    print(f"Failed step 1 for highlight {i+1}. Skipping.")
-                    if os.path.exists(temp_segment): 
-                        try: os.remove(temp_segment) 
-                        except Exception as clean_e: print(f"Warning: Could not remove temp segment file: {clean_e}")
-                    continue
-                
-                # --- CHECK DIMENSIONS: Segment --- 
-                print("\n--- Checking Segment Video Dimensions ---")
-                segment_width, segment_height = get_video_dimensions(temp_segment)
-                if segment_width is None or segment_height is None:
-                    print("Error: Could not determine segment video dimensions. Skipping highlight.")
-                    # Cleanup?
-                    if os.path.exists(temp_segment): 
-                        try: 
-                            os.remove(temp_segment) 
-                        except Exception as clean_e: 
-                            print(f"Warning: Could not remove temp segment file: {clean_e}")
-                    continue
-                if segment_width != initial_width or segment_height != initial_height:
-                     print(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({initial_width}x{initial_height}).")
-                     # Decide whether to continue or abort? For now, continue.
-                print("--- Segment Check Done ---")
-                # --- End Check ---
-                
-                # 2. Create Vertical Crop (Based on Average Face Position)
-                print(f"2. Creating average face centered vertical crop...")
-                vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
-                if not vert_crop_path:
-                    print(f"Failed step 2 (average face crop) for highlight {i+1}. Skipping.")
-                    if os.path.exists(temp_segment): 
-                        try: 
-                            os.remove(temp_segment) 
-                        except Exception as clean_e:
-                             print(f"Warning: Could not remove temp segment file: {clean_e}")
-                    if os.path.exists(cropped_vertical_temp): 
-                        try: 
-                            os.remove(cropped_vertical_temp) 
-                        except Exception as clean_e:
-                             print(f"Warning: Could not remove temp vertical crop file: {clean_e}")
-                    continue
-                cropped_vertical_temp = vert_crop_path # Use returned path
-
-                # 3. Crop Bottom Off Vertical Video (Temporary Fix)
-                if CROP_PERCENTAGE_BOTTOM > 0:
-                    print(f"3. Applying bottom crop to vertical video...")
-                 
-                    bottom_crop_success = crop_bottom_video(cropped_vertical_temp, cropped_vertical_final, CROP_PERCENTAGE_BOTTOM)
-                    if not bottom_crop_success:
-                        print(f"Failed step 3 for highlight {i+1}. Skipping.")
-                        # Clean up previous steps
-                        if os.path.exists(temp_segment): 
-
-                            try: os.remove(temp_segment) 
-                            except: pass
-                        if os.path.exists(cropped_vertical_temp):
-
-                            try: os.remove(cropped_vertical_temp) 
-                            except: pass
-                        if os.path.exists(cropped_vertical_final): 
-
-                            try: os.remove(cropped_vertical_final) 
-                            except: pass
-                        continue
-                else:
-                    print("No bottom crop applied")
-                    cropped_vertical_final = cropped_vertical_temp
-
-
-                # 4. Choose Captioning Method
-                captioning_success = False
-                if USE_ANIMATED_CAPTIONS:
-                    print("Attempting Word-Level Animated Captions...")
-                    print(f"Extracting audio for segment {i+1}...")
-                    segment_audio_extracted_path = extractAudio(temp_segment) 
-                    if not segment_audio_extracted_path:
-                        print("Failed to extract audio from segment. Cannot perform word transcription. Skipping highlight.")
-                        if os.path.exists(temp_segment): 
-                            try: os.remove(temp_segment)
-                            except Exception as clean_e: print(f"Warning: Could not remove temp segment file: {clean_e}")
-                        if os.path.exists(cropped_vertical_temp): 
-                            try: os.remove(cropped_vertical_temp)
-                            except Exception as clean_e: print(f"Warning: Could not remove cropped vertical file: {clean_e}")
-                        if os.path.exists(cropped_vertical_final): 
-                            try: os.remove(cropped_vertical_final)
-                            except Exception as clean_e: print(f"Warning: Could not remove cropped vertical file: {clean_e}")
-                        continue # Skip to next highlight
-                    else:
-                        segment_audio_path = segment_audio_extracted_path 
-                        
-                    transcription_result = transcribe_segment_word_level(segment_audio_path)
-                    # Save words-level JSON for this highlight (non-blocking)
-                    try:
-                        base_sanitized = sanitize_base_name(os.path.splitext(os.path.basename(video_path))[0])
-                        words_payload = to_words_payload(transcription_result)
-                        target_words = build_transcriptions_dir() / f"{base_sanitized}_highlight_{i+1}_words.json"
-                        save_json_safely(words_payload, target_words)
-                    except Exception:
-                        # Never interrupt the pipeline on save errors
-                        pass
-                    if transcription_result:
-                        captioning_success = animate_captions(cropped_vertical_final, temp_segment, transcription_result, final_output_with_captions)
-                    else:
-                        print("Word-level transcription failed for segment. Skipping animation.")
-                        captioning_success = False
-                else:
-                    print("Using Standard ASS Caption Burning...")
-                    captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions, start, stop, final_output_with_captions)
-                
-                # 5. Handle Captioning Result
-                if not captioning_success:
-                    print(f"Animated caption generation failed for highlight {i+1}. Attempting ASS burn fallback...")
-                    # Try fallback with ASS burning
-                    fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions, start, stop, final_output_with_captions)
-                    if not fallback_success:
-                        print(f"ASS fallback failed for highlight {i+1}. Skipping.")
-                        # Cleanup intermediate files
-                        if os.path.exists(temp_segment):
-                            try: os.remove(temp_segment)
-                            except Exception as clean_e:
-                                print(f"Warning: Could not remove temp segment file: {clean_e}")
-                        if os.path.exists(cropped_vertical_temp): # Use correct variable name
-                            try: os.remove(cropped_vertical_temp)
-                            except Exception as clean_e:
-                                print(f"Warning: Could not remove temp vertical file: {clean_e}")
-                        if os.path.exists(cropped_vertical_final): # Use correct variable name
-                            try: os.remove(cropped_vertical_final)
-                            except Exception as clean_e:
-                                print(f"Warning: Could not remove final vertical file: {clean_e}")
-                        if segment_audio_path and os.path.exists(segment_audio_path):
-                            try: os.remove(segment_audio_path)
-                            except Exception as clean_e:
-                                print(f"Warning: Could not remove segment audio file: {clean_e}")
-                        continue
-                    else:
-                        captioning_success = True
-
-                # --- Success for this highlight --- 
-                print(f"Successfully processed highlight {i+1}.")
-                final_output_paths.append(final_output_with_captions)
-                print(f"Saving highlight {i+1} info to database: {final_output_with_captions}")
-                
-                # Get the enriched data from the highlight
-                segment_text = highlight_data.get('segment_text', '')
-                caption = highlight_data.get('caption_with_hashtags', '')
-                
-                # Save to database with enriched data
-                db.add_highlight(
-                    video_id, 
-                    start, 
-                    stop, 
-                    final_output_with_captions,
-                    segment_text=segment_text,
-                    caption_with_hashtags=caption
-                )
-
-                # --- Cleanup Intermediate Files --- 
-                print("Cleaning up intermediate files for this highlight...")
-                if os.path.exists(temp_segment): 
-                    try: os.remove(temp_segment)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove temp segment file: {clean_e}")
-                if os.path.exists(cropped_vertical_temp): # Use correct variable name 
-                    try: os.remove(cropped_vertical_temp)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove temp vertical file: {clean_e}")
-                if os.path.exists(cropped_vertical_final): # Use correct variable name
-                    try: os.remove(cropped_vertical_final)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove final vertical file: {clean_e}") 
-                if segment_audio_path and os.path.exists(segment_audio_path): 
-                    try: os.remove(segment_audio_path)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove segment audio file: {clean_e}")
-            
-            except Exception as e_inner:
-                print(f"\n--- Error processing highlight {i+1} --- ")
-                traceback.print_exc()
-                print(f"Continuing to next highlight if available.")
-                # Attempt cleanup even on inner loop error
-                if temp_segment and os.path.exists(temp_segment): 
-                    try: os.remove(temp_segment)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove temp segment file: {clean_e}")
-                if cropped_vertical_temp and os.path.exists(cropped_vertical_temp): # Use correct variable name
-                    try: os.remove(cropped_vertical_temp)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove temp vertical file: {clean_e}")
-                if cropped_vertical_final and os.path.exists(cropped_vertical_final): # Use correct variable name
-                    try: os.remove(cropped_vertical_final)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove final vertical file: {clean_e}")
-                if segment_audio_path and os.path.exists(segment_audio_path): 
-                    try: os.remove(segment_audio_path)
-                    except Exception as clean_e: 
-                        print(f"Warning: Could not remove segment audio file: {clean_e}")
-        # --- End of loop for processing highlights --- 
-
-        if not final_output_paths:
-             print("\nProcessing finished, but no highlight segments were successfully converted.")
-             return None
-        else:
-             print(f"\nProcessing finished. Generated {len(final_output_paths)} shorts in '{SHORTS_DIR}' directory.")
-             # Return the list of paths or just the first one?
-             # Returning list is more informative.
-             return final_output_paths 
-
+        outputs = process_all_highlights(ctx, highlights)
+        if not outputs:
+            return None
+        return outputs
     except Exception as e:
         print(f"Error in overall highlight processing: {str(e)}")
         traceback.print_exc()
@@ -569,4 +698,3 @@ if __name__ == "__main__":
             print(f"\nSuccess! Output saved to: {output}")
     else:
         print("\nProcessing failed or no shorts generated!")
-

@@ -196,3 +196,103 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Original project by [SamurAIGPT](https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator)
 - Uses Google's Gemini AI for content analysis
 - Powered by faster-whisper for transcription
+
+## Batch‑метаданные
+
+- Цель: пакетно сгенерировать для каждого текстового фрагмента видео метаданные: `title`, `description`, `hashtags`.
+- Вход: JSON‑массив объектов вида `{"id": string, "text": string}`.
+- Выход: JSON‑массив объектов вида `{"id": string, "title": string, "description": string, "hashtags": string[]}`.
+  - Требования:
+    - title: 40–70 символов
+    - description: ≤ 150 символов
+    - hashtags: 3–5 шт., первый элемент строго `#shorts`
+    - строго один валидный JSON‑массив без текста вокруг
+- Реализация: [generate_metadata_batch()](Components/LanguageTasks.py:576)
+- Место интеграции в пайплайн: [GetHighlights()](Components/LanguageTasks.py:711) — после выделения тайм‑сегментов и извлечения текста для каждого сегмента.
+
+Новый системный промпт (точно как в ТЗ), применяемый при пакетной генерации:
+```
+Ты — эксперт по SMM и продвижению на YouTube, специализирующийся на вирусных Shorts. Тебе на вход подается JSON-массив текстовых фрагментов из видео, каждый с уникальным `id`. Твоя задача — для каждого фрагмента создать оптимальный набор метаданных для максимального вовлечения и охвата.
+
+Правила:
+1. Твой ответ должен быть ИСКЛЮЧИТЕЛЬНО одним валидным JSON-массивом. Никакого текста до или после.
+2. Для каждого входного объекта с `id` ты должен сгенерировать объект в выходном массиве с тем же `id` и тремя полями: `title`, `description` и `hashtags`.
+3. title (заголовок): 40–70 символов, интригующий, задает вопрос или создает предвкушение. Обязательно использовать ключевые слова из текста.
+4. description (описание): до 150 символов, кратко раскрывает суть, допускается призыв к действию.
+5. hashtags (хэштеги): массив из 3–5 строк; первым ВСЕГДА `#shorts`; остальные — максимально релевантны теме фрагмента.
+
+Пример Входа:
+[{"id":"seg_1","text":"Сегодня обсудим, как автоматически находить лучшие моменты в видео..."}]
+
+Пример Выхода:
+[{"id":"seg_1","title":"Нейросеть находит лучшие моменты в видео?","description":"Смотрите, как ИИ анализирует ролики для создания шортсов.","hashtags":["#shorts","#ИИ","#нейросети","#видеомонтаж"]}]
+```
+
+## Rate‑limiting
+
+- Централизованная обёртка для вызова LLM: [call_llm_with_retry()](Components/LanguageTasks.py:145)
+  - Пытается повторить запрос при лимитах API и парсит задержку повтора.
+  - Разбор задержки: [parse_retry_delay_seconds()](Components/LanguageTasks.py:89)
+- Поддерживаемые форматы retryDelay:
+  - `Retry-After: 28`
+  - `retry-after: 28`
+  - `"retryDelay": "28s"`
+  - `retryDelay: 28s`
+- Логи (точные формулировки):
+  - "Лимит API обработан. Выполняю паузу на X секунд перед попыткой #Y."
+  - "Не удалось извлечь retryDelay. Попытки прекращены."
+- Поведение:
+  - При наличии корректного `retryDelay` выполняется `sleep(X)` и повтор запроса.
+  - При отсутствии `retryDelay` попытки прекращаются и исключение пробрасывается дальше.
+
+## Конфигурация (config.yaml)
+
+- Путь: [config.yaml](config.yaml)
+- Структура секций и ключи:
+  - `processing`:
+    - `use_animated_captions`: bool — использовать ли анимированные субтитры
+    - `shorts_dir`: str — каталог для итоговых шортов
+    - `videos_dir`: str — каталог для промежуточных файлов/видео
+    - `crop_bottom_percent`: float — нижний кроп вертикального видео (в процентах)
+    - `min_video_dimension_px`: int — минимальный размер видео
+    - `log_transcription_preview_len`: int — длина превью транскрипции в логах
+  - `llm`:
+    - `model_name`: str — модель Gemini
+    - `temperature_highlights`: float — температура для поиска хайлайтов
+    - `temperature_metadata`: float — температура для метаданных
+    - `max_attempts_highlights`: int — попытки при извлечении сегментов
+    - `max_attempts_metadata`: int — попытки при генерации метаданных
+    - `highlight_min_sec` / `highlight_max_sec`: границы длительности сегмента
+    - `max_highlights`: максимум сегментов
+- Минимальный пример:
+```yaml
+processing:
+  use_animated_captions: true
+  shorts_dir: "shorts"
+  videos_dir: "videos"
+
+llm:
+  model_name: "gemini-2.5-flash"
+  temperature_highlights: 0.2
+  temperature_metadata: 1.0
+  highlight_min_sec: 29
+  highlight_max_sec: 61
+  max_highlights: 20
+```
+- Поведение при отсутствии файла: используются значения по умолчанию; при этом выводится сообщение
+  "Конфиг не найден. Использую значения по умолчанию." — см. [Components/config.py](Components/config.py:100).
+- Логирование факта загрузки и активной модели — см. [main.py](main.py:15).
+
+## Тесты
+
+- Запуск всех тестов:
+  - `python -m unittest -v`
+- Покрытие:
+  - Форматирование транскрипции [build_transcription_prompt()](Components/LanguageTasks.py:38) —
+    [tests/test_language_tasks_prompt_formatting.py](tests/test_language_tasks_prompt_formatting.py)
+  - Пакетная генерация метаданных [generate_metadata_batch()](Components/LanguageTasks.py:576) —
+    [tests/test_language_tasks_batch_metadata.py](tests/test_language_tasks_batch_metadata.py)
+  - Обработка лимитов API [call_llm_with_retry()](Components/LanguageTasks.py:145) —
+    [tests/test_language_tasks_rate_limit.py](tests/test_language_tasks_rate_limit.py)
+- Для запуска не требуется реальный API/ключ: в тестах используется monkeypatch/mock.
+- Опциональный онлайновый сценарий (при наличии GOOGLE_API_KEY): [tests/smoke_gemini_and_whisper.py](tests/smoke_gemini_and_whisper.py)

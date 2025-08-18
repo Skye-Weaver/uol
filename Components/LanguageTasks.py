@@ -1,10 +1,23 @@
 from google import genai
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Any
 import json
 import os
 import re # Import regex for parsing transcription
+import time
 from dotenv import load_dotenv
 from google.genai import types
+from Components.config import get_config
+
+# Optional imports for Google API exceptions (rate limit handling)
+try:
+    from google.api_core.exceptions import ResourceExhausted as GoogleResourceExhausted  # type: ignore
+except Exception:
+    GoogleResourceExhausted = None  # type: ignore
+
+try:
+    from google.api_core import exceptions as google_exceptions  # type: ignore
+except Exception:
+    google_exceptions = None  # type: ignore
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -16,9 +29,175 @@ if not GOOGLE_API_KEY:
 client = genai.Client(
         api_key=GOOGLE_API_KEY,
     )
+# Load configuration (cached)
+cfg = get_config()
 # Consider using a more capable model if generating descriptions needs more nuance
 # model = genai.GenerativeModel("gemini-1.5-flash") # Example alternative
-model = "gemini-2.5-flash"
+model = cfg.llm.model_name
+
+def build_transcription_prompt(segments: list[dict]) -> str:
+    """
+    Собирает строку транскрипции для LLM из списка сегментов.
+
+    Вход:
+    - segments: список словарей со следующими ключами (минимально необходимые):
+        - "start": float
+        - "end": float
+        - "text": str
+        - опционально: "speaker" | "name" | "id" — будет использовано вместо "Speaker", если непусто.
+
+    Формат каждой строки:
+    "[{start:.2f}] SpeakerName: {text} [{end:.2f}]"
+
+    Возврат:
+    - Одна большая строка с символом новой строки после каждой записи. Побочных эффектов нет.
+    """
+    lines: list[str] = []
+    for seg in (segments or []):
+        try:
+            if isinstance(seg, dict):
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", 0.0))
+                text = str(seg.get("text", "") or "")
+                speaker_val = None
+                for key in ("speaker", "name", "id"):
+                    v = seg.get(key, None)
+                    if v is not None and str(v).strip():
+                        speaker_val = str(v).strip()
+                        break
+            else:
+                start = float(getattr(seg, "start", 0.0))
+                end = float(getattr(seg, "end", 0.0))
+                text = str(getattr(seg, "text", "") or "")
+                speaker_val = None
+                for key in ("speaker", "name", "id"):
+                    if hasattr(seg, key):
+                        v = getattr(seg, key)
+                        if v is not None and str(v).strip():
+                            speaker_val = str(v).strip()
+                            break
+
+            speaker_label = speaker_val if speaker_val else "Speaker"
+            line = f"[{start:.2f}] {speaker_label}: {text.strip()} [{end:.2f}]"
+            lines.append(line)
+        except Exception:
+            # Любые странности сегмента — пропускаем строку, не прерывая пайплайн
+            continue
+    return "\n".join(lines) + ("\n" if lines else "")
+# --- Rate limit handling utilities and wrapper ---
+
+def parse_retry_delay_seconds(error: Exception | str) -> Optional[int]:
+    """
+    Пытается извлечь задержку повторной попытки (в секундах) из текста ошибки.
+    Поддерживаемые форматы:
+    - Retry-After: 28
+    - retry-after: 28
+    - "retryDelay": "28s"
+    - retryDelay: 28s
+    Возвращает целое количество секунд или None, если не удалось распарсить.
+    """
+    text = ""
+    try:
+        if isinstance(error, Exception):
+            parts = [str(error), repr(error)]
+            for attr in ("message", "details", "args"):
+                val = getattr(error, attr, None)
+                if val:
+                    parts.append(str(val))
+            text = " | ".join(parts)
+        else:
+            text = str(error)
+    except Exception:
+        text = str(error)
+
+    patterns = [
+        r'(?i)(?:retry[- ]?after|retryDelay)"?:?\s*"?(\d+)\s*s?',  # Retry-After: 28  or retryDelay: "28s"
+        r'(?i)"retryDelay"\s*:\s*"?(\d+)\s*s"?'                    # "retryDelay": "28s"
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                continue
+    return None
+
+
+def _is_resource_exhausted_error(err: Exception) -> bool:
+    """Возвращает True, если ошибка соответствует лимиту API (ResourceExhausted)."""
+    try:
+        if 'GoogleResourceExhausted' in globals() and GoogleResourceExhausted is not None and isinstance(err, GoogleResourceExhausted):  # type: ignore
+            return True
+    except Exception:
+        pass
+    try:
+        if 'google_exceptions' in globals() and google_exceptions is not None:
+            ResExh = getattr(google_exceptions, "ResourceExhausted", None)
+            if ResExh is not None and isinstance(err, ResExh):
+                return True
+    except Exception:
+        pass
+    text = f"{type(err).__name__}: {err}"
+    return ("ResourceExhausted" in text) or ("RESOURCE_EXHAUSTED" in text) or ("rate limit" in text.lower())
+
+
+def call_llm_with_retry(
+    system_instruction: Optional[str],
+    content: List | str,
+    generation_config,
+    model: Optional[str] = None,
+    max_api_attempts: int = 3,
+):
+    """
+    Выполняет вызов client.models.generate_content с централизованной обработкой лимитов API.
+
+    Логирование:
+    - При перехвате лимита и наличии retryDelay:
+      "Лимит API обработан. Выполняю паузу на X секунд перед попыткой #Y."
+    - Если retryDelay извлечь не удалось:
+      "Не удалось извлечь retryDelay. Попытки прекращены."
+
+    Стратегия:
+    - Повторяет запрос не более max_api_attempts раз, делая паузу X секунд, если retryDelay присутствует.
+    - При отсутствии retryDelay немедленно прекращает дальнейшие попытки и пробрасывает исключение.
+    - Другие исключения пробрасываются без изменений.
+    """
+    model_to_use = model or globals().get("model")
+    # Нормализуем contents
+    if isinstance(content, list):
+        contents = content
+    else:
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=str(content))])]
+
+    last_err: Optional[Exception] = None
+
+    for api_try in range(1, max_api_attempts + 1):
+        try:
+            # system_instruction ожидается внутри generation_config; параметр system_instruction оставлен для совместимости.
+            return client.models.generate_content(
+                model=model_to_use,
+                contents=contents,
+                config=generation_config,
+            )
+        except Exception as e:
+            last_err = e
+            if _is_resource_exhausted_error(e):
+                delay = parse_retry_delay_seconds(e)
+                if delay is None:
+                    print("Не удалось извлечь retryDelay. Попытки прекращены.")
+                    raise
+                if api_try < max_api_attempts:
+                    print(f"Лимит API обработан. Выполняю паузу на {delay} секунд перед попыткой #{api_try+1}.")
+                    time.sleep(delay)
+                    continue
+                # Достигнут лимит попыток API — пробрасываем исключение без дополнительного лога.
+                raise
+            else:
+                raise
+
+    if last_err is not None:
+        raise last_err
 
 # Вспомогательная функция: безопасная сборка конфигурации генерации с поддержкой Thinking (если доступно в SDK)
 def make_generation_config(system_instruction_text: str, temperature: float = 0.2) -> types.GenerateContentConfig:
@@ -70,6 +249,9 @@ class EnrichedHighlightData(TypedDict):
     end: float
     caption_with_hashtags: str
     segment_text: str # Store the text used for generation
+    title: Optional[str]
+    description: Optional[str]
+    hashtags: Optional[List[str]]
 
 
 def validate_highlight(highlight: HighlightSegment) -> bool:
@@ -83,12 +265,12 @@ def validate_highlight(highlight: HighlightSegment) -> bool:
         end = float(highlight["end"])
         duration = end - start
 
-        # Check for valid duration (between ~29 and ~61 seconds)
-        min_duration = 30.0 - 1.0 # Increased tolerance
-        max_duration = 60.0 + 1.0 # Increased tolerance
+        # Check for valid duration (configured range)
+        min_duration = float(cfg.llm.highlight_min_sec)
+        max_duration = float(cfg.llm.highlight_max_sec)
 
         if not (min_duration <= duration <= max_duration):
-            print(f"Validation Fail: Duration {duration:.2f}s out of range [~29s, ~61s] for {highlight}")
+            print(f"Validation Fail: Duration {duration:.2f}s out of range [~{min_duration:.0f}s, ~{max_duration:.0f}s] for {highlight}")
             return False
 
         # Check for valid ordering
@@ -131,7 +313,7 @@ def extract_highlights(
 ) -> List[HighlightSegment]:
     """Extracts highlight time segments from transcription, validates, checks overlaps, with retry logic."""
     # System instruction based on Google AI Studio code
-    system_instruction_text = """
+    system_instruction_text = f"""
 Ты — креатор коротких видео для соцсетей. По предоставленной транскрипции выдели как можно больше непересекающихся отрезков, которые подойдут для увлекательных коротких роликов. Отдавай приоритет разнообразию валидных сегментов.
 Верни ТОЛЬКО JSON-массив объектов. Каждый объект обязан содержать ключи "start" и "end" (на английском) с точными временными метками начала и конца сегмента из транскрипта. Никакого текста, объяснений или форматирования вне JSON.
 
@@ -142,9 +324,9 @@ def extract_highlights(
 • Естественные паузы и переходы — плюс, но не обязательны.
 
 Требования к длительности:
-• Длительность каждого сегмента (end - start) СТРОГО ОТ 30 ДО 60 секунд (включительно).
+• Длительность каждого сегмента (end - start) СТРОГО ОТ {cfg.llm.highlight_min_sec} ДО {cfg.llm.highlight_max_sec} секунд (включительно).
 • Сегменты не должны перекрываться.
-• Найди и верни от 10 до 20 валидных сегментов — не больше.
+• Найди и верни от 10 до {cfg.llm.max_highlights} валидных сегментов — не больше.
 
 Точность таймкодов:
 • Используй ИМЕННО те таймкоды, что присутствуют/логически вытекают из транскрипта.
@@ -152,28 +334,33 @@ def extract_highlights(
 
 Пример JSON-вывода:
 [
-  {"start": "8.96", "end": "42.20"},
-  {"start": "115.08", "end": "156.12"},
-  {"start": "1381.68", "end": "1427.40"}
+  {{"start": "8.96", "end": "42.20"}},
+  {{"start": "115.08", "end": "156.12"}},
+  {{"start": "1381.68", "end": "1427.40"}}
 ]
 
-• Главная цель — найти несколько сегментов со сроком строго 30–60 секунд.
+• Главная цель — найти несколько сегментов со сроком строго {cfg.llm.highlight_min_sec}–{cfg.llm.highlight_max_sec} секунд.
 • Убедись, что таймкоды соответствуют фактическим маркерам/границам смысла.
 • Сегменты не должны пересекаться.
     """
 
     # Define generation config based on AI Studio code
-    generation_config = make_generation_config(system_instruction_text, temperature=0.2)
+    generation_config = make_generation_config(system_instruction_text, temperature=cfg.llm.temperature_highlights)
 
-    for attempt in range(max_attempts):
+    effective_attempts = cfg.llm.max_attempts_highlights if max_attempts == 3 else max_attempts
+    for attempt in range(effective_attempts):
         print(f"\nПопытка {attempt + 1}: генерация и валидация тайм-сегментов для хайлайтов...")
         try:
             # Structure the prompt and system instruction for generate_content
-            user_prompt_text = f"Transcription:\\n{transcription}"
+            user_prompt_text = f"Transcription:\n{transcription}"
             contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_prompt_text)])]
             # Use the global model but with the new config
-            response = client.models.generate_content(model=model,contents=contents,
-                                              config=generation_config)
+            response = call_llm_with_retry(
+                system_instruction=None,
+                content=contents,
+                generation_config=generation_config,
+                model=model,
+            )
 
             # Basic safety check for response content
             if not response or not response.text:
@@ -220,6 +407,13 @@ def extract_highlights(
 
             # If we reach here, we have a non-empty list of valid, non-overlapping highlights
             print(f"Успех на попытке {attempt + 1}. Найдено валидных сегментов: {len(sorted_highlights)}.")
+            # Apply max_highlights cap from config
+            try:
+                max_h = int(cfg.llm.max_highlights)
+                if max_h > 0:
+                    return sorted_highlights[:max_h]
+            except Exception:
+                pass
             return sorted_highlights # Return the validated and sorted list
 
         except json.JSONDecodeError:
@@ -227,8 +421,12 @@ def extract_highlights(
              if 'response_text' in locals(): print(f"Сырой ответ LLM: {response_text}")
              continue
         except Exception as e:
+            if _is_resource_exhausted_error(e):
+                # Обертка уже залогировала причину; прекращаем дальнейшие попытки этой функции
+                break
             print(f"Неудача на попытке {attempt + 1}: непредвиденная ошибка: {str(e)}")
-            if 'response_text' in locals(): print(f"Сырой ответ LLM при ошибке: {response_text}")
+            if 'response_text' in locals():
+                print(f"Сырой ответ LLM при ошибке: {response_text}")
             continue
 
     print("Достигнуто максимальное число попыток извлечения сегментов. Возвращаю пустой список.")
@@ -303,19 +501,21 @@ def generate_description_and_hashtags(segment_text: str, max_attempts: int = 3) 
     """
 
     # Define generation config based on AI Studio code
-    generation_config = make_generation_config(system_prompt, temperature=1)
+    generation_config = make_generation_config(system_prompt, temperature=cfg.llm.temperature_metadata)
 
-    for attempt in range(max_attempts):
+    effective_attempts = cfg.llm.max_attempts_metadata if max_attempts == 3 else max_attempts
+    for attempt in range(effective_attempts):
         try:
             # Structure the prompt and system instruction for generate_content
             user_prompt_text = f"Segment Text:\n{segment_text}"
             contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_prompt_text)])]
             
             # Use the global model with the new config
-            response = client.models.generate_content(
+            response = call_llm_with_retry(
+                system_instruction=None,
+                content=contents,
+                generation_config=generation_config,
                 model=model,
-                contents=contents,
-                config=generation_config
             )
 
             if not response or not response.text:
@@ -347,20 +547,172 @@ def generate_description_and_hashtags(segment_text: str, max_attempts: int = 3) 
             if 'response_text' in locals(): print(f"Сырой ответ LLM: {response_text}")
             continue
         except Exception as e:
+            if _is_resource_exhausted_error(e):
+                break
             print(f"Неудача на попытке {attempt + 1}: непредвиденная ошибка при генерации описания: {str(e)}")
-            if 'response_text' in locals(): print(f"Сырой ответ LLM при ошибке: {response_text}")
+            if 'response_text' in locals():
+                print(f"Сырой ответ LLM при ошибке: {response_text}")
             continue
 
     print("Достигнуто максимальное число попыток генерации описания/хэштегов. Возвращаю None.")
     return None
 
+# --- Batch metadata generation ---
+BATCH_METADATA_SYSTEM_PROMPT = """Ты — эксперт по SMM и продвижению на YouTube, специализирующийся на вирусных Shorts. Тебе на вход подается JSON-массив текстовых фрагментов из видео, каждый с уникальным `id`. Твоя задача — для каждого фрагмента создать оптимальный набор метаданных для максимального вовлечения и охвата.
+
+Правила:
+1. Твой ответ должен быть ИСКЛЮЧИТЕЛЬНО одним валидным JSON-массивом. Никакого текста до или после.
+2. Для каждого входного объекта с `id` ты должен сгенерировать объект в выходном массиве с тем же `id` и тремя полями: `title`, `description` и `hashtags`.
+3. title (заголовок): 40–70 символов, интригующий, задает вопрос или создает предвкушение. Обязательно использовать ключевые слова из текста.
+4. description (описание): до 150 символов, кратко раскрывает суть, допускается призыв к действию.
+5. hashtags (хэштеги): массив из 3–5 строк; первым ВСЕГДА `#shorts`; остальные — максимально релевантны теме фрагмента.
+
+Пример Входа:
+[{"id":"seg_1","text":"Сегодня обсудим, как автоматически находить лучшие моменты в видео..."}]
+
+Пример Выхода:
+[{"id":"seg_1","title":"Нейросеть находит лучшие моменты в видео?","description":"Смотрите, как ИИ анализирует ролики для создания шортсов.","hashtags":["#shorts","#ИИ","#нейросети","#видеомонтаж"]}]"""
+
+def generate_metadata_batch(items: list[dict], max_attempts: int = 3) -> list[dict]:
+    """
+    Пакетная генерация метаданных (title, description, hashtags) для сегментов.
+
+    Параметры:
+    - items: список словарей вида {"id": str, "text": str}
+    - max_attempts: количество повторных попыток при ошибках парсинга/валидации
+
+    Возврат:
+    - список объектов {"id": str, "title": str, "description": str, "hashtags": list[str]} в исходном порядке items.
+
+    Валидация:
+    - title: 40–70 символов (после trim)
+    - description: длина ≤ 150 символов
+    - hashtags: массив длиной 3–5; первый элемент — "#shorts"; все элементы строки с префиксом "#".
+    """
+    if not items:
+        print("Пакетная генерация метаданных: входных сегментов = 0")
+        return []
+
+    print(f"Пакетная генерация метаданных: входных сегментов = {len(items)}")
+
+    generation_config = make_generation_config(BATCH_METADATA_SYSTEM_PROMPT, temperature=cfg.llm.temperature_metadata)
+
+    def _clean_space(s: str) -> str:
+        return re.sub(r"\s+", " ", s or "").strip()
+
+    def _extract_json_array(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        t = text.strip()
+        m = re.search(r"```json\s*([\s\S]*?)\s*```", t)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"```\s*([\s\S]*?)\s*```", t)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r'"""([\s\S]*?)"""', t)
+        if m:
+            return m.group(1).strip()
+        start = t.find("[")
+        end = t.rfind("]")
+        if start != -1 and end != -1 and start < end:
+            return t[start:end+1].strip()
+        return t
+
+    def _validate_item(obj: dict, expected_id: str) -> Optional[dict]:
+        if not isinstance(obj, dict):
+            return None
+        obj_id = str(obj.get("id", ""))
+        if obj_id != expected_id:
+            return None
+        title = _clean_space(str(obj.get("title", "")))
+        description = _clean_space(str(obj.get("description", "")))
+        hashtags = obj.get("hashtags", [])
+        if not (40 <= len(title) <= 70):
+            return None
+        if len(description) > 150:
+            return None
+        if not isinstance(hashtags, list) or not (3 <= len(hashtags) <= 5):
+            return None
+        if any(not isinstance(h, str) or not h.startswith("#") for h in hashtags):
+            return None
+        if len(hashtags) == 0 or hashtags[0] != "#shorts":
+            return None
+        return {"id": expected_id, "title": title, "description": description, "hashtags": hashtags}
+
+    best_by_id: dict = {}
+    N = len(items)
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"Попытка {attempt} из {max_attempts} для batch-метаданных")
+        try:
+            user_payload = json.dumps(items, ensure_ascii=False)
+            contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_payload)])]
+            response = call_llm_with_retry(
+                system_instruction=None,
+                content=contents,
+                generation_config=generation_config,
+                model=model,
+            )
+            if not response or not getattr(response, "text", None):
+                print(f"Неудача на попытке {attempt}: пустой ответ от LLM.")
+                continue
+            raw_text = response.text
+            json_str = _extract_json_array(raw_text)
+            data = json.loads(json_str)
+            if not isinstance(data, list):
+                print(f"Неудача на попытке {attempt}: ответ LLM не является JSON‑массивом.")
+                continue
+
+            out_by_id = {}
+            for obj in data:
+                if isinstance(obj, dict) and "id" in obj:
+                    out_by_id[str(obj["id"])] = obj
+
+            valid_this_attempt = 0
+            for it in items:
+                expected_id = str(it.get("id"))
+                candidate = out_by_id.get(expected_id)
+                normalized = _validate_item(candidate, expected_id) if candidate is not None else None
+                if normalized:
+                    best_by_id[expected_id] = normalized
+                    valid_this_attempt += 1
+
+            print(f"Batch-метаданные: успешно сгенерировано {valid_this_attempt} из {N}")
+
+            if valid_this_attempt == N:
+                return [best_by_id[str(it["id"])] for it in items]
+
+        except json.JSONDecodeError:
+            print(f"Неудача на попытке {attempt}: некорректный JSON от LLM для batch-метаданных.")
+            if 'raw_text' in locals():
+                print(f"Сырой ответ LLM: {raw_text}")
+            continue
+        except Exception as e:
+            if _is_resource_exhausted_error(e):
+                break
+            print(f"Неудача на попытке {attempt}: непредвиденная ошибка при batch-метаданных: {e}")
+            if 'raw_text' in locals():
+                print(f"Сырой ответ LLM при ошибке: {raw_text}")
+            continue
+
+    print("Batch-метаданные: ошибка парсинга/валидации, использованы плейсхолдеры")
+    results = []
+    for it in items:
+        key = str(it.get("id"))
+        if key in best_by_id:
+            results.append(best_by_id[key])
+        else:
+            results.append({"id": key, "title": "", "description": "", "hashtags": ["#shorts"]})
+    return results
 
 # --- Updated Main Function ---
 
 def GetHighlights(transcription: str) -> List[EnrichedHighlightData]:
     """
     Main function to get multiple highlight segments from transcription,
-    each enriched with an LLM-generated description and hashtags.
+    each enriched with LLM-generated metadata (title, description, hashtags).
+    Backward-compatible: caption_with_hashtags is preserved.
     """
     enriched_highlights = []
     try:
@@ -376,10 +728,11 @@ def GetHighlights(transcription: str) -> List[EnrichedHighlightData]:
             print("Не удалось извлечь валидные тайм‑сегменты для хайлайтов.")
             return []
 
-        print(f"\nПерехожу к генерации описаний для {len(highlight_segments)} сегментов...")
+        # 2. Extract text and prepare batch items
+        items = []
+        mapping = []
 
-        # 2. For each segment, extract text and generate description/hashtags
-        for segment in highlight_segments:
+        for idx, segment in enumerate(highlight_segments, start=1):
             # Convert string timestamps to floats first
             try:
                 start_time = float(segment["start"])
@@ -388,32 +741,59 @@ def GetHighlights(transcription: str) -> List[EnrichedHighlightData]:
                 print(f"Предупреждение: не удалось преобразовать таймкоды в float для сегмента {segment}. Пропускаю.")
                 continue
 
-            # 2a. Extract text for this segment
+            # Extract text for this segment
             segment_text = extract_text_for_segment(transcription, start_time, end_time)
 
             if not segment_text.strip():
-                 print("Предупреждение: для этого сегмента не извлечён текст. Пропускаю генерацию описания.")
-                 # Optionally skip this segment entirely or add placeholder description
-                 continue # Skip this segment
+                print("Предупреждение: для этого сегмента не извлечён текст. Пропускаю генерацию метаданных.")
+                continue
 
-            # 2b. Generate description and hashtags for the segment text
-            caption_string = generate_description_and_hashtags(segment_text)
+            seg_id = f"seg_{len(items)+1}"
+            items.append({"id": seg_id, "text": segment_text})
+            mapping.append((seg_id, start_time, end_time, segment_text))
 
-            if caption_string:
-                # 2c. Combine time segment with description data
-                enriched_data: EnrichedHighlightData = {
-                    "start": start_time,
-                    "end": end_time,
-                    "segment_text": segment_text, # Store the original text
-                    "caption_with_hashtags": caption_string
-                }
-                enriched_highlights.append(enriched_data)
-            else:
-                print(f"Предупреждение: не удалось сгенерировать описание для сегмента {start_time:.2f}-{end_time:.2f}. Пропускаю.")
-                # Optionally add segment with placeholder/error description instead of skipping
+        if not items:
+            print("Не удалось подготовить ни одного текстового сегмента для пакетной генерации.")
+            return []
+
+        print(f"\nПерехожу к пакетной генерации метаданных для {len(items)} сегментов...")
+        batch_meta = generate_metadata_batch(items)
+        meta_by_id = {str(m.get("id")): m for m in (batch_meta or []) if isinstance(m, dict)}
+
+        # 3. Assemble enriched highlights
+        for seg_id, start_time, end_time, segment_text in mapping:
+            meta = meta_by_id.get(seg_id, {})
+            title = str(meta.get("title", "") or "").strip()
+            description = str(meta.get("description", "") or "").strip()
+            hashtags = meta.get("hashtags", None)
+            if not isinstance(hashtags, list) or not all(isinstance(h, str) for h in hashtags):
+                hashtags = ["#shorts"]
+
+            # Build backward-compatible caption_with_hashtags
+            base_caption = ""
+            if title and description:
+                base_caption = f"{title} — {description}"
+            elif title:
+                base_caption = title
+            elif description:
+                base_caption = description
+            caption_with_hashtags = base_caption
+            if hashtags:
+                caption_with_hashtags = f"{base_caption}\n{' '.join(hashtags)}" if base_caption else " ".join(hashtags)
+
+            enriched_data: EnrichedHighlightData = {
+                "start": start_time,
+                "end": end_time,
+                "segment_text": segment_text,
+                "caption_with_hashtags": caption_with_hashtags,
+                "title": title or None,
+                "description": description or None,
+                "hashtags": hashtags or None,
+            }
+            enriched_highlights.append(enriched_data)
 
         if not enriched_highlights:
-            print("Не удалось обогатить ни один хайлайт описанием.")
+            print("Не удалось обогатить ни один хайлайт метаданными.")
             return []
 
         print(f"\nУспешно обогащено хайлайтов: {len(enriched_highlights)}.")
