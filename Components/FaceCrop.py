@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from moviepy.editor import *
+import warnings
 # Note: detect_faces_and_speakers and Frames are no longer used by crop_to_vertical_static
 # from Components.Speaker import detect_faces_and_speakers, Frames
 global Fps
@@ -189,6 +190,7 @@ def crop_to_vertical(input_video_path, output_video_path):
 
 def crop_to_vertical_average_face(input_video_path, output_video_path, sample_interval_seconds=0.5):
     """Crops video to 9:16 based on the average horizontal face position sampled periodically."""
+    warnings.warn("crop_to_vertical_average_face is deprecated...", RuntimeWarning)
     print("Starting average face centered vertical crop...")
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
@@ -315,7 +317,135 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
     print(f"Average face centered vertical crop complete. Saved to: {output_video_path}")
     return output_video_path
 
+def crop_to_vertical_dynamic_smoothed(
+    input_video_path: str,
+    output_video_path: str,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    smoothing_factor: float = 0.05,
+    face_cascade_path: str = 'haarcascade_frontalface_default.xml'
+):
+    """
+    Crops a video to a vertical aspect ratio (e.g., 9:16) in a single pass, dynamically
+    and smoothly following the detected face.
 
+    This function reads the video frame by frame, detects the largest face, calculates a smoothed
+    horizontal center for the crop, and then writes the cropped frame to the output file.
+    This avoids the need for a two-pass approach.
 
+    Args:
+        input_video_path (str): Path to the input video file.
+        output_video_path (str): Path to save the cropped output video file.
+        target_width (int): The target width of the output video (e.g., 1080 for 1080x1920).
+                            The actual crop width is calculated based on the original video's
+                            height and this aspect ratio.
+        target_height (int): The target height of the output video (e.g., 1920 for 1080x1920).
+        smoothing_factor (float): A value between 0 and 1 for smoothing the crop movement.
+                                  Lower values (e.g., 0.05) result in smoother, slower tracking.
+                                  Higher values (e.g., 0.2) make tracking more responsive.
+        face_cascade_path (str): Path to the Haar cascade XML file for face detection.
 
+    Returns:
+        str or None: The path to the output video if successful, otherwise None.
+    """
+    print("Starting single-pass dynamic smooth vertical crop...")
 
+    # 1. --- Initialization ---
+    face_cascade = cv2.CascadeClassifier(face_cascade_path)
+    if face_cascade.empty():
+        print(f"Error: Could not load face cascade from '{face_cascade_path}'")
+        return None
+
+    cap = cv2.VideoCapture(input_video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {input_video_path}")
+        return None
+
+    # Get video properties
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if original_height <= 0 or fps <= 0:
+        print("Error: Invalid video properties (height or fps <= 0).")
+        cap.release()
+        return None
+    
+    print(f"Input: {original_width}x{original_height} @ {fps:.2f}fps")
+    
+    # Calculate crop dimensions based on the original height and target aspect ratio
+    crop_height = original_height
+    crop_width = int(crop_height * (target_width / target_height))
+    if crop_width % 2 != 0:
+        crop_width -= 1  # Ensure even width for codec compatibility
+
+    if original_width < crop_width or crop_width <= 0:
+        print(f"Error: Original width ({original_width}px) is too small for the calculated crop width ({crop_width}px).")
+        cap.release()
+        return None
+
+    print(f"Target Crop Dims: {crop_width}x{crop_height}")
+
+    # Video writer setup
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (crop_width, crop_height))
+    if not out.isOpened():
+        print(f"Error: Could not open video writer for {output_video_path}")
+        cap.release()
+        return None
+
+    # 2. --- Processing Loop ---
+    # Initialize smoothed center to the middle of the frame
+    smoothed_center_x = float(original_width / 2)
+    half_crop_width = float(crop_width / 2)
+    processed_frames = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Use more performant parameters for faster, real-time-like detection
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+
+        target_center_x = smoothed_center_x  # Default to last smoothed position if no face is found
+        if len(faces) > 0:
+            # Find the largest face (most likely the main subject)
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+            x, y, w, h = faces[0]
+            # The center of the detected face becomes the target for our crop
+            target_center_x = float(x + w / 2)
+
+        # Apply exponential moving average (LERP) for smoothing
+        # This moves the camera smoothly towards the target rather than jumping instantly
+        smoothed_center_x += (target_center_x - smoothed_center_x) * smoothing_factor
+        
+        # Calculate crop boundaries based on the new smoothed center
+        x_start = int(smoothed_center_x - half_crop_width)
+        
+        # Clamp to frame boundaries to prevent out-of-bounds errors
+        x_start = max(0, x_start)
+        x_end = x_start + crop_width
+        if x_end > original_width:
+            x_end = original_width
+            x_start = x_end - crop_width
+
+        # Apply the crop
+        cropped_frame = frame[:, x_start:x_end]
+
+        # Final sanity check: if the crop is not the exact size, resize it.
+        # This can happen at the very edges.
+        if cropped_frame.shape[1] != crop_width or cropped_frame.shape[0] != crop_height:
+            cropped_frame = cv2.resize(cropped_frame, (crop_width, crop_height))
+
+        out.write(cropped_frame)
+        processed_frames += 1
+
+    # 3. --- Cleanup ---
+    print(f"Processed and wrote {processed_frames}/{total_frames} frames.")
+    cap.release()
+    out.release()
+    print(f"Dynamic smooth crop complete. Video saved to: {output_video_path}")
+    return output_video_path

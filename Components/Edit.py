@@ -12,6 +12,7 @@ import numpy as np
 
 # Import caption functions from the new module
 from .Captions import burn_captions, animate_captions, create_ass_file
+from .FaceCrop import crop_to_vertical_dynamic_smoothed # Import the new function
 
 def extractAudio(video_path):
     try:
@@ -210,156 +211,91 @@ def process_frame_for_vertical_short(
     face_cascade_path: str = 'haarcascade_frontalface_default.xml'
 ) -> bool:
     """
-    Оптимизированный однопроходный конвейер для создания вертикального видео.
-
-    Выполняет следующие операции за один вызов ffmpeg:
-    1.  Извлечение сегмента видео (`-ss`, `-to`).
-    2.  Анализ лиц для определения центра кадрирования.
-    3.  Динамическое кадрирование в вертикальный формат (9:16) с центрированием на лицах.
-    4.  Опциональная обрезка нижней части видео.
-    5.  Наложение анимированных субтитров через ASS-файл.
-    6.  Копирование аудиодорожки из исходного сегмента.
-
-    Возвращает True в случае успеха, иначе False.
+    Creates a vertical short by first cropping a segment, then applying dynamic face tracking,
+    and finally adding animated captions.
     """
     temp_dir = None
     ass_file_path = None
+    temp_segment_path = None
+    temp_cropped_path = None
+
     try:
-        # 1. Проверка входных данных
+        # 1. --- Setup and Validation ---
         if not os.path.exists(source_video_path):
             print(f"Error: Source video not found at '{source_video_path}'")
-            return False
-        if not os.path.exists(face_cascade_path):
-            print(f"Error: Face cascade classifier not found at '{face_cascade_path}'")
             return False
         if end_time <= start_time:
             print("Error: End time must be greater than start time.")
             return False
 
-        # 2. Получение размеров видео
-        original_width, original_height = get_video_dimensions(source_video_path)
-        if not original_width or not original_height:
-            print("Error: Could not get video dimensions.")
+        temp_dir = tempfile.mkdtemp()
+        temp_segment_path = os.path.join(temp_dir, "segment.mp4")
+        temp_cropped_path = os.path.join(temp_dir, "cropped_video.mp4")
+
+        # 2. --- Extract Video Segment (Fast) ---
+        print(f"Extracting segment from {start_time:.2f}s to {end_time:.2f}s...")
+        if not crop_video(source_video_path, temp_segment_path, start_time, end_time, 0, 0):
+             print("Error: Failed to extract video segment.")
+             return False
+
+        # 3. --- Apply Dynamic Smooth Crop ---
+        print("Applying dynamic smooth face crop...")
+        cropped_video_path = crop_to_vertical_dynamic_smoothed(
+            input_video_path=temp_segment_path,
+            output_video_path=temp_cropped_path,
+            face_cascade_path=face_cascade_path
+        )
+        if not cropped_video_path:
+            print("Error: Dynamic face cropping failed.")
             return False
 
-        # 3. Анализ лиц для определения средней позиции
-        print("Analyzing face positions for smart cropping...")
-        cap = cv2.VideoCapture(source_video_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-        face_cascade = cv2.CascadeClassifier(face_cascade_path)
-        face_positions = []
-        
-        frame_count = 0
-        while cap.isOpened():
-            current_time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            if current_time_sec > end_time:
-                break
-            
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # 4. --- Get Dimensions of the Final Cropped Video ---
+        final_width, final_height = get_video_dimensions(cropped_video_path)
+        if not final_width or not final_height:
+             print("Error: Could not get dimensions of the final cropped video.")
+             return False
 
-            # Анализируем каждый N-й кадр для производительности
-            if frame_count % 3 == 0:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-                if len(faces) > 0:
-                    # Усредняем позиции всех найденных лиц в кадре
-                    avg_x = np.mean([x + w / 2 for x, y, w, h in faces])
-                    face_positions.append(avg_x)
-            frame_count += 1
-        
-        cap.release()
-
-        # Вычисляем среднюю позицию лица по всему клипу
-        if face_positions:
-            average_face_x = int(np.mean(face_positions))
-        else:
-            # Если лиц не найдено, центрируемся по горизонтали
-            average_face_x = original_width // 2
-        
-        print(f"Average horizontal face position: {average_face_x}px")
-
-        # 4. Расчет параметров кадрирования
-        target_height = original_height
-        if crop_bottom_percent > 0:
-            target_height = int(original_height * (1.0 - crop_bottom_percent))
-
-        # Соотношение сторон 9:16
-        target_width = int(target_height * 9 / 16)
-
-        # Гарантируем, что ширина кадрирования четная (требование многих кодеков)
-        if target_width % 2 != 0:
-            target_width += 1
-        
-        # Определяем x_offset для кадрирования, центрируясь на average_face_x
-        crop_x = max(0, average_face_x - target_width // 2)
-        # Убеждаемся, что не выходим за правую границу
-        if crop_x + target_width > original_width:
-            crop_x = original_width - target_width
-        
-        # 5. Создание временного ASS-файла для субтитров
+        # 5. --- Create Animated Captions ---
         print("Preparing animated captions...")
-        temp_dir = tempfile.mkdtemp()
         ass_file_path = os.path.join(temp_dir, "captions.ass")
-
-        # Эта функция должна быть адаптирована или импортирована, она создает ASS файл
-        # на основе словной транскрипции.
         ass_success = create_ass_file(
             word_level_transcription,
             ass_file_path,
-            target_width,
-            target_height,
-            start_time,
-            end_time
+            final_width,
+            final_height,
+            start_time=0, # Timestamps in ASS are relative to the segment
+            end_time=(end_time - start_time)
         )
         if not ass_success:
-            print("Error: Failed to create ASS subtitle file.")
-            # Не возвращаем False, можем продолжить без субтитров
+            print("Warning: Failed to create ASS subtitle file. Proceeding without captions.")
             ass_file_path = None
 
-        # 6. Сборка и выполнение команды FFmpeg
-        print("Building and running final FFmpeg command...")
-        
-        # Используем `to` вместо `t` для точности
-        duration = end_time - start_time
-        
+        # 6. --- Burn Captions into Video ---
+        print("Building and running final FFmpeg command to burn captions...")
         ffmpeg_command = [
             'ffmpeg',
-            '-ss', str(start_time),   # Точное время начала
-            '-to', str(end_time),     # Точное время окончания
-            '-i', source_video_path,
-            '-c:a', 'copy',           # Копируем аудио без перекодирования
+            '-i', cropped_video_path,
+            '-c:a', 'copy',
         ]
 
-        # Комплексный фильтр
-        video_filters = []
-        # 1. Кадрирование: crop=width:height:x:y
-        video_filters.append(f"crop={target_width}:{target_height}:{crop_x}:0")
-        
-        # 2. Наложение субтитров, если они есть
+        # Add ASS filter only if the file was created successfully
         if ass_file_path and os.path.exists(ass_file_path):
-            # Важно: путь к файлу нужно правильно экранировать для ffmpeg
-            escaped_ass_path = ass_file_path.replace('\\', '/').replace(':', '\\\\:')
-            video_filters.append(f"ass='{escaped_ass_path}'")
-        
-        if video_filters:
-            ffmpeg_command.extend(['-vf', ",".join(video_filters)])
+             escaped_ass_path = ass_file_path.replace('\\', '/').replace(':', '\\\\:')
+             ffmpeg_command.extend(['-vf', f"ass='{escaped_ass_path}'"])
 
-        # Параметры видеокодека
         ffmpeg_command.extend([
             '-c:v', 'libx264',
             '-preset', 'medium',
             '-crf', '23',
-            '-aspect', '9:16', # Устанавливаем правильное соотношение сторон
+            '-aspect', '9:16',
             '-y',
             output_path
         ])
 
         cmd_string = ' '.join(shlex.quote(str(arg)) for arg in ffmpeg_command)
         print(f"Executing FFmpeg: {cmd_string}")
-
-        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, encoding='utf-8')
+        
+        subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, encoding='utf-8')
         
         print(f"Successfully created vertical short at: {output_path}")
         return True
@@ -368,8 +304,8 @@ def process_frame_for_vertical_short(
         print(f"Error during FFmpeg execution:")
         print(f"  Command: {' '.join(e.cmd)}")
         print(f"  Return Code: {e.returncode}")
-        print(f"  Stdout: {e.stdout.strip()}")
-        print(f"  Stderr: {e.stderr.strip()}")
+        print(f"  Stdout: {e.stdout.strip() if e.stdout else 'N/A'}")
+        print(f"  Stderr: {e.stderr.strip() if e.stderr else 'N/A'}")
         return False
     except Exception as e:
         print(f"An unexpected error occurred in process_frame_for_vertical_short: {e}")
@@ -377,15 +313,11 @@ def process_frame_for_vertical_short(
         traceback.print_exc()
         return False
     finally:
-        # Очистка временных файлов
-        if ass_file_path and os.path.exists(ass_file_path):
-            try:
-                os.remove(ass_file_path)
-            except OSError as e:
-                print(f"Warning: could not remove temp ass file: {e}")
+        # --- Cleanup ---
         if temp_dir and os.path.exists(temp_dir):
             try:
                 import shutil
                 shutil.rmtree(temp_dir)
+                print(f"Cleaned up temporary directory: {temp_dir}")
             except OSError as e:
                 print(f"Warning: could not remove temp directory: {e}")
