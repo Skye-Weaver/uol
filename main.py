@@ -1,6 +1,9 @@
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
-from Components.Transcription import transcribeAudio, transcribe_word_level_full
+from Components.Transcription import transcribe_unified
+from faster_whisper import WhisperModel
+import torch
+import json
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt
 from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
@@ -311,40 +314,69 @@ def ensure_audio(ctx: ProcessingContext) -> bool:
     return True
 
 
-def transcribe_or_load(ctx: ProcessingContext) -> bool:
-    """Грузит транскрипцию из БД или вызывает Whisper; сохраняет полную JSON и сегменты в ctx."""
-    transcriptions = None
-    if ctx.video_id:
-        transcriptions = ctx.db.get_transcription(ctx.video_id)
-        if transcriptions:
-            print("Using cached segment transcription")
+def run_unified_transcription(ctx: ProcessingContext, model: WhisperModel) -> bool:
+    """
+    Выполняет или загружает из кэша транскрипцию (сегменты и слова).
+    Использует JSON-файлы как основной кэш для обоих типов данных.
+    Сохраняет результаты в контекст.
+    """
+    base_name = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
+    segments_cache_path = build_transcriptions_dir() / f"{base_name}_full_segments.json"
+    words_cache_path = build_transcriptions_dir() / f"{base_name}_word_level.json"
 
-    if not transcriptions:
-        print("Generating new segment transcription")
-        transcriptions = transcribeAudio(ctx.audio_path)
-        if transcriptions:
-            ctx.db.add_transcription(ctx.video_id, transcriptions)
-            try:
-                base = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
-                payload = to_full_segments_payload(transcriptions)
-                target = build_transcriptions_dir() / f"{base}_full_segments.json"
-                save_json_safely(payload, target)
-            except Exception:
-                pass
-        else:
-            print("Segment-level transcription failed. Cannot proceed.")
-            return False
+    segments_loaded = False
+    words_loaded = False
 
-    segments: List[dict] = []
-    for item in (transcriptions or []):
+    # Попытка загрузить из JSON кэша
+    if segments_cache_path.exists():
         try:
-            text, start, end = item
-        except Exception:
-            text = str(item.get("text", ""))
-            start = float(item.get("start", 0.0))
-            end = float(item.get("end", 0.0))
-        segments.append({"text": str(text), "start": float(start), "end": float(end), "speaker": None})
-    ctx.transcription_segments = segments
+            with segments_cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                ctx.transcription_segments = data.get("segments", [])
+                segments_loaded = True
+                print("Loaded segment transcription from JSON cache.")
+        except Exception as e:
+            print(f"[WARN] Could not load segments from JSON cache: {e}")
+
+    if words_cache_path.exists():
+        try:
+            with words_cache_path.open("r", encoding="utf-8") as f:
+                ctx.word_level_transcription = json.load(f)
+                words_loaded = True
+                print("Loaded word-level transcription from JSON cache.")
+        except Exception as e:
+            print(f"[WARN] Could not load words from JSON cache: {e}")
+
+    if segments_loaded and words_loaded:
+        print("Both transcriptions loaded from cache. Skipping transcription.")
+        # Убедимся, что в контексте не None, а пустой dict, если что-то пошло не так
+        if ctx.word_level_transcription is None:
+            ctx.word_level_transcription = {"segments": []}
+        return True
+
+    # Если чего-то нет, запускаем унифицированную транскрипцию
+    print("Cache incomplete. Running unified transcription for segments and words...")
+    
+    # Используется унифицированный подход для повышения эффективности
+    segments_legacy, word_level_transcription = transcribe_unified(ctx.audio_path, model)
+
+    if not segments_legacy:
+        print("Unified transcription failed. Cannot proceed.")
+        return False
+
+    # Преобразуем и сохраняем результаты в контекст
+    full_segments_payload = to_full_segments_payload(segments_legacy)
+    ctx.transcription_segments = full_segments_payload.get("segments", [])
+    ctx.word_level_transcription = word_level_transcription
+
+    # Сохраняем в БД (как и раньше) и в JSON-кэш
+    if ctx.video_id:
+        ctx.db.add_transcription(ctx.video_id, segments_legacy)
+    
+    save_json_safely(full_segments_payload, segments_cache_path)
+    save_json_safely(word_level_transcription, words_cache_path)
+    
+    print("Unified transcription complete. Results saved to context and cache.")
     return True
 
 
@@ -649,6 +681,19 @@ def process_all_highlights(ctx: ProcessingContext, items: list) -> List[str]:
         return []
 
 
+def _select_whisper_runtime():
+    """Выбирает оптимальные параметры для модели Whisper."""
+    try:
+        has_cuda = torch.cuda.is_available()
+    except Exception:
+        has_cuda = False
+    device = "cuda" if has_cuda else "cpu"
+    model_size = "large-v3" if has_cuda else "small"
+    compute_type = "float16" if has_cuda else "int8"
+    cpu_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
+    return model_size, device, compute_type, cpu_threads
+
+
 def process_video(url: str = None, local_path: str = None):
     """
     Координатор пайплайна. Публичная сигнатура сохранена.
@@ -661,18 +706,28 @@ def process_video(url: str = None, local_path: str = None):
         return None
     if not ensure_audio(ctx):
         return None
-    if not transcribe_or_load(ctx):
-        return None
 
-    # Единая словная транскрипция на весь ролик (один раз)
-    if ctx.word_level_transcription is None:
-        print("\n[WordLevel] Starting global word-level transcription for the full audio...")
-        wl = transcribe_word_level_full(ctx.audio_path)
-        if wl:
-            ctx.word_level_transcription = wl
-            print("[WordLevel] Global word-level transcription computed and cached in context.")
-        else:
-            print("[WordLevel][WARN] Failed to compute global word-level transcription; proceeding without it.")
+    # --- Загрузка модели Whisper ---
+    print("\n--- Loading Whisper Model ---")
+    model_size, device, compute_type, cpu_threads = _select_whisper_runtime()
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    try:
+        model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads if device == "cpu" else 0,
+            num_workers=2,
+        )
+        print(f"Faster-Whisper model loaded: {model_size} on {device} ({compute_type})")
+    except Exception as e:
+        print(f"FATAL: Could not load Whisper model. Error: {e}")
+        return None
+    
+    # --- Транскрипция (унифицированный вызов) ---
+    if not run_unified_transcription(ctx, model):
+        return None
 
     prepare_transcript_text(ctx)
 
