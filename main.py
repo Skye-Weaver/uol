@@ -5,7 +5,6 @@ from faster_whisper import WhisperModel
 import torch
 import json
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt
-from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
 from dataclasses import dataclass, field
 from typing import Optional, List
