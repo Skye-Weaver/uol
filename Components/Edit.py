@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 # Import caption functions from the new module
-from .Captions import burn_captions, animate_captions, create_ass_file
+from .Captions import burn_captions, create_ass_file
 from .FaceCrop import analyze_face_position_lightweight # Import the new function
 import logging
 
