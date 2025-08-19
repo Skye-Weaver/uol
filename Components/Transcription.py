@@ -103,6 +103,19 @@ def transcribe_segment_word_level(audio_path):
         return None
 
 
+def transcribe_word_level_full(audio_path):
+    """Обёртка для получения словной транскрибации всего файла одним вызовом.
+    Возвращает формат:
+      {"segments": [{"start": float, "end": float, "text": str, "words": [{"start": float, "end": float, "text": str}, ...]}, ...]}
+    """
+    try:
+        print("Транскрибирование аудио (уровень слов, весь файл)...")
+        return transcribe_segment_word_level(audio_path)
+    except Exception as e:
+        print(f"Ошибка транскрибирования (полный, слова): {e}")
+        return None
+
+
 if __name__ == "__main__":
     audio_path = "audio.wav"
     print("--- Тест транскрибации сегментов ---")

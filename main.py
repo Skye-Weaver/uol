@@ -1,6 +1,6 @@
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
-from Components.Transcription import transcribeAudio, transcribe_segment_word_level
+from Components.Transcription import transcribeAudio, transcribe_word_level_full
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt
 from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
@@ -189,6 +189,7 @@ class ProcessingContext:
     transcription_segments: List[dict] = field(default_factory=list)
     transcription_text: Optional[str] = None
     outputs: List[str] = field(default_factory=list)
+    word_level_transcription: Optional[dict] = None
 
 
 def init_context(url: Optional[str], local_path: Optional[str]) -> ProcessingContext:
@@ -376,7 +377,19 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         start = float(item["start"])
         stop = float(item["end"])
 
-        print(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s ---")
+        # Корректировка stop по фактическому окончанию последнего полного слова (по start < stop)
+        adjusted_stop = stop
+        if getattr(ctx, "word_level_transcription", None):
+            last_word_end = find_last_word_end_time(ctx.word_level_transcription, stop)
+            if last_word_end is not None and last_word_end > stop:
+                prev_stop = adjusted_stop
+                adjusted_stop = last_word_end
+                print(f"[WordLevel] Adjusted stop from {prev_stop:.2f}s to {adjusted_stop:.2f}s based on last word end")
+        # Гарантия: stop > start
+        if adjusted_stop <= start:
+            adjusted_stop = start + 0.1
+
+        print(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s (effective end {adjusted_stop:.2f}s) ---")
         if isinstance(item, dict) and "caption_with_hashtags" in item:
             print(f"Caption: {item['caption_with_hashtags']}")
 
@@ -392,7 +405,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
 
         # 1. Extract Segment (Video + Audio, Original Aspect Ratio)
         print("1. Extracting segment...")
-        extract_success = crop_video(ctx.video_path, temp_segment, start, stop, ctx.initial_width, ctx.initial_height)
+        extract_success = crop_video(ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height)
         if not extract_success:
             print(f"Failed step 1 for highlight {seq}. Skipping.")
             if os.path.exists(temp_segment):
@@ -464,43 +477,39 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         # 4. Choose Captioning Method
         captioning_success = False
         if USE_ANIMATED_CAPTIONS:
-            print("Attempting Word-Level Animated Captions...")
-            print(f"Extracting audio for segment {seq}...")
-            segment_audio_extracted_path = extractAudio(temp_segment)
-            if not segment_audio_extracted_path:
-                print("Failed to extract audio from segment. Cannot perform word transcription. Skipping highlight.")
-                if os.path.exists(temp_segment):
+            print("Attempting Word-Level Animated Captions (reusing global word-level transcription)...")
+            transcription_result = None
+            if getattr(ctx, "word_level_transcription", None):
+                # Подготовка слов через чистый хелпер
+                try:
+                    transcription_result = prepare_words_for_segment(ctx.word_level_transcription, start, adjusted_stop)
+                    # Логирование количества слов после фильтрации
+                    words_count = 0
                     try:
-                        os.remove(temp_segment)
-                    except Exception as clean_e:
-                        print(f"Warning: Could not remove temp segment file: {clean_e}")
-                if os.path.exists(cropped_vertical_temp):
+                        segs = transcription_result.get("segments", []) or []
+                        if segs:
+                            words_count = len(segs[0].get("words", []))
+                    except Exception:
+                        words_count = 0
+                    print(f"[WordLevel] Prepared {words_count} words for animated captions from global transcription.")
+                    # Опционально сохраним JSON слов для дебага/просмотра
                     try:
-                        os.remove(cropped_vertical_temp)
-                    except Exception as clean_e:
-                        print(f"Warning: Could not remove cropped vertical file: {clean_e}")
-                if os.path.exists(cropped_vertical_final):
-                    try:
-                        os.remove(cropped_vertical_final)
-                    except Exception as clean_e:
-                        print(f"Warning: Could not remove cropped vertical file: {clean_e}")
-                return None
+                        base_sanitized = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
+                        words_payload = to_words_payload(transcription_result)
+                        target_words = build_transcriptions_dir() / f"{base_sanitized}_highlight_{seq}_words.json"
+                        save_json_safely(words_payload, target_words)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[WordLevel][WARN] Failed to prepare words subset: {e}")
+                    transcription_result = None
             else:
-                segment_audio_path = segment_audio_extracted_path
-
-            transcription_result = transcribe_segment_word_level(segment_audio_path)
-            # Save words-level JSON for this highlight (non-blocking)
-            try:
-                base_sanitized = sanitize_base_name(os.path.splitext(os.path.basename(ctx.video_path))[0])
-                words_payload = to_words_payload(transcription_result)
-                target_words = build_transcriptions_dir() / f"{base_sanitized}_highlight_{seq}_words.json"
-                save_json_safely(words_payload, target_words)
-            except Exception:
-                pass
-            if transcription_result:
+                print("[WordLevel][WARN] No global word-level transcription available; cannot animate captions for this highlight.")
+    
+            if transcription_result and transcription_result.get("segments", []) and transcription_result["segments"][0].get("words"):
                 captioning_success = animate_captions(cropped_vertical_final, temp_segment, transcription_result, final_output_with_captions)
             else:
-                print("Word-level transcription failed for segment. Skipping animation.")
+                print("Word-level data for this segment is empty. Skipping animation.")
                 captioning_success = False
         else:
             print("Using Standard ASS Caption Burning...")
@@ -509,7 +518,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, stop, final_output_with_captions)
+            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions)
 
         # 5. Handle Captioning Result
         if not captioning_success:
@@ -519,7 +528,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, stop, final_output_with_captions)
+            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions)
             if not fallback_success:
                 print(f"ASS fallback failed for highlight {seq}. Skipping.")
                 if os.path.exists(temp_segment):
@@ -556,7 +565,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         ctx.db.add_highlight(
             ctx.video_id,
             start,
-            stop,
+            adjusted_stop,
             final_output_with_captions,
             segment_text=segment_text,
             caption_with_hashtags=caption
@@ -654,6 +663,17 @@ def process_video(url: str = None, local_path: str = None):
         return None
     if not transcribe_or_load(ctx):
         return None
+
+    # Единая словная транскрипция на весь ролик (один раз)
+    if ctx.word_level_transcription is None:
+        print("\n[WordLevel] Starting global word-level transcription for the full audio...")
+        wl = transcribe_word_level_full(ctx.audio_path)
+        if wl:
+            ctx.word_level_transcription = wl
+            print("[WordLevel] Global word-level transcription computed and cached in context.")
+        else:
+            print("[WordLevel][WARN] Failed to compute global word-level transcription; proceeding without it.")
+
     prepare_transcript_text(ctx)
 
     try:
@@ -669,6 +689,165 @@ def process_video(url: str = None, local_path: str = None):
     except Exception as e:
         print(f"Error in overall highlight processing: {str(e)}")
         traceback.print_exc()
+        return None
+
+
+def prepare_words_for_segment(full_word_level_transcription: dict, start: float, stop: float) -> dict:
+    """
+    Подготавливает подмножество слов для одного сегмента [start, stop] из глобальной
+    словной транскрипции и нормализует их таймкоды к координатам сегмента.
+
+    Вход:
+    - full_word_level_transcription: dict в формате
+      {
+        "segments": [
+          {
+            "words": [
+              {"start": float, "end": float, "text"/"word": str, ...},
+              ...
+            ],
+            ...
+          },
+          ...
+        ]
+      }
+    - start: абсолютное время начала сегмента, секунды (float)
+    - stop:  абсолютное время конца сегмента, секунды (float)
+
+    Логика отбора и нормализации:
+    - Выбираются только те слова, которые пересекаются с интервалом [start, stop]:
+      word.start < stop и word.end > start.
+    - Нормализация в координаты сегмента:
+      start_rel = max(0.0, word.start - start)
+      end_rel   = max(start_rel, word.end - start)
+    - end_rel дополнительно ограничивается длительностью сегмента (stop - start), чтобы
+      «хвост» слова за границей сегмента был обрезан.
+    - Слова без числовых start/end пропускаются.
+    - Результат сортируется по (start_rel, end_rel).
+
+    Возврат:
+    Структура совместимая с animate_captions:
+    {
+      "segments": [{
+        "start": 0.0,
+        "end": stop - start,
+        "text": "segment",
+        "words": [
+          {"start": start_rel, "end": end_rel, "text": word_text}, ...
+        ]
+      }]}
+    
+    Предположения:
+    - Функция чистая: не изменяет входные данные, не имеет побочных эффектов.
+    - При некорректном входе возвращается сегмент с пустым списком слов и корректной длительностью.
+    """
+    try:
+        seg_duration = max(0.0, float(stop) - float(start))
+    except Exception:
+        # На всякий случай, если приведение типов не удалось
+        seg_duration = max(0.0, (stop or 0.0) - (start or 0.0))
+
+    words_out = []
+    try:
+        segments_wl = []
+        if isinstance(full_word_level_transcription, dict):
+            segments_wl = full_word_level_transcription.get("segments", []) or []
+        for seg_wl in segments_wl:
+            # Достаём список слов из dict или объекта с атрибутом .words
+            seg_words = seg_wl.get("words", []) if isinstance(seg_wl, dict) else getattr(seg_wl, "words", []) or []
+            if not seg_words:
+                continue
+            for w in seg_words:
+                if isinstance(w, dict):
+                    s = _to_float(w.get("start", None), None)
+                    e = _to_float(w.get("end", None), None)
+                    txt = w.get("text", w.get("word", ""))
+                else:
+                    s = _to_float(getattr(w, "start", None), None)
+                    e = _to_float(getattr(w, "end", None), None)
+                    txt = getattr(w, "text", getattr(w, "word", ""))
+                # Пропускаем некорректные таймкоды
+                if s is None or e is None:
+                    continue
+                # Фильтр пересечения [start, stop]
+                if e > start and s < stop:
+                    start_rel = max(0.0, s - start)
+                    end_rel = max(start_rel, e - start)
+                    # Обрезка по длительности сегмента
+                    if end_rel > seg_duration:
+                        end_rel = seg_duration
+                        if end_rel < start_rel:
+                            start_rel = end_rel
+                    words_out.append({"start": start_rel, "end": end_rel, "text": str(txt)})
+        # Сортировка стабильна для предсказуемости
+        words_out.sort(key=lambda x: (x["start"], x["end"]))
+    except Exception:
+        # В случае неожиданных проблем вернём пустой список слов, сохранив длительность
+        words_out = []
+
+    return {
+        "segments": [{
+            "start": 0.0,
+            "end": seg_duration,
+            "text": "segment",
+            "words": words_out
+        }]}
+    
+
+def find_last_word_end_time(word_level_transcription: dict, segment_end_time: float) -> Optional[float]:
+    """
+    Определяет фактическое время окончания «последнего слова до segment_end_time».
+
+    Определение «последнего слова до segment_end_time»:
+    - Рассматриваются только слова, у которых start < segment_end_time (start — абсолютный).
+    - Возвращается максимальный end среди таких слов.
+
+    Почему функция может вернуть end > segment_end_time:
+    - Слово может начинаться до segment_end_time, а заканчиваться ПОСЛЕ него. Это важно для
+      корректировки stop вправо, чтобы не обрывать слово в анимации (используется max(original_stop, last_word_end)).
+
+    Граничные случаи:
+    - Отсутствуют сегменты/слова — возвращается None.
+    - Нечисловые или отсутствующие start/end у слова — такие слова пропускаются.
+    - Порядок слов/сегментов может быть произвольным — берётся максимум end среди подходящих.
+
+    Безопасность:
+    - Функция устойчиво обрабатывает некорректные структуры (не dict / пустые поля), возвращая None.
+    """
+    try:
+        if not isinstance(word_level_transcription, dict):
+            return None
+
+        segments = word_level_transcription.get("segments", []) or []
+        if not isinstance(segments, list) or not segments:
+            return None
+
+        last_end: Optional[float] = None
+        for seg in segments:
+            # Безопасно достаём список слов
+            words = seg.get("words", []) if isinstance(seg, dict) else getattr(seg, "words", []) or []
+            if not words:
+                continue
+
+            for w in words:
+                if isinstance(w, dict):
+                    s = _to_float(w.get("start", None), None)
+                    e = _to_float(w.get("end", None), None)
+                else:
+                    s = _to_float(getattr(w, "start", None), None)
+                    e = _to_float(getattr(w, "end", None), None)
+
+                # Пропускаем слова без числовых таймкодов
+                if s is None or e is None:
+                    continue
+
+                # Критерий отбора — слово началось до segment_end_time
+                if s < segment_end_time:
+                    if last_end is None or e > last_end:
+                        last_end = e
+
+        return last_end
+    except Exception:
         return None
 
 
