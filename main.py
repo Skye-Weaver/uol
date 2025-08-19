@@ -1,5 +1,5 @@
 from Components.YoutubeDownloader import download_youtube_video
-from Components.Edit import extractAudio, get_video_dimensions, process_frame_for_vertical_short
+from Components.Edit import extractAudio, get_video_dimensions, process_highlight_unified
 from Components.Transcription import transcribe_unified
 from faster_whisper import WhisperModel
 import torch
@@ -435,14 +435,12 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
              word_transcription_for_segment = {"segments": []} # Fallback to empty
 
         # --- Вызов единой функции обработки ---
-        success = process_frame_for_vertical_short(
-            source_video_path=ctx.video_path,
-            output_path=final_output_path,
+        success = process_highlight_unified(
+            source_video=ctx.video_path,
             start_time=start,
             end_time=adjusted_stop,
-            word_level_transcription=word_transcription_for_segment,
-            crop_bottom_percent=CROP_PERCENTAGE_BOTTOM,
-            face_cascade_path='haarcascade_frontalface_default.xml'
+            transcript_data=word_transcription_for_segment,
+            output_path=final_output_path
         )
 
         if not success:

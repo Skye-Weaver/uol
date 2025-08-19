@@ -6,18 +6,141 @@ import tempfile
 import os
 import shlex
 import json # For ffprobe output
+import torch
 
 import cv2
 import numpy as np
 
 # Import caption functions from the new module
 from .Captions import burn_captions, animate_captions, create_ass_file
-from .FaceCrop import crop_to_vertical_dynamic_smoothed # Import the new function
+from .FaceCrop import analyze_face_position_lightweight # Import the new function
+import logging
+
+from .config import get_config
+
+def process_highlight_unified(source_video: str, start_time: float, end_time: float, transcript_data: dict, output_path: str):
+    """
+    Processes a video highlight using a unified FFmpeg command for cropping and adding subtitles.
+    """
+    cfg = get_config()
+    logging.info(f"Starting unified processing for {source_video} from {start_time} to {end_time}")
+
+    try:
+        # 1. Pre-analysis to find the average face position
+        logging.info("Analyzing face position...")
+        avg_face_center_x = analyze_face_position_lightweight(source_video, cfg.video_processing.face_detection_sample_rate)
+        if avg_face_center_x == 0:
+            logging.warning("Could not detect face, using center of the frame as fallback.")
+            # Get video width to fall back to center
+            cap = cv2.VideoCapture(source_video)
+            if not cap.isOpened():
+                logging.error("Failed to open source video with OpenCV to get width.")
+                return False
+            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap.release()
+            avg_face_center_x = video_width / 2
+        
+        logging.info(f"Average face center X: {avg_face_center_x}")
+
+        # 2. Calculate cropping geometry
+        crop_h = cfg.video_processing.crop_height
+        crop_w = cfg.video_processing.crop_width
+        
+        crop_x = int(avg_face_center_x - crop_w / 2)
+
+        # Get original video width for boundary checks
+        cap = cv2.VideoCapture(source_video)
+        if not cap.isOpened():
+            logging.error("Failed to open source video with OpenCV for dimensions.")
+            return False
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cap.release()
+
+        # Clamp crop_x to be within frame boundaries
+        crop_x = max(0, crop_x)
+        crop_x = min(crop_x, original_width - crop_w)
+        
+        logging.info(f"Calculated crop geometry: w={crop_w}, h={crop_h}, x={crop_x}")
+
+        # 3. Generate subtitles
+        temp_dir = tempfile.mkdtemp()
+        ass_path = os.path.join(temp_dir, "captions.ass")
+        logging.info(f"Generating subtitles at: {ass_path}")
+
+        create_ass_file(
+            word_level_transcription=transcript_data,
+            output_ass_path=ass_path,
+            video_width=crop_w,
+            video_height=crop_h,
+            segment_start_time=start_time,
+            segment_end_time=end_time
+        )
+        
+        # FFmpeg requires escaping special characters in paths
+        escaped_ass_path = ass_path.replace('\\', '/').replace(':', '\\:')
+
+        # 4. Form and execute FFmpeg command
+        duration = end_time - start_time
+        
+        # Dynamically build the FFmpeg command based on GPU availability
+        gpu_available = torch.cuda.is_available()
+        logging.info(f"NVIDIA GPU available: {gpu_available}")
+
+        if gpu_available:
+            # Use NVIDIA's NVENC for hardware-accelerated encoding
+            video_codec_options = f"-hwaccel cuda -c:v h264_nvenc -preset {cfg.ffmpeg.gpu_preset}"
+            logging.info("Using GPU-accelerated (h264_nvenc) FFmpeg command.")
+        else:
+            # Fallback to CPU-based encoding
+            video_codec_options = f"-c:v {cfg.ffmpeg.cpu_codec} -preset {cfg.ffmpeg.cpu_preset}"
+            logging.info(f"Using CPU-based ({cfg.ffmpeg.cpu_codec}) FFmpeg command.")
+
+        ffmpeg_command = (
+            f'ffmpeg -y -ss {start_time} -i "{source_video}" -t {duration} '
+            f'-vf "crop={crop_w}:{crop_h}:{crop_x}:0,ass=\'{escaped_ass_path}\'" '
+            f'-c:a copy {video_codec_options} "{output_path}"'
+        )
+
+        logging.info(f"Executing FFmpeg command:\n{ffmpeg_command}")
+
+        # 5. Execution and cleanup
+        process = subprocess.run(ffmpeg_command, shell=True, check=True, capture_output=True, text=True)
+        
+        logging.info("FFmpeg execution successful.")
+        logging.info(f"Output video saved to: {output_path}")
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"FFmpeg command failed with exit code {e.returncode}")
+        logging.error(f"FFmpeg stderr:\n{e.stderr}")
+        return False
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        # Clean up the temporary .ass file
+        if 'ass_path' in locals() and os.path.exists(ass_path):
+            try:
+                os.remove(ass_path)
+                logging.info(f"Removed temporary subtitles file: {ass_path}")
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary file {ass_path}: {e}")
+        if 'temp_dir' in locals() and os.path.exists(temp_dir):
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+                logging.info(f"Removed temporary directory: {temp_dir}")
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary directory {temp_dir}: {e}")
+
+    return True
 
 def extractAudio(video_path):
+    cfg = get_config()
     try:
         video_clip = VideoFileClip(video_path)
-        audio_path = "audio.wav"
+        audio_path = cfg.video_processing.temp_audio_filename
         video_clip.audio.write_audiofile(audio_path)
         video_clip.close()
         print(f"Extracted audio to: {audio_path}")
@@ -201,123 +324,3 @@ def get_video_dimensions(video_path):
 #    # ... (old example usage)
 
 
-def process_frame_for_vertical_short(
-    source_video_path: str,
-    output_path: str,
-    start_time: float,
-    end_time: float,
-    word_level_transcription: dict,
-    crop_bottom_percent: float = 0.0,
-    face_cascade_path: str = 'haarcascade_frontalface_default.xml'
-) -> bool:
-    """
-    Creates a vertical short by first cropping a segment, then applying dynamic face tracking,
-    and finally adding animated captions.
-    """
-    temp_dir = None
-    ass_file_path = None
-    temp_segment_path = None
-    temp_cropped_path = None
-
-    try:
-        # 1. --- Setup and Validation ---
-        if not os.path.exists(source_video_path):
-            print(f"Error: Source video not found at '{source_video_path}'")
-            return False
-        if end_time <= start_time:
-            print("Error: End time must be greater than start time.")
-            return False
-
-        temp_dir = tempfile.mkdtemp()
-        temp_segment_path = os.path.join(temp_dir, "segment.mp4")
-        temp_cropped_path = os.path.join(temp_dir, "cropped_video.mp4")
-
-        # 2. --- Extract Video Segment (Fast) ---
-        print(f"Extracting segment from {start_time:.2f}s to {end_time:.2f}s...")
-        if not crop_video(source_video_path, temp_segment_path, start_time, end_time, 0, 0):
-             print("Error: Failed to extract video segment.")
-             return False
-
-        # 3. --- Apply Dynamic Smooth Crop ---
-        print("Applying dynamic smooth face crop...")
-        cropped_video_path = crop_to_vertical_dynamic_smoothed(
-            input_video_path=temp_segment_path,
-            output_video_path=temp_cropped_path,
-            face_cascade_path=face_cascade_path
-        )
-        if not cropped_video_path:
-            print("Error: Dynamic face cropping failed.")
-            return False
-
-        # 4. --- Get Dimensions of the Final Cropped Video ---
-        final_width, final_height = get_video_dimensions(cropped_video_path)
-        if not final_width or not final_height:
-             print("Error: Could not get dimensions of the final cropped video.")
-             return False
-
-        # 5. --- Create Animated Captions ---
-        print("Preparing animated captions...")
-        ass_file_path = os.path.join(temp_dir, "captions.ass")
-        ass_success = create_ass_file(
-            word_level_transcription,
-            ass_file_path,
-            final_width,
-            final_height,
-            start_time=0, # Timestamps in ASS are relative to the segment
-            end_time=(end_time - start_time)
-        )
-        if not ass_success:
-            print("Warning: Failed to create ASS subtitle file. Proceeding without captions.")
-            ass_file_path = None
-
-        # 6. --- Burn Captions into Video ---
-        print("Building and running final FFmpeg command to burn captions...")
-        ffmpeg_command = [
-            'ffmpeg',
-            '-i', cropped_video_path,
-            '-c:a', 'copy',
-        ]
-
-        # Add ASS filter only if the file was created successfully
-        if ass_file_path and os.path.exists(ass_file_path):
-             escaped_ass_path = ass_file_path.replace('\\', '/').replace(':', '\\\\:')
-             ffmpeg_command.extend(['-vf', f"ass='{escaped_ass_path}'"])
-
-        ffmpeg_command.extend([
-            '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '23',
-            '-aspect', '9:16',
-            '-y',
-            output_path
-        ])
-
-        cmd_string = ' '.join(shlex.quote(str(arg)) for arg in ffmpeg_command)
-        print(f"Executing FFmpeg: {cmd_string}")
-        
-        subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, encoding='utf-8')
-        
-        print(f"Successfully created vertical short at: {output_path}")
-        return True
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error during FFmpeg execution:")
-        print(f"  Command: {' '.join(e.cmd)}")
-        print(f"  Return Code: {e.returncode}")
-        print(f"  Stdout: {e.stdout.strip() if e.stdout else 'N/A'}")
-        print(f"  Stderr: {e.stderr.strip() if e.stderr else 'N/A'}")
-        return False
-    except Exception as e:
-        print(f"An unexpected error occurred in process_frame_for_vertical_short: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    finally:
-        # --- Cleanup ---
-        if temp_dir and os.path.exists(temp_dir):
-            try:
-                import shutil
-                shutil.rmtree(temp_dir)
-                print(f"Cleaned up temporary directory: {temp_dir}")
-            except OSError as e:
-                print(f"Warning: could not remove temp directory: {e}")

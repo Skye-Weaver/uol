@@ -31,9 +31,39 @@ class LLMConfig:
 
 
 @dataclass
+class PathsConfig:
+    face_cascade: str = "haarcascade_frontalface_default.xml"
+    font: str = "fonts/Montserrat-Bold.ttf"
+
+@dataclass
+class FFmpegConfig:
+    gpu_preset: str = "p5"
+    cpu_preset: str = "veryfast"
+    cpu_codec: str = "libx264"
+
+@dataclass
+class VideoProcessingConfig:
+    temp_audio_filename: str = "audio.wav"
+    crop_height: int = 1080
+    crop_width: int = 608
+    face_detection_sample_rate: int = 25
+
+@dataclass
+class CaptionsConfig:
+    font_name: str = "Montserrat"
+    font_size_ratio: int = 25
+    outline_ratio: int = 10
+    shadow_ratio: int = 2
+    margin_v_ratio: int = 15
+
+@dataclass
 class AppConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
+    ffmpeg: FFmpegConfig = field(default_factory=FFmpegConfig)
+    video_processing: VideoProcessingConfig = field(default_factory=VideoProcessingConfig)
+    captions: CaptionsConfig = field(default_factory=CaptionsConfig)
 
 
 def _as_bool(v: Any, default: bool) -> bool:
@@ -114,10 +144,18 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
     p_in = data.get("processing", {}) or {}
     l_in = data.get("llm", {}) or {}
-    if not isinstance(p_in, dict):
-        p_in = {}
-    if not isinstance(l_in, dict):
-        l_in = {}
+    paths_in = data.get("paths", {}) or {}
+    ffmpeg_in = data.get("ffmpeg", {}) or {}
+    vp_in = data.get("video_processing", {}) or {}
+    caps_in = data.get("captions", {}) or {}
+
+    if not isinstance(p_in, dict): p_in = {}
+    if not isinstance(l_in, dict): l_in = {}
+    if not isinstance(paths_in, dict): paths_in = {}
+    if not isinstance(ffmpeg_in, dict): ffmpeg_in = {}
+    if not isinstance(vp_in, dict): vp_in = {}
+    if not isinstance(caps_in, dict): caps_in = {}
+
 
     # Processing
     p = ProcessingConfig(
@@ -181,7 +219,34 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_highlights=max_hls,
     )
 
-    return AppConfig(processing=p, llm=l)
+    paths = PathsConfig(
+        face_cascade=_as_str(paths_in.get("face_cascade", defaults.paths.face_cascade), defaults.paths.face_cascade),
+        font=_as_str(paths_in.get("font", defaults.paths.font), defaults.paths.font),
+    )
+
+    ffmpeg = FFmpegConfig(
+        gpu_preset=_as_str(ffmpeg_in.get("gpu_preset", defaults.ffmpeg.gpu_preset), defaults.ffmpeg.gpu_preset),
+        cpu_preset=_as_str(ffmpeg_in.get("cpu_preset", defaults.ffmpeg.cpu_preset), defaults.ffmpeg.cpu_preset),
+        cpu_codec=_as_str(ffmpeg_in.get("cpu_codec", defaults.ffmpeg.cpu_codec), defaults.ffmpeg.cpu_codec),
+    )
+
+    vp = VideoProcessingConfig(
+        temp_audio_filename=_as_str(vp_in.get("temp_audio_filename", defaults.video_processing.temp_audio_filename), defaults.video_processing.temp_audio_filename),
+        crop_height=_as_int(vp_in.get("crop_height", defaults.video_processing.crop_height), defaults.video_processing.crop_height),
+        crop_width=_as_int(vp_in.get("crop_width", defaults.video_processing.crop_width), defaults.video_processing.crop_width),
+        face_detection_sample_rate=_as_int(vp_in.get("face_detection_sample_rate", defaults.video_processing.face_detection_sample_rate), defaults.video_processing.face_detection_sample_rate),
+    )
+
+    caps = CaptionsConfig(
+        font_name=_as_str(caps_in.get("font_name", defaults.captions.font_name), defaults.captions.font_name),
+        font_size_ratio=_as_int(caps_in.get("font_size_ratio", defaults.captions.font_size_ratio), defaults.captions.font_size_ratio),
+        outline_ratio=_as_int(caps_in.get("outline_ratio", defaults.captions.outline_ratio), defaults.captions.outline_ratio),
+        shadow_ratio=_as_int(caps_in.get("shadow_ratio", defaults.captions.shadow_ratio), defaults.captions.shadow_ratio),
+        margin_v_ratio=_as_int(caps_in.get("margin_v_ratio", defaults.captions.margin_v_ratio), defaults.captions.margin_v_ratio),
+    )
+
+
+    return AppConfig(processing=p, llm=l, paths=paths, ffmpeg=ffmpeg, video_processing=vp, captions=caps)
 
 
 _CONFIG: Optional[AppConfig] = None
