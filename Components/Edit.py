@@ -86,9 +86,11 @@ def process_highlight_unified(source_video: str, start_time: float, end_time: fl
         gpu_available = torch.cuda.is_available()
         logging.info(f"NVIDIA GPU available: {gpu_available}")
 
+        hwaccel_option = ""
         if gpu_available:
             # Use NVIDIA's NVENC for hardware-accelerated encoding
-            video_codec_options = f"-hwaccel cuda -c:v h264_nvenc -preset {cfg.ffmpeg.gpu_preset}"
+            video_codec_options = f"-c:v h264_nvenc -preset {cfg.ffmpeg.gpu_preset}"
+            hwaccel_option = "-hwaccel cuda"
             logging.info("Using GPU-accelerated (h264_nvenc) FFmpeg command.")
         else:
             # Fallback to CPU-based encoding
@@ -96,7 +98,7 @@ def process_highlight_unified(source_video: str, start_time: float, end_time: fl
             logging.info(f"Using CPU-based ({cfg.ffmpeg.cpu_codec}) FFmpeg command.")
 
         ffmpeg_command = (
-            f'ffmpeg -y -ss {start_time} -i "{source_video}" -t {duration} '
+            f'ffmpeg -y -ss {start_time} {hwaccel_option} -i "{source_video}" -t {duration} '
             f'-vf "crop={crop_w}:{crop_h}:{crop_x}:0,ass=\'{escaped_ass_path}\'" '
             f'-c:a copy {video_codec_options} "{output_path}"'
         )
