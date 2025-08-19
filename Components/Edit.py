@@ -86,27 +86,37 @@ def process_highlight_unified(source_video: str, start_time: float, end_time: fl
         gpu_available = torch.cuda.is_available()
         logging.info(f"NVIDIA GPU available: {gpu_available}")
 
-        hwaccel_option = ""
+        # Build the command as a list of arguments for security and correctness
+        command = ['ffmpeg', '-y', '-ss', str(start_time)]
+
+        # Correctly place the hardware acceleration option BEFORE the input file
         if gpu_available:
-            # Use NVIDIA's NVENC for hardware-accelerated encoding
-            video_codec_options = f"-c:v h264_nvenc -preset {cfg.ffmpeg.gpu_preset}"
-            hwaccel_option = "-hwaccel cuda"
+            command.extend(['-hwaccel', 'cuda'])
+        
+        command.extend(['-i', source_video])
+        command.extend(['-t', str(duration)])
+
+        # Set up video filter chain
+        video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:0,ass='{escaped_ass_path}'"
+        command.extend(['-vf', video_filter])
+
+        # Set audio and video codecs
+        command.extend(['-c:a', 'copy'])
+        if gpu_available:
             logging.info("Using GPU-accelerated (h264_nvenc) FFmpeg command.")
+            command.extend(['-c:v', 'h264_nvenc', '-preset', cfg.ffmpeg.gpu_preset])
         else:
-            # Fallback to CPU-based encoding
-            video_codec_options = f"-c:v {cfg.ffmpeg.cpu_codec} -preset {cfg.ffmpeg.cpu_preset}"
             logging.info(f"Using CPU-based ({cfg.ffmpeg.cpu_codec}) FFmpeg command.")
+            command.extend(['-c:v', cfg.ffmpeg.cpu_codec, '-preset', cfg.ffmpeg.cpu_preset])
+            
+        command.append(output_path)
 
-        ffmpeg_command = (
-            f'ffmpeg -y -ss {start_time} {hwaccel_option} -i "{source_video}" -t {duration} '
-            f'-vf "crop={crop_w}:{crop_h}:{crop_x}:0,ass=\'{escaped_ass_path}\'" '
-            f'-c:a copy {video_codec_options} "{output_path}"'
-        )
-
-        logging.info(f"Executing FFmpeg command:\n{ffmpeg_command}")
+        # Log the command in a copy-paste friendly format
+        logging.info(f"Executing FFmpeg command: {' '.join(shlex.quote(str(arg)) for arg in command)}")
 
         # 5. Execution and cleanup
-        process = subprocess.run(ffmpeg_command, shell=True, check=True, capture_output=True, text=True)
+        # Use shell=False (default) and pass command as a list
+        process = subprocess.run(command, check=True, capture_output=True, text=True)
         
         logging.info("FFmpeg execution successful.")
         logging.info(f"Output video saved to: {output_path}")
