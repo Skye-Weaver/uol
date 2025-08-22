@@ -15,3 +15,25 @@ llm:
   highlight_min_sec: 29
   highlight_max_sec: 61
   max_highlights: 20
+
+paths:
+  face_cascade: "haarcascade_frontalface_default.xml"
+  font: "fonts/Montserrat-Bold.ttf"
+
+ffmpeg:
+  gpu_preset: "p5"
+  cpu_preset: "veryfast"
+  cpu_codec: "libx264"
+
+video_processing:
+  temp_audio_filename: "audio.wav"
+  crop_height: 1080
+  crop_width: 608
+  face_detection_sample_rate: 25
+
+captions:
+  font_name: "Montserrat"
+  font_size_ratio: 25
+  outline_ratio: 10
+  shadow_ratio: 2
+  margin_v_ratio: 15
