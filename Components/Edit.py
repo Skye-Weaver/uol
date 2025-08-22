@@ -6,153 +6,14 @@ import tempfile
 import os
 import shlex
 import json # For ffprobe output
-import torch
-
-import cv2
-import numpy as np
 
 # Import caption functions from the new module
-from .Captions import burn_captions, create_ass_file
-from .FaceCrop import analyze_face_position_lightweight # Import the new function
-import logging
-
-from .config import get_config
-
-def process_highlight_unified(source_video: str, start_time: float, end_time: float, transcript_data: dict, output_path: str):
-    """
-    Processes a video highlight using a unified FFmpeg command for cropping and adding subtitles.
-    """
-    cfg = get_config()
-    logging.info(f"Starting unified processing for {source_video} from {start_time} to {end_time}")
-
-    try:
-        # 1. Pre-analysis to find the average face position
-        logging.info("Analyzing face position...")
-        avg_face_center_x = analyze_face_position_lightweight(source_video, cfg.video_processing.face_detection_sample_rate)
-        if avg_face_center_x == 0:
-            logging.warning("Could not detect face, using center of the frame as fallback.")
-            # Get video width to fall back to center
-            cap = cv2.VideoCapture(source_video)
-            if not cap.isOpened():
-                logging.error("Failed to open source video with OpenCV to get width.")
-                return False
-            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            cap.release()
-            avg_face_center_x = video_width / 2
-        
-        logging.info(f"Average face center X: {avg_face_center_x}")
-
-        # 2. Calculate cropping geometry
-        crop_h = cfg.video_processing.crop_height
-        crop_w = cfg.video_processing.crop_width
-        
-        crop_x = int(avg_face_center_x - crop_w / 2)
-
-        # Get original video width for boundary checks
-        cap = cv2.VideoCapture(source_video)
-        if not cap.isOpened():
-            logging.error("Failed to open source video with OpenCV for dimensions.")
-            return False
-        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        cap.release()
-
-        # Clamp crop_x to be within frame boundaries
-        crop_x = max(0, crop_x)
-        crop_x = min(crop_x, original_width - crop_w)
-        
-        logging.info(f"Calculated crop geometry: w={crop_w}, h={crop_h}, x={crop_x}")
-
-        # 3. Generate subtitles
-        temp_dir = tempfile.mkdtemp()
-        ass_path = os.path.join(temp_dir, "captions.ass")
-        logging.info(f"Generating subtitles at: {ass_path}")
-
-        create_ass_file(
-            word_level_transcription=transcript_data,
-            output_ass_path=ass_path,
-            video_width=crop_w,
-            video_height=crop_h,
-            segment_start_time=start_time,
-            segment_end_time=end_time
-        )
-        
-        # FFmpeg requires escaping special characters in paths
-        escaped_ass_path = ass_path.replace('\\', '/').replace(':', '\\:')
-
-        # 4. Form and execute FFmpeg command
-        duration = end_time - start_time
-        
-        # Dynamically build the FFmpeg command based on GPU availability
-        gpu_available = torch.cuda.is_available()
-        logging.info(f"NVIDIA GPU available: {gpu_available}")
-
-        # Build the command as a list of arguments for security and correctness
-        command = ['ffmpeg', '-y', '-ss', str(start_time)]
-
-        # Correctly place the hardware acceleration option BEFORE the input file
-        if gpu_available:
-            command.extend(['-hwaccel', 'cuda'])
-        
-        command.extend(['-i', source_video])
-        command.extend(['-t', str(duration)])
-
-        # Set up video filter chain
-        video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:0,ass='{escaped_ass_path}'"
-        command.extend(['-vf', video_filter])
-
-        # Set audio and video codecs
-        command.extend(['-c:a', 'copy'])
-        if gpu_available:
-            logging.info("Using GPU-accelerated (h264_nvenc) FFmpeg command.")
-            command.extend(['-c:v', 'h264_nvenc', '-preset', cfg.ffmpeg.gpu_preset])
-        else:
-            logging.info(f"Using CPU-based ({cfg.ffmpeg.cpu_codec}) FFmpeg command.")
-            command.extend(['-c:v', cfg.ffmpeg.cpu_codec, '-preset', cfg.ffmpeg.cpu_preset])
-            
-        command.append(output_path)
-
-        # Log the command in a copy-paste friendly format
-        logging.info(f"Executing FFmpeg command: {' '.join(shlex.quote(str(arg)) for arg in command)}")
-
-        # 5. Execution and cleanup
-        # Use shell=False (default) and pass command as a list
-        process = subprocess.run(command, check=True, capture_output=True, text=True)
-        
-        logging.info("FFmpeg execution successful.")
-        logging.info(f"Output video saved to: {output_path}")
-
-    except subprocess.CalledProcessError as e:
-        logging.error(f"FFmpeg command failed with exit code {e.returncode}")
-        logging.error(f"FFmpeg stderr:\n{e.stderr}")
-        return False
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    finally:
-        # Clean up the temporary .ass file
-        if 'ass_path' in locals() and os.path.exists(ass_path):
-            try:
-                os.remove(ass_path)
-                logging.info(f"Removed temporary subtitles file: {ass_path}")
-            except Exception as e:
-                logging.warning(f"Failed to remove temporary file {ass_path}: {e}")
-        if 'temp_dir' in locals() and os.path.exists(temp_dir):
-            try:
-                import shutil
-                shutil.rmtree(temp_dir)
-                logging.info(f"Removed temporary directory: {temp_dir}")
-            except Exception as e:
-                logging.warning(f"Failed to remove temporary directory {temp_dir}: {e}")
-
-    return True
+from .Captions import burn_captions, animate_captions
 
 def extractAudio(video_path):
-    cfg = get_config()
     try:
         video_clip = VideoFileClip(video_path)
-        audio_path = cfg.video_processing.temp_audio_filename
+        audio_path = "audio.wav"
         video_clip.audio.write_audiofile(audio_path)
         video_clip.close()
         print(f"Extracted audio to: {audio_path}")
@@ -334,5 +195,4 @@ def get_video_dimensions(video_path):
 # Example usage:
 # if __name__ == "__main__":
 #    # ... (old example usage)
-
 

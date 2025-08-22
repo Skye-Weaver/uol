@@ -4,33 +4,14 @@ import os
 
 
 def _select_runtime():
-    """
-    Dynamically selects the runtime environment (CPU or GPU) for Whisper.
-    """
     try:
-        # Check for CUDA availability
         has_cuda = torch.cuda.is_available()
     except Exception:
-        # Fallback if torch or CUDA check fails
         has_cuda = False
-
-    if has_cuda:
-        # GPU (CUDA) environment
-        device = "cuda"
-        compute_type = "float16"  # Faster on modern GPUs
-        print("CUDA is available. Using GPU with float16.")
-    else:
-        # CPU environment
-        device = "cpu"
-        compute_type = "int8"     # Optimized for CPU
-        print("CUDA not available. Using CPU with int8.")
-
-    # Standard model for both environments
-    model_size = "large-v3"
-    
-    # Set CPU threads for CTranslate2
+    device = "cuda" if has_cuda else "cpu"
+    model_size = "large-v3" if has_cuda else "small"
+    compute_type = "float16" if has_cuda else "int8"
     cpu_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
-    
     return model_size, device, compute_type, cpu_threads
 
 
