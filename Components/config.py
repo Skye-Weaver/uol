@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional, Any, Dict
 import os
+import re
 from pathlib import Path
 
 try:
@@ -118,11 +119,61 @@ class PathsConfig:
 
 
 @dataclass
+class ShadowConfig:
+    x_px: int = 2
+    y_px: int = 2
+    blur_px: int = 1
+    color: str = "#00000080"
+
+
+@dataclass
+class AccentPalette:
+    urgency: str = "#FFD400"
+    drama: str = "#FF3B30"
+    positive: str = "#34C759"
+
+
+@dataclass
+class AnimateConfig:
+    type: str = "slide-up"  # "pop-in" | "slide-up"
+    duration_s: float = 0.35  # [0.2, 0.5]
+    easing: str = "easeOutCubic"
+    per_word_stagger_ms: int = 120  # [0, 500]
+
+
+@dataclass
+class PositionConfig:
+    mode: str = "safe_bottom"  # "safe_bottom" | "center"
+    bottom_offset_pct: int = 22  # [0, 100]
+
+
+@dataclass
+class EmojiConfig:
+    enabled: bool = True
+    max_per_short: int = 2  # [0, 5]
+    style: str = "shiny"  # "shiny" | "pulse" | "none"
+
+
+@dataclass
+class CaptionsConfig:
+    font_size_px: int = 96
+    letter_spacing_px: float = 1.5
+    line_height: float = 1.3
+    base_color: str = "#FFFFFF"
+    shadow: ShadowConfig = field(default_factory=ShadowConfig)
+    accent_palette: AccentPalette = field(default_factory=AccentPalette)
+    animate: AnimateConfig = field(default_factory=AnimateConfig)
+    position: PositionConfig = field(default_factory=PositionConfig)
+    emoji: EmojiConfig = field(default_factory=EmojiConfig)
+
+
+@dataclass
 class AppConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    captions: CaptionsConfig = field(default_factory=CaptionsConfig)
 
 
 def _as_bool(v: Any, default: bool) -> bool:
@@ -486,7 +537,162 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         fonts_dir=fonts_dir_raw,
     )
 
-    return AppConfig(processing=p, llm=l, logging=log, paths=paths)
+    # Captions (with safe defaults and clipping)
+    captions_in = data.get("captions", {}) or {}
+    if not isinstance(captions_in, dict):
+        captions_in = {}
+
+    # Local helpers (scoped to load_config)
+    def _is_hex_color(s: str) -> bool:
+        if not isinstance(s, str):
+            return False
+        return bool(re.fullmatch(r"#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})", s.strip()))
+
+    def _as_hex_color(v: Any, default: str) -> str:
+        s = _as_str(v, default)
+        return s if _is_hex_color(s) else default
+
+    def _clamp_int_val(v: Any, default: int, lo: int, hi: int) -> int:
+        try:
+            iv = int(v)
+        except Exception:
+            iv = default
+        if iv < lo:
+            iv = lo
+        if iv > hi:
+            iv = hi
+        return iv
+
+    def _clamp_float_val(v: Any, default: float, lo: float, hi: float) -> float:
+        try:
+            fv = float(v)
+        except Exception:
+            fv = default
+        return max(lo, min(hi, fv))
+
+    # Top-level caption fields
+    fs = _clamp_int_val(
+        captions_in.get("font_size_px", defaults.captions.font_size_px),
+        defaults.captions.font_size_px, 24, 200
+    )
+    ls = _clamp_float_val(
+        captions_in.get("letter_spacing_px", defaults.captions.letter_spacing_px),
+        defaults.captions.letter_spacing_px, 0.0, 10.0
+    )
+    lh = _clamp_float_val(
+        captions_in.get("line_height", defaults.captions.line_height),
+        defaults.captions.line_height, 1.0, 2.0
+    )
+    base_color = _as_hex_color(
+        captions_in.get("base_color", defaults.captions.base_color),
+        defaults.captions.base_color
+    )
+
+    # Shadow
+    shadow_in = captions_in.get("shadow", {}) or {}
+    if not isinstance(shadow_in, dict):
+        shadow_in = {}
+    shadow = ShadowConfig(
+        x_px=_clamp_int_val(
+            shadow_in.get("x_px", defaults.captions.shadow.x_px),
+            defaults.captions.shadow.x_px, 0, 20
+        ),
+        y_px=_clamp_int_val(
+            shadow_in.get("y_px", defaults.captions.shadow.y_px),
+            defaults.captions.shadow.y_px, 0, 20
+        ),
+        blur_px=_clamp_int_val(
+            shadow_in.get("blur_px", defaults.captions.shadow.blur_px),
+            defaults.captions.shadow.blur_px, 0, 16
+        ),
+        color=_as_hex_color(
+            shadow_in.get("color", defaults.captions.shadow.color),
+            defaults.captions.shadow.color
+        ),
+    )
+
+    # Accent palette
+    palette_in = captions_in.get("accent_palette", {}) or {}
+    if not isinstance(palette_in, dict):
+        palette_in = {}
+    accent_palette = AccentPalette(
+        urgency=_as_hex_color(
+            palette_in.get("urgency", defaults.captions.accent_palette.urgency),
+            defaults.captions.accent_palette.urgency
+        ),
+        drama=_as_hex_color(
+            palette_in.get("drama", defaults.captions.accent_palette.drama),
+            defaults.captions.accent_palette.drama
+        ),
+        positive=_as_hex_color(
+            palette_in.get("positive", defaults.captions.accent_palette.positive),
+            defaults.captions.accent_palette.positive
+        ),
+    )
+
+    # Animate
+    animate_in = captions_in.get("animate", {}) or {}
+    if not isinstance(animate_in, dict):
+        animate_in = {}
+    a_type = _as_str(animate_in.get("type", defaults.captions.animate.type), defaults.captions.animate.type)
+    if a_type not in ("pop-in", "slide-up"):
+        a_type = defaults.captions.animate.type
+    duration_s = _clamp_float_val(
+        animate_in.get("duration_s", defaults.captions.animate.duration_s),
+        defaults.captions.animate.duration_s, 0.2, 0.5
+    )
+    easing = _as_str(animate_in.get("easing", defaults.captions.animate.easing), defaults.captions.animate.easing)
+    per_word_stagger_ms = _clamp_int_val(
+        animate_in.get("per_word_stagger_ms", defaults.captions.animate.per_word_stagger_ms),
+        defaults.captions.animate.per_word_stagger_ms, 0, 500
+    )
+    animate = AnimateConfig(
+        type=a_type,
+        duration_s=duration_s,
+        easing=easing,
+        per_word_stagger_ms=per_word_stagger_ms,
+    )
+
+    # Position
+    position_in = captions_in.get("position", {}) or {}
+    if not isinstance(position_in, dict):
+        position_in = {}
+    mode = _as_str(position_in.get("mode", defaults.captions.position.mode), defaults.captions.position.mode)
+    if mode not in ("safe_bottom", "center"):
+        mode = defaults.captions.position.mode
+    bottom_offset_pct = _clamp_int_val(
+        position_in.get("bottom_offset_pct", defaults.captions.position.bottom_offset_pct),
+        defaults.captions.position.bottom_offset_pct, 0, 100
+    )
+    position = PositionConfig(mode=mode, bottom_offset_pct=bottom_offset_pct)
+
+    # Emoji
+    emoji_in = captions_in.get("emoji", {}) or {}
+    if not isinstance(emoji_in, dict):
+        emoji_in = {}
+    enabled = _as_bool(emoji_in.get("enabled", defaults.captions.emoji.enabled), defaults.captions.emoji.enabled)
+    max_per_short = _clamp_int_val(
+        emoji_in.get("max_per_short", defaults.captions.emoji.max_per_short),
+        defaults.captions.emoji.max_per_short, 0, 5
+    )
+    style = _as_str(emoji_in.get("style", defaults.captions.emoji.style), defaults.captions.emoji.style)
+    if style not in ("shiny", "pulse", "none"):
+        style = defaults.captions.emoji.style
+    emoji = EmojiConfig(enabled=enabled, max_per_short=max_per_short, style=style)
+
+    captions = CaptionsConfig(
+        font_size_px=fs,
+        letter_spacing_px=ls,
+        line_height=lh,
+        base_color=base_color,
+        shadow=shadow,
+        accent_palette=accent_palette,
+        animate=animate,
+        position=position,
+        emoji=emoji,
+    )
+
+    return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions)
 
 
 _CONFIG: Optional[AppConfig] = None

@@ -4,7 +4,7 @@ from Components.Transcription import transcribe_unified
 from faster_whisper import WhisperModel
 import torch
 import json
-from Components.LanguageTasks import GetHighlights, build_transcription_prompt
+from Components.LanguageTasks import GetHighlights, build_transcription_prompt, compute_tone_and_keywords, compute_emojis_for_segment
 from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
 from dataclasses import dataclass, field
@@ -553,7 +553,49 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 print("[WordLevel][WARN] No global word-level transcription available; cannot animate captions for this highlight.")
     
             if transcription_result and transcription_result.get("segments", []) and transcription_result["segments"][0].get("words"):
-                captioning_success = animate_captions(cropped_vertical_final, temp_segment, transcription_result, final_output_with_captions)
+                # tone/keywords heuristic — compute meta based on segment text used for captions
+                text_for_segment = ""
+                try:
+                    # Prefer enriched text from highlight item (LLM-extracted for this segment)
+                    text_for_segment = (item.get("segment_text", "") if isinstance(item, dict) else "") or ""
+                except Exception:
+                    text_for_segment = ""
+                if not text_for_segment:
+                    # Fallback: reconstruct from prepared words list
+                    try:
+                        segs = transcription_result.get("segments", []) or []
+                        if segs:
+                            words = segs[0].get("words", []) or []
+                            text_for_segment = " ".join(
+                                (w.get("text") or w.get("word") or "").strip()
+                                for w in words if isinstance(w, dict) and (w.get("text") or w.get("word"))
+                            ).strip()
+                    except Exception:
+                        text_for_segment = ""
+                meta = compute_tone_and_keywords(text_for_segment) if text_for_segment else None
+
+                # emoji: heuristics and placement — propagate emoji metadata (backward compatible)
+                highlight_meta = meta or {}
+                try:
+                    cfg_emoji = getattr(ctx.cfg.captions, "emoji", None)
+                    if cfg_emoji and getattr(cfg_emoji, "enabled", False) and text_for_segment:
+                        tone_val = (highlight_meta.get("tone") if isinstance(highlight_meta, dict) else None) or "neutral"
+                        max_per = int(getattr(cfg_emoji, "max_per_short", 0) or 0)
+                        emojis = compute_emojis_for_segment(text_for_segment, tone_val, max_per)
+                        if isinstance(highlight_meta, dict):
+                            highlight_meta = {**highlight_meta, "emojis": list(emojis or [])[:max_per]}
+                except Exception:
+                    # Полная обратная совместимость: любые ошибки с эмодзи не должны ломать рендер
+                    pass
+
+                captioning_success = animate_captions(
+                    cropped_vertical_final,
+                    temp_segment,
+                    transcription_result,
+                    final_output_with_captions,
+                    style_cfg=ctx.cfg.captions,
+                    highlight_meta=highlight_meta
+                )
             else:
                 print("Word-level data for this segment is empty. Skipping animation.")
                 captioning_success = False
@@ -564,7 +606,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions)
+            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
 
         # 5. Handle Captioning Result
         if not captioning_success:
@@ -574,7 +616,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions)
+            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
             if not fallback_success:
                 print(f"ASS fallback failed for highlight {seq}. Skipping.")
                 if os.path.exists(temp_segment):

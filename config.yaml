@@ -101,3 +101,29 @@ logging:
 paths:
   base_dir: .
   fonts_dir: fonts
+captions:
+  font_size_px: 96
+  letter_spacing_px: 1.5
+  line_height: 1.3
+  base_color: "#FFFFFF"
+  shadow:
+    x_px: 2
+    y_px: 2
+    blur_px: 1
+    color: "#00000080"
+  accent_palette:
+    urgency: "#FFD400"
+    drama: "#FF3B30"
+    positive: "#34C759"
+  animate:
+    type: "slide-up"         # возможные: "pop-in" | "slide-up"
+    duration_s: 0.35         # диапазон 0.2–0.5
+    easing: "easeOutCubic"
+    per_word_stagger_ms: 120
+  position:
+    mode: "safe_bottom"      # возможные: "safe_bottom" | "center"
+    bottom_offset_pct: 22    # 20–28% рекомендовано, по умолчанию 22
+  emoji:
+    enabled: true
+    max_per_short: 2
+    style: "shiny"           # возможные: "shiny" | "pulse" | "none"
