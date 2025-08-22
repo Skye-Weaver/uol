@@ -110,7 +110,7 @@ def download_youtube_video(url):
                 print(f"Фолбэк: {lib} — пытаюсь скачать прогрессивный MP4…")
                 # Имитируем поведение WEB‑клиента (для pytubefix) и отключаем OAuth/кэш.
                 if lib == "pytubefix":
-                    yt = YouTube(src_url, client="WEB", use_oauth=False, allow_oauth_cache=False)
+                    yt = YouTube(src_url, client="WEB", use_oauth=False, allow_oauth_cache=False, use_po_token=True)
                 else:
                     yt = YouTube(src_url, use_oauth=False, allow_oauth_cache=False)
                 # Прогрессивный (видео+аудио в одном mp4)
@@ -144,6 +144,24 @@ def download_youtube_video(url):
                     print(f"Загрузка завершена через {lib}. Итоговый файл: {res}")
                     return res
                 return None
+
+            except Exception as e_fb:
+                # Дополнительный фолбэк для pytubefix с WEB клиентом
+                if lib == "pytubefix" and "bot" in str(e_fb).lower():
+                    try:
+                        print(f"Повторная попытка с WEB клиентом для {lib}…")
+                        yt = YouTube(src_url, client="WEB", use_oauth=False, allow_oauth_cache=False, use_po_token=True)
+                        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                        if stream:
+                            filename = f"master-{yt.video_id}.mp4"
+                            final_path = stream.download(output_path=out_dir, filename=filename)
+                            print(f"Загрузка завершена через {lib} (WEB клиент). Итоговый файл: {final_path}")
+                            return final_path
+                    except Exception as e_web:
+                        print(f"Ошибка WEB клиента {lib}: {e_web}")
+
+                print(f"Ошибка фолбэка {lib}: {e_fb}")
+                return None
             except Exception as e_fb:
                 print(f"Ошибка фолбэка {lib}: {e_fb}")
                 return None
@@ -173,6 +191,15 @@ def download_youtube_video(url):
                 "retries": 3,
                 # yt-dlp по умолчанию использует -c copy для merge; добавим faststart
                 "postprocessor_args": ["-movflags", "+faststart"],
+                # Добавляем параметры для обхода блокировок
+                "extract_flat": False,
+                "geo_bypass": True,
+                "geo_bypass_country": "US",
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                },
+                # Проверяем наличие cookies файла
+                "cookiefile": "cookies.txt" if os.path.exists("cookies.txt") else None,
             }
             with ytdlp.YoutubeDL(ydl_opts) as ydl:
                 _ = ydl.extract_info(url, download=True)
@@ -199,6 +226,57 @@ def download_youtube_video(url):
 
         except Exception as e_ydl:
             print(f"Ошибка при загрузке через yt-dlp (Python API): {e_ydl}")
+
+            # Дополнительный фолбэк: yt-dlp через subprocess
+            try:
+                print("Пробую yt-dlp через командную строку…")
+                format_str = "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+                out_tmpl = os.path.join(out_dir, "master-%(id)s.%(ext)s")
+
+                cmd = [
+                    "yt-dlp",
+                    "--format", format_str,
+                    "--output", out_tmpl,
+                    "--merge-output-format", "mp4",
+                    "--no-playlist",
+                    "--prefer-ffmpeg",
+                    "--geo-bypass",
+                    "--geo-bypass-country", "US",
+                    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                    "--retries", "3",
+                    "--postprocessor-args", "-movflags +faststart"
+                ]
+
+                # Добавляем cookies если файл существует
+                if os.path.exists("cookies.txt"):
+                    cmd.extend(["--cookies", "cookies.txt"])
+
+                cmd.append(url)
+
+                print("Запуск команды:", " ".join(cmd))
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+                if result.returncode == 0:
+                    # Проверяем итоговый mp4
+                    mp4s = [
+                        p for p in glob.glob(os.path.join(out_dir, "master-*.mp4"))
+                        if os.path.getmtime(p) >= (start_time - 1.0)
+                    ]
+                    if mp4s:
+                        mp4s.sort(key=os.path.getmtime, reverse=True)
+                        final_path = mp4s[0]
+                        print(f"Загрузка через yt-dlp (subprocess) завершена. Итоговый файл: {final_path}")
+                        return final_path
+
+                print(f"yt-dlp subprocess завершился с кодом {result.returncode}")
+                if result.stderr:
+                    print("stderr:", result.stderr.strip())
+
+            except subprocess.TimeoutExpired:
+                print("yt-dlp subprocess превысил время ожидания")
+            except Exception as e_sub:
+                print(f"Ошибка yt-dlp subprocess: {e_sub}")
+
             print("Перехожу к фолбэку pytubefix/pytube…")
             return _fallback_pytube(url)
 

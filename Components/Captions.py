@@ -139,7 +139,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         traceback.print_exc()
         return False
 
-# Function removed: burn_captions was deprecated and unused
+# Function to burn captions using FFmpeg (DEPRECATED but kept for reference/fallback)
+def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_time, end_time, output_path):
+    print("[WARN] burn_captions is deprecated. Use the new single-pass pipeline.")
+    return False
 
 
 # --- Word-Level Animation Helpers ---

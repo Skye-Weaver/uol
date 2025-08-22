@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 # Import caption functions from the new module
-from .Captions import create_ass_file
+from .Captions import burn_captions, animate_captions, create_ass_file
 from .FaceCrop import crop_to_vertical_dynamic_smoothed, analyze_face_position_lightweight # Import the new function
 
 def extractAudio(video_path):
@@ -264,8 +264,8 @@ def process_frame_for_vertical_short(
             ass_file_path,
             final_width,
             final_height,
-            segment_start_time=0, # Timestamps in ASS are relative to the segment
-            segment_end_time=(end_time - start_time)
+            0, # Timestamps in ASS are relative to the segment
+            (end_time - start_time)
         )
         if not ass_success:
             print("Warning: Failed to create ASS subtitle file. Proceeding without captions.")
