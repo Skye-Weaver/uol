@@ -99,6 +99,7 @@ class LoggingConfig:
 
     # Ресурсный мониторинг
     resource_monitoring_interval: float = 1.0
+    enable_resource_monitoring: bool = True
     enable_resource_alerts: bool = True
     alert_threshold_duration: float = 30.0
 
@@ -438,6 +439,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             0.1,
             _as_float(log_in.get("resource_monitoring_interval", defaults.logging.resource_monitoring_interval),
                       defaults.logging.resource_monitoring_interval),
+        ),
+        enable_resource_monitoring=_as_bool(
+            log_in.get("enable_resource_monitoring", defaults.logging.enable_resource_monitoring),
+            defaults.logging.enable_resource_monitoring,
         ),
         enable_resource_alerts=_as_bool(
             log_in.get("enable_resource_alerts", defaults.logging.enable_resource_alerts),

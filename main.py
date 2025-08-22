@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import os
 import traceback
+import time
 from Components.config import get_config, AppConfig
 from Components.Logger import logger, timed_operation
 
@@ -21,6 +22,11 @@ print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, m
 # Инициализация системы логирования
 if cfg.logging.enable_system_info_logging:
     logger.log_system_info()
+
+# Инициализация постоянного мониторинга ресурсов
+if cfg.logging.enable_resource_monitoring:
+    logger.start_resource_monitoring()
+    logger.log_resource_status()
 
 # --- Configuration Flags ---
 # Set to True to use two words-level animated captions (slower but nicer)
@@ -763,8 +769,15 @@ def process_video(url: str = None, local_path: str = None):
 
     # --- Транскрипция (унифицированный вызов) ---
     with logger.operation_context("transcription", {"audio_path": ctx.audio_path}):
+        logger.logger.info(f"Начало транскрипции аудио: {ctx.audio_path}")
+        transcription_start = time.time()
+
         if not run_unified_transcription(ctx, model):
+            logger.logger.error("Транскрипция завершилась неудачей")
             return None
+
+        transcription_time = time.time() - transcription_start
+        logger.logger.info(f"Транскрипция завершена за {transcription_time:.2f} секунд")
 
     with logger.operation_context("prepare_transcript_text", {"transcription_length": len(ctx.transcription_text or "")}):
         prepare_transcript_text(ctx)

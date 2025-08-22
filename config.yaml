@@ -83,5 +83,6 @@ logging:
 
   # Ресурсный мониторинг
   resource_monitoring_interval: 1.0  # seconds
+  enable_resource_monitoring: true
   enable_resource_alerts: true
   alert_threshold_duration: 30.0  # seconds for long operations
