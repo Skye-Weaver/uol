@@ -83,7 +83,7 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         play_res_x = int(video_w)
         play_res_y = int(video_h)
 
-    font_size_default = 36
+    font_size_default = 38
     font_size = font_size_default
     primary_colour = "&H00FFFFFF"  # белый
     outline_colour = "&H00000000"  # чёрный
@@ -100,7 +100,7 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         # Font size
         try:
             fs = int(getattr(style_cfg, "font_size_px", font_size_default))
-            font_size = max(24, min(200, fs))
+            font_size = max(20, min(60, fs))
         except Exception:
             font_size = font_size_default
 
@@ -367,7 +367,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
     try:
         # --- Font Setup (Pillow) ---
-        font_size = 34  # default legacy
+        font_size = 38  # default legacy
         if style_cfg is not None:
             try:
                 font_size = int(getattr(style_cfg, "font_size_px", font_size) or font_size)

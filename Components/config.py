@@ -156,7 +156,7 @@ class EmojiConfig:
 
 @dataclass
 class CaptionsConfig:
-    font_size_px: int = 96
+    font_size_px: int = 38
     letter_spacing_px: float = 1.5
     line_height: float = 1.3
     base_color: str = "#FFFFFF"
@@ -573,7 +573,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     # Top-level caption fields
     fs = _clamp_int_val(
         captions_in.get("font_size_px", defaults.captions.font_size_px),
-        defaults.captions.font_size_px, 24, 200
+        defaults.captions.font_size_px, 20, 60
     )
     ls = _clamp_float_val(
         captions_in.get("letter_spacing_px", defaults.captions.letter_spacing_px),
