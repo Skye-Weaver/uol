@@ -47,6 +47,15 @@ def ensure_dir(path_like):
 
 
 def sanitize_base_name(name: str) -> str:
+    """
+    Sanitize filename to create safe base name for file operations.
+
+    Args:
+        name: Original filename or path
+
+    Returns:
+        Sanitized base name safe for file operations
+    """
     import re
     from pathlib import Path
     try:
@@ -77,9 +86,10 @@ def save_json_safely(data, path):
 
 
 def _to_float(val, default=None):
+    """Convert value to float with error handling."""
     try:
         return float(val)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
