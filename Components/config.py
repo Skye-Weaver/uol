@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional, Any, Dict
 import os
+from pathlib import Path
 
 try:
     import yaml  # type: ignore
@@ -13,6 +14,7 @@ class ProcessingConfig:
     use_animated_captions: bool = True
     shorts_dir: str = "shorts"
     videos_dir: str = "videos"
+    transcriptions_dir: str = "transcriptions"
     crop_bottom_percent: float = 0.0
     min_video_dimension_px: int = 100
     log_transcription_preview_len: int = 200
@@ -104,10 +106,23 @@ class LoggingConfig:
 
 
 @dataclass
+class PathsConfig:
+    """
+    Путь-ориентированная конфигурация проекта.
+
+    - base_dir: Абсолютный корень проекта/ресурсов.
+    - fonts_dir: Каталог со шрифтами (может быть относительным к base_dir или абсолютным).
+    """
+    base_dir: str = str(Path(".").resolve())
+    fonts_dir: str = "fonts"
+
+
+@dataclass
 class AppConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
 
 
 def _as_bool(v: Any, default: bool) -> bool:
@@ -189,12 +204,15 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     p_in = data.get("processing", {}) or {}
     l_in = data.get("llm", {}) or {}
     log_in = data.get("logging", {}) or {}
+    paths_in = data.get("paths", {}) or {}
     if not isinstance(p_in, dict):
         p_in = {}
     if not isinstance(l_in, dict):
         l_in = {}
     if not isinstance(log_in, dict):
         log_in = {}
+    if not isinstance(paths_in, dict):
+        paths_in = {}
 
     # Processing
     p = ProcessingConfig(
@@ -204,6 +222,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         ),
         shorts_dir=_as_str(p_in.get("shorts_dir", defaults.processing.shorts_dir), defaults.processing.shorts_dir),
         videos_dir=_as_str(p_in.get("videos_dir", defaults.processing.videos_dir), defaults.processing.videos_dir),
+        transcriptions_dir=_as_str(
+            p_in.get("transcriptions_dir", defaults.processing.transcriptions_dir),
+            defaults.processing.transcriptions_dir
+        ),
         crop_bottom_percent=_clamp(
             _as_float(p_in.get("crop_bottom_percent", defaults.processing.crop_bottom_percent),
                       defaults.processing.crop_bottom_percent),
@@ -450,7 +472,21 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         ),
     )
 
-    return AppConfig(processing=p, llm=l, logging=log)
+    # Paths
+    base_dir_raw = _as_str(paths_in.get("base_dir", "."), ".")
+    fonts_dir_raw = _as_str(paths_in.get("fonts_dir", "fonts"), "fonts")
+
+    try:
+        base_abs = Path(base_dir_raw).resolve()
+    except Exception:
+        base_abs = Path(".").resolve()
+
+    paths = PathsConfig(
+        base_dir=str(base_abs),
+        fonts_dir=fonts_dir_raw,
+    )
+
+    return AppConfig(processing=p, llm=l, logging=log, paths=paths)
 
 
 _CONFIG: Optional[AppConfig] = None

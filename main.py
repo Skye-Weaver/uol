@@ -14,6 +14,7 @@ import traceback
 import time
 from Components.config import get_config, AppConfig
 from Components.Logger import logger, timed_operation
+from Components.Paths import build_short_output_name
 
 # Load config once
 cfg = get_config()
@@ -440,7 +441,8 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_segment.mp4")
         cropped_vertical_temp = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_temp.mp4")
         cropped_vertical_final = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_final.mp4")
-        final_output_with_captions = os.path.join(SHORTS_DIR, f"{output_base}_final.mp4")
+        # Use unified naming with zero-padded index for final output (and derived temp anim path)
+        final_output_with_captions, _unused_temp_anim = build_short_output_name(base_name, seq, SHORTS_DIR)
         if USE_ANIMATED_CAPTIONS:
             segment_audio_path = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_audio.wav")
 
@@ -794,11 +796,16 @@ def process_video(url: str = None, local_path: str = None):
 
             outputs = []
             for i, highlight in enumerate(highlights):
+                # Ensure proper sequencing for unique filenames and logging
+                payload = dict(highlight) if isinstance(highlight, dict) else highlight
+                if isinstance(payload, dict):
+                    payload["_seq"] = i + 1
+                    payload["_total"] = len(highlights)
                 with logger.operation_context(
                     "process_single_highlight",
-                    {"highlight_index": i, "highlight_text": highlight.get("caption_with_hashtags", "")[:50]}
+                    {"highlight_index": i, "highlight_text": (payload.get("caption_with_hashtags", "")[:50] if isinstance(payload, dict) else "")}
                 ):
-                    output = process_highlight(ctx, highlight)
+                    output = process_highlight(ctx, payload)
                     if output:
                         outputs.append(output)
 

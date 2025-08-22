@@ -5,6 +5,7 @@ import os
 import subprocess
 import traceback # For detailed error printing in animate_captions
 from PIL import Image, ImageDraw, ImageFont # Pillow imports for custom font
+from Components.Paths import fonts_path
 
 # Function to format time in SRT format
 def format_time(seconds):
@@ -187,18 +188,17 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
     try:
         # --- Font Setup (Pillow) ---
         font_size = 34  # Adjust size as needed
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        abs_font_path = os.path.normpath(os.path.join(base_dir, "..", "fonts", "Montserrat-Bold.ttf"))
+        font_path = fonts_path("Montserrat-Bold.ttf")
         font = None
         try:
-            if os.path.exists(abs_font_path):
-                font = ImageFont.truetype(abs_font_path, font_size)
-                print(f"Successfully loaded font: {abs_font_path}")
+            if os.path.exists(font_path):
+                font = ImageFont.truetype(font_path, font_size)
+                print(f"Successfully loaded font: {font_path}")
             else:
-                print(f"Font file not found at {abs_font_path}. Using PIL default font.")
+                print(f"Font file not found at {font_path}. Using PIL default font.")
                 font = ImageFont.load_default()
         except Exception as e:
-            print(f"Warning: could not load TTF font at {abs_font_path}: {e}. Using PIL default font.")
+            print(f"Warning: could not load TTF font at {font_path}: {e}. Using PIL default font.")
             font = ImageFont.load_default()
         # --- Pre-filter segments ---
         original_segments = transcription_result.get("segments", [])

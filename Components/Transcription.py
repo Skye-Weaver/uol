@@ -4,6 +4,9 @@ import os
 import psutil
 import time
 from Components.Logger import logger, timed_operation
+import json
+from pathlib import Path
+from Components.config import get_config
 
 
 # Старые функции транскрипции (`transcribeAudio`, `transcribe_word_level_full`)
@@ -127,6 +130,16 @@ def transcribe_unified(audio_path, model):
         # Финальное логирование ресурсов
         _log_system_resources("Завершение транскрипции")
 
+        # Экспорт артефактов транскрипции на диск
+        try:
+            cfg = get_config()
+            out_dir = getattr(cfg.processing, "transcriptions_dir", "transcriptions")
+            base_name = Path(audio_path).stem
+            export_transcription_artifacts(base_name, word_level_transcription, out_dir)
+        except Exception as ex:
+            logger.logger.error(f"Ошибка при сохранении транскрипции на диск: {ex}")
+            raise
+
         return segments_legacy, word_level_transcription
 
     except Exception as e:
@@ -135,6 +148,113 @@ def transcribe_unified(audio_path, model):
         traceback.print_exc()
         # Возвращаем пустые структуры в случае ошибки
         return [], {"segments": []}
+
+
+def _format_timestamp_srt(seconds: float) -> str:
+    try:
+        if seconds is None:
+            seconds = 0.0
+        seconds = float(seconds)
+    except Exception:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _format_timestamp_vtt(seconds: float) -> str:
+    try:
+        if seconds is None:
+            seconds = 0.0
+        seconds = float(seconds)
+    except Exception:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def export_transcription_artifacts(base_name: str, word_level_transcription: dict, out_dir: str) -> dict:
+    """
+    Экспортирует артефакты транскрипции в форматы TXT, JSON, SRT, VTT в указанный каталог.
+
+    Args:
+        base_name (str): Базовое имя файла без расширения.
+        word_level_transcription (dict): Полная транскрипция с ключом "segments".
+        out_dir (str): Каталог для сохранения файлов.
+
+    Returns:
+        dict: Словарь путей: {"txt": ..., "json": ..., "srt": ..., "vtt": ...}
+    """
+    if not isinstance(base_name, str) or not base_name:
+        raise ValueError("base_name must be a non-empty string")
+    if not isinstance(word_level_transcription, dict):
+        raise ValueError("word_level_transcription must be a dict")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    txt_path = os.path.join(out_dir, f"{base_name}.txt")
+    json_path = os.path.join(out_dir, f"{base_name}.json")
+    srt_path = os.path.join(out_dir, f"{base_name}.srt")
+    vtt_path = os.path.join(out_dir, f"{base_name}.vtt")
+
+    segments = word_level_transcription.get("segments", []) or []
+
+    # TXT: плоский текст
+    plain_lines = []
+    for seg in segments:
+        text = str(seg.get("text", "")).strip()
+        if text:
+            plain_lines.append(text)
+    with open(txt_path, "w", encoding="utf-8") as f_txt:
+        f_txt.write("\n".join(plain_lines))
+    logger.logger.info(f"Saving transcription to: {txt_path}")
+
+    # JSON: структура транскрипции
+    payload = word_level_transcription
+    with open(json_path, "w", encoding="utf-8") as f_json:
+        json.dump(payload, f_json, ensure_ascii=False, indent=2)
+    logger.logger.info(f"Saving transcription to: {json_path}")
+
+    # SRT
+    with open(srt_path, "w", encoding="utf-8") as f_srt:
+        idx = 1
+        for seg in segments:
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0) or 0.0)
+            end = float(seg.get("end", 0.0) or 0.0)
+            f_srt.write(f"{idx}\n")
+            f_srt.write(f"{_format_timestamp_srt(start)} --> {_format_timestamp_srt(end)}\n")
+            f_srt.write(f"{text}\n\n")
+            idx += 1
+    logger.logger.info(f"Saving transcription to: {srt_path}")
+
+    # VTT
+    with open(vtt_path, "w", encoding="utf-8") as f_vtt:
+        f_vtt.write("WEBVTT\n\n")
+        for seg in segments:
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0) or 0.0)
+            end = float(seg.get("end", 0.0) or 0.0)
+            f_vtt.write(f"{_format_timestamp_vtt(start)} --> {_format_timestamp_vtt(end)}\n")
+            f_vtt.write(f"{text}\n\n")
+    logger.logger.info(f"Saving transcription to: {vtt_path}")
+
+    return {"txt": txt_path, "json": json_path, "srt": srt_path, "vtt": vtt_path}
 
 
 def _log_system_resources(context: str = ""):

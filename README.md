@@ -283,6 +283,69 @@ llm:
   "Конфиг не найден. Использую значения по умолчанию." — см. [Components/config.py](Components/config.py:100).
 - Логирование факта загрузки и активной модели — см. [main.py](main.py:15).
 
+## Централизованные пути и конфигурация
+
+Начиная с актуальной версии, все ресурсы и каталоги резолвятся относительно базовой директории из конфига. Ключевые параметры задаются в секции `paths` и `processing`.
+
+Пример фрагмента `config.yaml` (минимальный):
+```yaml
+paths:
+  base_dir: .
+  fonts_dir: fonts
+processing:
+  transcriptions_dir: transcriptions
+  shorts_dir: shorts
+```
+
+Назначение ключей:
+- `base_dir` — корень проекта, относительно которого резолвятся внутренние пути.
+- `fonts_dir` — подкаталог со шрифтами (по умолчанию `fonts`), резолвится относительно `base_dir`.
+- `transcriptions_dir` — директория, куда сохраняются транскрипции (`.txt/.json/.srt/.vtt`).
+- `shorts_dir` — директория, куда сохраняются итоговые шорт‑видео.
+
+Центральные функции резолва путей:
+- Ресурсы: [resolve_path()](Components/Paths.py:22)
+- Шрифты: [fonts_path()](Components/Paths.py:37)
+
+Пример резолва пути к шрифту «Montserrat-Bold.ttf» с настройками по умолчанию:
+- Конфиг: `paths.base_dir: .`, `paths.fonts_dir: fonts`
+- Вызов: [fonts_path()](Components/Paths.py:37) для `"Montserrat-Bold.ttf"` даст путь вида: `<ABS_BASE_DIR>/fonts/Montserrat-Bold.ttf`
+
+## Именование выходных short‑файлов
+
+Уникальные имена итоговых и временных short‑файлов формируются функцией [build_short_output_name()](Components/Paths.py:6).
+
+Шаблоны:
+- Итоговый: `shorts/{base_name}_highlight_{idx:02d}_final.mp4`  
+  Пример: `shorts/master-ABC_highlight_01_final.mp4`
+- Временный (анимация): `{final_path}_temp_anim.mp4`
+
+Индекс `idx` — это порядковый номер хайлайта в текущей сессии; он пробрасывается из цикла и логируется (см. [main.py](main.py)).
+
+## Экспорт транскрипций
+
+После завершения унифицированной транскрипции ("Unified transcription complete…") экспорт выполняется автоматически, код — [Components/Transcription.py](Components/Transcription.py).
+
+Создаются файлы:
+- `{transcriptions_dir}/{base_name}.txt`
+- `{transcriptions_dir}/{base_name}.json`
+- `{transcriptions_dir}/{base_name}.srt`
+- `{transcriptions_dir}/{base_name}.vtt`
+
+Особенности:
+- JSON сохраняет сегменты и слова в UTF‑8 (`ensure_ascii=False`).
+- Папка назначения задаётся через `processing.transcriptions_dir` в `config.yaml`.
+
+## Пути и совместимость окружений
+
+- Абсолютные пути вида `/content/uol/*` больше не используются — все ресурсы резолвятся относительно `paths.base_dir`.
+- Для Google Colab/контейнеров можно установить `paths.base_dir` на рабочую директорию окружения — остальные относительные пути (`fonts_dir`, `transcriptions_dir`, `shorts_dir`) подхватятся корректно.
+
+### Релевантные тесты
+
+- Проверка уникальности имён short‑файлов: [tests/test_output_naming.py](tests/test_output_naming.py)
+- Экспорт транскрипции в 4 формата: [tests/test_transcription_export.py](tests/test_transcription_export.py)
+- Резолв путей для ресурсов и шрифта: [tests/test_resource_paths.py](tests/test_resource_paths.py)
 ## Тесты
 
 - Запуск всех тестов:

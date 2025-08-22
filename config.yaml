@@ -1,7 +1,20 @@
+# --- Paths & processing hints (comments only, safe to keep as-is) ---
+# Все пути теперь резолвятся относительно paths.base_dir.
+# Для Colab/контейнеров можно указать base_dir как рабочую директорию окружения;
+# fonts_dir и прочие каталоги будут резолвиться относительно base_dir.
+#
+# Примерные значения по умолчанию (РАЗКОММЕНТИРУЙТЕ при необходимости переопределения):
+# paths:
+#   base_dir: .
+#   fonts_dir: fonts
+# processing:
+#   transcriptions_dir: "transcriptions"  # экспорт .txt/.json/.srt/.vtt
+#   shorts_dir: "shorts"                   # каталог итоговых шортов
 processing:
   use_animated_captions: true
   shorts_dir: "shorts"
   videos_dir: "videos"
+  transcriptions_dir: "transcriptions"
   crop_bottom_percent: 0.0
   min_video_dimension_px: 100
   log_transcription_preview_len: 200
@@ -85,3 +98,6 @@ logging:
   resource_monitoring_interval: 1.0  # seconds
   enable_resource_alerts: true
   alert_threshold_duration: 30.0  # seconds for long operations
+paths:
+  base_dir: .
+  fonts_dir: fonts
