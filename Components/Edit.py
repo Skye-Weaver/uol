@@ -9,10 +9,11 @@ import json # For ffprobe output
 
 import cv2
 import numpy as np
+import torch
 
 # Import caption functions from the new module
 from .Captions import burn_captions, animate_captions, create_ass_file
-from .FaceCrop import crop_to_vertical_dynamic_smoothed # Import the new function
+from .FaceCrop import crop_to_vertical_dynamic_smoothed, analyze_face_position_lightweight # Import the new function
 
 def extractAudio(video_path):
     try:
@@ -263,8 +264,8 @@ def process_frame_for_vertical_short(
             ass_file_path,
             final_width,
             final_height,
-            start_time=0, # Timestamps in ASS are relative to the segment
-            end_time=(end_time - start_time)
+            0, # Timestamps in ASS are relative to the segment
+            (end_time - start_time)
         )
         if not ass_success:
             print("Warning: Failed to create ASS subtitle file. Proceeding without captions.")
@@ -309,6 +310,170 @@ def process_frame_for_vertical_short(
         return False
     except Exception as e:
         print(f"An unexpected error occurred in process_frame_for_vertical_short: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        # --- Cleanup ---
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+                print(f"Cleaned up temporary directory: {temp_dir}")
+            except OSError as e:
+                print(f"Warning: could not remove temp directory: {e}")
+
+
+def process_highlight_unified(
+    source_video_path: str,
+    output_path: str,
+    start_time: float,
+    end_time: float,
+    word_level_transcription: dict,
+    crop_bottom_percent: float = 0.0,
+    face_cascade_path: str = 'haarcascade_frontalface_default.xml'
+) -> bool:
+    """
+    Unified processing function that creates a vertical short using a single FFmpeg pipeline.
+    This eliminates multiple read/write operations by combining crop and ass filters.
+    """
+    temp_dir = None
+    ass_file_path = None
+
+    try:
+        # 1. --- Setup and Validation ---
+        if not os.path.exists(source_video_path):
+            print(f"Error: Source video not found at '{source_video_path}'")
+            return False
+        if end_time <= start_time:
+            print("Error: End time must be greater than start time.")
+            return False
+
+        temp_dir = tempfile.mkdtemp()
+        ass_file_path = os.path.join(temp_dir, "captions.ass")
+
+        # 2. --- Analyze Face Position ---
+        print("Analyzing face position for crop parameters...")
+        avg_face_center_x = analyze_face_position_lightweight(
+            video_path=source_video_path,
+            sample_rate=25
+        )
+
+        if avg_face_center_x is None or avg_face_center_x == 0.0:
+            print("Warning: Could not analyze face position, using center crop")
+            avg_face_center_x = original_width / 2  # Default to center in pixels
+        else:
+            # Convert to normalized value (0.0 to 1.0)
+            avg_face_center_x = avg_face_center_x / original_width
+
+        # 3. --- Calculate Crop Parameters ---
+        # For vertical video (9:16 aspect ratio)
+        target_aspect = 9/16
+        original_width, original_height = get_video_dimensions(source_video_path)
+
+        if not original_width or not original_height:
+            print("Error: Could not get video dimensions")
+            return False
+
+        # Calculate crop dimensions
+        crop_height = original_height
+        crop_width = int(crop_height * target_aspect)
+
+        # Ensure crop width doesn't exceed original width
+        if crop_width > original_width:
+            crop_width = original_width
+            crop_height = int(crop_width / target_aspect)
+
+        # Calculate crop x position based on face center (avg_face_center_x is normalized 0.0-1.0)
+        crop_x = int((original_width - crop_width) * avg_face_center_x)
+        # Ensure crop doesn't go outside video bounds
+        crop_x = max(0, min(crop_x, original_width - crop_width))
+
+        # Apply bottom crop percentage if specified
+        if crop_bottom_percent > 0:
+            crop_height = int(crop_height * (1.0 - crop_bottom_percent))
+            # Ensure even height for FFmpeg
+            crop_height = crop_height - (crop_height % 2)
+
+        crop_filter = f"crop={crop_width}:{crop_height}:{crop_x}:0"
+
+        # 4. --- Create ASS Subtitle File ---
+        print("Creating ASS subtitle file...")
+        ass_success = create_ass_file(
+            word_level_transcription,
+            ass_file_path,
+            crop_width,  # Use cropped dimensions
+            crop_height,
+            segment_start_time=0,
+            segment_end_time=(end_time - start_time)
+        )
+
+        if not ass_success:
+            print("Warning: Failed to create ASS subtitle file. Proceeding without captions.")
+            ass_file_path = None
+
+        # 5. --- Check GPU Availability and Build Single FFmpeg Command ---
+        print("Checking GPU availability for hardware acceleration...")
+        gpu_available = torch.cuda.is_available()
+        if gpu_available:
+            print("NVIDIA GPU detected - using GPU acceleration (NVENC)")
+            video_codec = 'h264_nvenc'
+            hwaccel_flag = ['-hwaccel', 'cuda']
+        else:
+            print("No NVIDIA GPU detected - using CPU encoding (libx264)")
+            video_codec = 'libx264'
+            hwaccel_flag = []
+
+        print("Building unified FFmpeg command with crop and ass filters...")
+
+        ffmpeg_command = [
+            'ffmpeg'
+        ] + hwaccel_flag + [
+            '-ss', str(start_time),
+            '-i', source_video_path,
+            '-t', str(end_time - start_time),
+            '-c:a', 'copy'
+        ]
+
+        # Build video filter chain
+        video_filters = [crop_filter]
+
+        # Add ASS filter if subtitle file was created
+        if ass_file_path and os.path.exists(ass_file_path):
+            escaped_ass_path = ass_file_path.replace('\\', '/').replace(':', '\\\\:')
+            video_filters.append(f"ass='{escaped_ass_path}'")
+
+        # Join filters with comma
+        if video_filters:
+            ffmpeg_command.extend(['-vf', ','.join(video_filters)])
+
+        # Output settings
+        ffmpeg_command.extend([
+            '-c:v', video_codec,
+            '-preset', 'medium',
+            '-crf', '23',
+            '-aspect', '9:16',
+            '-y',
+            output_path
+        ])
+
+        # 6. --- Execute FFmpeg Command ---
+        cmd_string = ' '.join(shlex.quote(str(arg)) for arg in ffmpeg_command)
+        print(f"Executing unified FFmpeg command: {cmd_string}")
+
+        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, encoding='utf-8')
+        print(f"Successfully created unified vertical short at: {output_path}")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error during unified FFmpeg execution:")
+        print(f"  Command: {' '.join(e.cmd)}")
+        print(f"  Return Code: {e.returncode}")
+        print(f"  Stdout: {e.stdout.strip() if e.stdout else 'N/A'}")
+        print(f"  Stderr: {e.stderr.strip() if e.stderr else 'N/A'}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred in process_highlight_unified: {e}")
         import traceback
         traceback.print_exc()
         return False
