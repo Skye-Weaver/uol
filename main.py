@@ -12,10 +12,15 @@ from typing import Optional, List
 import os
 import traceback
 from Components.config import get_config, AppConfig
+from Components.Logger import logger, timed_operation
 
 # Load config once
 cfg = get_config()
 print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}")
+
+# Инициализация системы логирования
+if cfg.logging.enable_system_info_logging:
+    logger.log_system_info()
 
 # --- Configuration Flags ---
 # Set to True to use two words-level animated captions (slower but nicer)
@@ -205,54 +210,56 @@ def init_context(url: Optional[str], local_path: Optional[str]) -> ProcessingCon
     return ctx
 
 
+@timed_operation("resolve_video_source")
 def resolve_video_source(ctx: ProcessingContext) -> bool:
     """Определяет источник видео (URL/локальный), учитывает кэш БД, выставляет ctx.video_path и ctx.video_id."""
     if not ctx.url and not ctx.local_path:
-        print("Error: Must provide either URL or local path")
+        logger.logger.error("Error: Must provide either URL or local path")
         return False
 
     video_path = None
     video_id = None
 
     if ctx.url:
-        print(f"Processing YouTube URL: {ctx.url}")
+        logger.logger.info(f"Processing YouTube URL: {ctx.url}")
         cached_data = ctx.db.get_cached_processing(youtube_url=ctx.url)
         if cached_data:
-            print("Found cached video from URL!")
+            logger.logger.info("Found cached video from URL!")
             video_path = cached_data["video"][2]
             video_id = cached_data["video"][0]
             if not os.path.exists(video_path):
-                print(f"Cached video path not found: {video_path}. Re-downloading.")
+                logger.logger.warning(f"Cached video path not found: {video_path}. Re-downloading.")
                 video_path = None
                 video_id = None
         if not video_path:
-            video_path = download_youtube_video(ctx.url)
-            if not video_path:
-                print("Failed to download video")
-                return False
-            if not video_path.lower().endswith('.mp4'):
-                base, _ = os.path.splitext(video_path)
-                new_path = base + ".mp4"
-                try:
-                    os.rename(video_path, new_path)
-                    video_path = new_path
-                    print(f"Renamed downloaded file to: {video_path}")
-                except OSError as e:
-                    print(f"Error renaming file to mp4: {e}. Trying conversion.")
-                    pass
+            with logger.operation_context("download_youtube_video", {"url": ctx.url}):
+                video_path = download_youtube_video(ctx.url)
+                if not video_path:
+                    logger.logger.error("Failed to download video")
+                    return False
+                if not video_path.lower().endswith('.mp4'):
+                    base, _ = os.path.splitext(video_path)
+                    new_path = base + ".mp4"
+                    try:
+                        os.rename(video_path, new_path)
+                        video_path = new_path
+                        logger.logger.info(f"Renamed downloaded file to: {video_path}")
+                    except OSError as e:
+                        logger.logger.warning(f"Error renaming file to mp4: {e}. Trying conversion.")
+                        pass
     else:
-        print(f"Processing local file: {ctx.local_path}")
+        logger.logger.info(f"Processing local file: {ctx.local_path}")
         if not os.path.exists(ctx.local_path):
-            print("Error: Local file does not exist")
+            logger.logger.error("Error: Local file does not exist")
             return False
         video_path = ctx.local_path
         cached_data = ctx.db.get_cached_processing(local_path=ctx.local_path)
         if cached_data:
-            print("Found cached local video!")
+            logger.logger.info("Found cached local video!")
             video_id = cached_data["video"][0]
 
     if not video_path or not os.path.exists(video_path):
-        print("No valid video path obtained or file does not exist.")
+        logger.logger.error("No valid video path obtained or file does not exist.")
         return False
 
     ctx.video_path = video_path
@@ -394,6 +401,7 @@ def fetch_highlights(ctx: ProcessingContext) -> list:
     return GetHighlights(ctx.transcription_text or "")
 
 
+@timed_operation("process_highlight")
 def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
     """Обрабатывает один хайлайт: кропы, субтитры, сохранение; возвращает путь финального файла либо None."""
     temp_segment = None
@@ -416,14 +424,14 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
             if last_word_end is not None and last_word_end > stop:
                 prev_stop = adjusted_stop
                 adjusted_stop = last_word_end
-                print(f"[WordLevel] Adjusted stop from {prev_stop:.2f}s to {adjusted_stop:.2f}s based on last word end")
+                logger.logger.info(f"[WordLevel] Adjusted stop from {prev_stop:.2f}s to {adjusted_stop:.2f}s based on last word end")
         # Гарантия: stop > start
         if adjusted_stop <= start:
             adjusted_stop = start + 0.1
 
-        print(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s (effective end {adjusted_stop:.2f}s) ---")
+        logger.logger.info(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s (effective end {adjusted_stop:.2f}s) ---")
         if isinstance(item, dict) and "caption_with_hashtags" in item:
-            print(f"Caption: {item['caption_with_hashtags']}")
+            logger.logger.info(f"Caption: {item['caption_with_hashtags']}")
 
         # --- Define File Paths ---
         base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
@@ -436,49 +444,52 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
             segment_audio_path = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_audio.wav")
 
         # 1. Extract Segment (Video + Audio, Original Aspect Ratio)
-        print("1. Extracting segment...")
-        extract_success = crop_video(ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height)
-        if not extract_success:
-            print(f"Failed step 1 for highlight {seq}. Skipping.")
-            if os.path.exists(temp_segment):
-                try:
-                    os.remove(temp_segment)
-                except Exception as clean_e:
-                    print(f"Warning: Could not remove temp segment file: {clean_e}")
-            return None
+        with logger.operation_context("extract_segment", {"start": start, "end": adjusted_stop}):
+            logger.logger.info("1. Extracting segment...")
+            extract_success = crop_video(ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height)
+            if not extract_success:
+                logger.logger.error(f"Failed step 1 for highlight {seq}. Skipping.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
+                return None
 
         # --- CHECK DIMENSIONS: Segment ---
-        print("\n--- Checking Segment Video Dimensions ---")
-        segment_width, segment_height = get_video_dimensions(temp_segment)
-        if segment_width is None or segment_height is None:
-            print("Error: Could not determine segment video dimensions. Skipping highlight.")
-            if os.path.exists(temp_segment):
-                try:
-                    os.remove(temp_segment)
-                except Exception as clean_e:
-                    print(f"Warning: Could not remove temp segment file: {clean_e}")
-            return None
-        if segment_width != ctx.initial_width or segment_height != ctx.initial_height:
-            print(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({ctx.initial_width}x{ctx.initial_height}).")
-        print("--- Segment Check Done ---")
+        with logger.operation_context("check_segment_dimensions", {"segment_path": temp_segment}):
+            logger.logger.info("\n--- Checking Segment Video Dimensions ---")
+            segment_width, segment_height = get_video_dimensions(temp_segment)
+            if segment_width is None or segment_height is None:
+                logger.logger.error("Error: Could not determine segment video dimensions. Skipping highlight.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
+                return None
+            if segment_width != ctx.initial_width or segment_height != ctx.initial_height:
+                logger.logger.warning(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({ctx.initial_width}x{ctx.initial_height}).")
+            logger.logger.info("--- Segment Check Done ---")
 
         # 2. Create Vertical Crop (Based on Average Face Position)
-        print("2. Creating average face centered vertical crop...")
-        vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
-        if not vert_crop_path:
-            print(f"Failed step 2 (average face crop) for highlight {seq}. Skipping.")
-            if os.path.exists(temp_segment):
-                try:
-                    os.remove(temp_segment)
-                except Exception as clean_e:
-                    print(f"Warning: Could not remove temp segment file: {clean_e}")
-            if os.path.exists(cropped_vertical_temp):
-                try:
-                    os.remove(cropped_vertical_temp)
-                except Exception as clean_e:
-                    print(f"Warning: Could not remove temp vertical crop file: {clean_e}")
-            return None
-        cropped_vertical_temp = vert_crop_path
+        with logger.operation_context("create_vertical_crop", {"segment_path": temp_segment}):
+            logger.logger.info("2. Creating average face centered vertical crop...")
+            vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
+            if not vert_crop_path:
+                logger.logger.error(f"Failed step 2 (average face crop) for highlight {seq}. Skipping.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
+                if os.path.exists(cropped_vertical_temp):
+                    try:
+                        os.remove(cropped_vertical_temp)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp vertical crop file: {clean_e}")
+                return None
+            cropped_vertical_temp = vert_crop_path
 
         # 3. Crop Bottom Off Vertical Video (Temporary Fix)
         if CROP_PERCENTAGE_BOTTOM > 0:
@@ -587,44 +598,46 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
             else:
                 captioning_success = True
 
-        print(f"Successfully processed highlight {seq}.")
+        logger.logger.info(f"Successfully processed highlight {seq}.")
         ctx.outputs.append(final_output_with_captions)
-        print(f"Saving highlight {seq} info to database: {final_output_with_captions}")
+        logger.logger.info(f"Saving highlight {seq} info to database: {final_output_with_captions}")
 
         segment_text = item.get('segment_text', '') if isinstance(item, dict) else ''
         caption = item.get('caption_with_hashtags', '') if isinstance(item, dict) else ''
 
-        ctx.db.add_highlight(
-            ctx.video_id,
-            start,
-            adjusted_stop,
-            final_output_with_captions,
-            segment_text=segment_text,
-            caption_with_hashtags=caption
-        )
+        with logger.operation_context("save_to_database", {"video_id": ctx.video_id, "highlight_path": final_output_with_captions}):
+            ctx.db.add_highlight(
+                ctx.video_id,
+                start,
+                adjusted_stop,
+                final_output_with_captions,
+                segment_text=segment_text,
+                caption_with_hashtags=caption
+            )
 
         # --- Cleanup Intermediate Files ---
-        print("Cleaning up intermediate files for this highlight...")
-        if os.path.exists(temp_segment):
-            try:
-                os.remove(temp_segment)
-            except Exception as clean_e:
-                print(f"Warning: Could not remove temp segment file: {clean_e}")
-        if os.path.exists(cropped_vertical_temp):
-            try:
-                os.remove(cropped_vertical_temp)
-            except Exception as clean_e:
-                print(f"Warning: Could not remove temp vertical file: {clean_e}")
-        if os.path.exists(cropped_vertical_final):
-            try:
-                os.remove(cropped_vertical_final)
-            except Exception as clean_e:
-                print(f"Warning: Could not remove final vertical file: {clean_e}")
-        if segment_audio_path and os.path.exists(segment_audio_path):
-            try:
-                os.remove(segment_audio_path)
-            except Exception as clean_e:
-                print(f"Warning: Could not remove segment audio file: {clean_e}")
+        with logger.operation_context("cleanup_intermediate_files", {"highlight_seq": seq}):
+            logger.logger.info("Cleaning up intermediate files for this highlight...")
+            if os.path.exists(temp_segment):
+                try:
+                    os.remove(temp_segment)
+                except Exception as clean_e:
+                    logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
+            if os.path.exists(cropped_vertical_temp):
+                try:
+                    os.remove(cropped_vertical_temp)
+                except Exception as clean_e:
+                    logger.logger.warning(f"Warning: Could not remove temp vertical file: {clean_e}")
+            if os.path.exists(cropped_vertical_final):
+                try:
+                    os.remove(cropped_vertical_final)
+                except Exception as clean_e:
+                    logger.logger.warning(f"Warning: Could not remove final vertical file: {clean_e}")
+            if segment_audio_path and os.path.exists(segment_audio_path):
+                try:
+                    os.remove(segment_audio_path)
+                except Exception as clean_e:
+                    logger.logger.warning(f"Warning: Could not remove segment audio file: {clean_e}")
 
         return final_output_with_captions
 
@@ -682,62 +695,113 @@ def process_all_highlights(ctx: ProcessingContext, items: list) -> List[str]:
 
 
 def _select_whisper_runtime():
-    """Выбирает оптимальные параметры для модели Whisper."""
+    """Выбирает оптимальные параметры для модели Whisper с GPU-first подходом."""
     try:
         has_cuda = torch.cuda.is_available()
+        gpu_count = torch.cuda.device_count() if has_cuda else 0
     except Exception:
         has_cuda = False
-    device = "cuda" if has_cuda else "cpu"
-    model_size = "large-v3" if has_cuda else "small"
-    compute_type = "float16" if has_cuda else "int8"
-    cpu_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
+        gpu_count = 0
+
+    # GPU-first подход
+    if has_cuda and cfg.logging.gpu_priority_mode:
+        device = "cuda"
+        # Используем лучшую доступную модель для GPU
+        model_size = "large-v3"
+        compute_type = "float16"
+        cpu_threads = 0  # Для GPU используем 0 CPU threads
+        logger.logger.info(f"GPU-first режим: Используем {gpu_count} GPU(s), модель {model_size}")
+    else:
+        device = "cpu"
+        model_size = "small"
+        compute_type = "int8"
+        cpu_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
+        logger.logger.info(f"CPU режим: Используем {cpu_threads} потоков, модель {model_size}")
+
     return model_size, device, compute_type, cpu_threads
 
 
+@timed_operation("video_processing_pipeline")
 def process_video(url: str = None, local_path: str = None):
     """
     Координатор пайплайна. Публичная сигнатура сохранена.
     Возвращает список путей к сгенерированным клипам или None при ошибке/пустом результате.
     """
-    ctx = init_context(url, local_path)
-    if not resolve_video_source(ctx):
-        return None
-    if not validate_dimensions(ctx):
-        return None
-    if not ensure_audio(ctx):
-        return None
+    with logger.operation_context("initialize_context", {"url": url, "local_path": local_path}):
+        ctx = init_context(url, local_path)
 
-    # --- Загрузка модели Whisper ---
-    print("\n--- Loading Whisper Model ---")
-    model_size, device, compute_type, cpu_threads = _select_whisper_runtime()
-    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
-    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
-    try:
-        model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            cpu_threads=cpu_threads if device == "cpu" else 0,
-            num_workers=2,
-        )
-        print(f"Faster-Whisper model loaded: {model_size} on {device} ({compute_type})")
-    except Exception as e:
-        print(f"FATAL: Could not load Whisper model. Error: {e}")
-        return None
-    
-    # --- Транскрипция (унифицированный вызов) ---
-    if not run_unified_transcription(ctx, model):
-        return None
-
-    prepare_transcript_text(ctx)
-
-    try:
-        highlights = fetch_highlights(ctx)
-        if not highlights or len(highlights) == 0:
-            print("No valid highlights found")
+    with logger.operation_context("resolve_video_source", {"url": url, "local_path": local_path}):
+        if not resolve_video_source(ctx):
             return None
 
-        outputs = process_all_highlights(ctx, highlights)
+    with logger.operation_context("validate_dimensions", {"video_path": ctx.video_path}):
+        if not validate_dimensions(ctx):
+            return None
+
+    with logger.operation_context("ensure_audio", {"video_path": ctx.video_path}):
+        if not ensure_audio(ctx):
+            return None
+
+    # --- Загрузка модели Whisper ---
+    with logger.operation_context("load_whisper_model", {"model_size": "auto", "device": "auto"}):
+        print("\n--- Loading Whisper Model ---")
+        model_size, device, compute_type, cpu_threads = _select_whisper_runtime()
+        os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+        os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+        try:
+            model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads if device == "cpu" else 0,
+                num_workers=2,
+            )
+            print(f"Faster-Whisper model loaded: {model_size} on {device} ({compute_type})")
+        except Exception as e:
+            print(f"FATAL: Could not load Whisper model. Error: {e}")
+            return None
+
+    # --- Транскрипция (унифицированный вызов) ---
+    with logger.operation_context("transcription", {"audio_path": ctx.audio_path}):
+        if not run_unified_transcription(ctx, model):
+            return None
+
+    with logger.operation_context("prepare_transcript_text", {"transcription_length": len(ctx.transcription_text or "")}):
+        prepare_transcript_text(ctx)
+
+    try:
+        with logger.operation_context("fetch_highlights", {"transcription_length": len(ctx.transcription_text or "")}):
+            highlights = fetch_highlights(ctx)
+            if not highlights or len(highlights) == 0:
+                print("No valid highlights found")
+                return None
+
+        with logger.operation_context("process_highlights", {"highlights_count": len(highlights)}):
+            # Создаем прогресс-бар для обработки хайлайтов
+            progress_bar = logger.create_progress_bar(
+                total=len(highlights),
+                desc="Обработка хайлайтов",
+                unit="highlight"
+            )
+
+            outputs = []
+            for i, highlight in enumerate(highlights):
+                with logger.operation_context(
+                    "process_single_highlight",
+                    {"highlight_index": i, "highlight_text": highlight.get("caption_with_hashtags", "")[:50]}
+                ):
+                    output = process_highlight(ctx, highlight)
+                    if output:
+                        outputs.append(output)
+
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "Обработано": f"{i+1}/{len(highlights)}",
+                    "Успешно": len(outputs)
+                })
+
+            progress_bar.close()
+
         if not outputs:
             return None
         return outputs
