@@ -23,11 +23,6 @@ print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, m
 if cfg.logging.enable_system_info_logging:
     logger.log_system_info()
 
-# Инициализация постоянного мониторинга ресурсов
-if cfg.logging.enable_resource_monitoring:
-    logger.start_resource_monitoring()
-    logger.log_resource_status()
-
 # --- Configuration Flags ---
 # Set to True to use two words-level animated captions (slower but nicer)
 # Set to False to use the default, faster ASS subtitle burning

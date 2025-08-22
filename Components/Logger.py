@@ -11,7 +11,7 @@ from functools import wraps
 from typing import Optional, Dict, Any, Callable
 from pathlib import Path
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import torch
@@ -21,7 +21,6 @@ from tqdm import tqdm
 import os
 from logging.handlers import RotatingFileHandler
 import sys
-from Components.ResourceMonitor import resource_monitor, ResourceAlert
 
 
 @dataclass
@@ -113,8 +112,7 @@ class AdvancedLogger:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
 
-        # Используем глобальный монитор ресурсов
-        self.resource_monitor = resource_monitor
+        self.monitor = ResourceMonitor()
         self.active_operations: Dict[str, PerformanceMetrics] = {}
         self._lock = threading.Lock()
 
@@ -126,9 +124,6 @@ class AdvancedLogger:
 
         # GPU-first настройки
         self._ensure_gpu_priority()
-
-        # Настройка callback для оповещений о ресурсах
-        self._setup_resource_alerts()
 
     def _setup_loggers(self):
         """Настройка системы логирования с ротацией"""
@@ -196,7 +191,7 @@ class AdvancedLogger:
 
     def _ensure_gpu_priority(self):
         """Обеспечить GPU-first подход"""
-        if self.resource_monitor.gpu_available:
+        if self.monitor.gpu_available:
             try:
                 # Установить текущий GPU
                 torch.cuda.set_device(0)
@@ -214,114 +209,36 @@ class AdvancedLogger:
         else:
             self.logger.info("GPU не доступен, используется CPU режим")
 
-    def _setup_resource_alerts(self):
-        """Настройка callback функций для оповещений о ресурсах"""
-        def resource_alert_handler(alert: ResourceAlert):
-            """Обработчик оповещений о ресурсах"""
-            alert_msg = f"{alert.severity_icon} {alert.alert_type.upper()} {alert.severity.upper()}: {alert.message}"
-
-            if alert.severity == 'critical':
-                self.logger.critical(alert_msg)
-            elif alert.severity == 'warning':
-                self.logger.warning(alert_msg)
-            else:
-                self.logger.info(alert_msg)
-
-        self.resource_monitor.add_alert_callback(resource_alert_handler)
-
-    def format_duration(self, seconds: float) -> str:
-        """Форматирование длительности в читаемый вид"""
-        if seconds < 0.001:  # < 1ms
-            return ".2f"
-        elif seconds < 0.1:  # < 100ms
-            return ".1f"
-        elif seconds < 60:  # < 1 мин
-            return ".2f"
-        elif seconds < 3600:  # < 1 час
-            minutes = int(seconds // 60)
-            secs = seconds % 60
-            return ".1f"
-        else:  # >= 1 час
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            secs = seconds % 60
-            return ".1f"
-
-    def format_timestamp(self, timestamp: float = None) -> str:
-        """Форматирование временной метки"""
-        if timestamp is None:
-            timestamp = time.time()
-
-        dt = datetime.fromtimestamp(timestamp)
-        return dt.strftime("%H:%M:%S.%f")[:-3]  # ЧЧ:ММ:СС.мс
-
-    def format_operation_time(self, start_time: float, end_time: float = None) -> str:
-        """Форматирование времени операции с дополнительной информацией"""
-        if end_time is None:
-            end_time = time.time()
-
-        duration = end_time - start_time
-        start_dt = datetime.fromtimestamp(start_time)
-        end_dt = datetime.fromtimestamp(end_time)
-
-        # Если операция длилась менее секунды, показываем миллисекунды
-        if duration < 1.0:
-            return ".1f"
-        # Если операция длилась менее минуты, показываем секунды
-        elif duration < 60.0:
-            return ".2f"
-        # Если операция длилась менее часа, показываем минуты и секунды
-        elif duration < 3600.0:
-            minutes = int(duration // 60)
-            seconds = duration % 60
-            return ".1f"
-        # Если операция длилась час или более, показываем часы, минуты и секунды
-        else:
-            hours = int(duration // 3600)
-            minutes = int((duration % 3600) // 60)
-            seconds = duration % 60
-            return ".1f"
-
     def start_operation(self, operation_name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         """Начать отслеживание операции"""
         operation_id = f"{operation_name}_{time.time()}_{threading.get_ident()}"
-        start_time = time.time()
 
         with self._lock:
             metrics = PerformanceMetrics(
                 operation_name=operation_name,
-                start_time=start_time,
-                cpu_usage_start=self.resource_monitor.get_current_status().cpu_percent if self.resource_monitor.get_current_status() else 0.0,
-                memory_usage_start=self.resource_monitor.get_current_status().memory_used_gb * (1024**3) if self.resource_monitor.get_current_status() else 0,
-                gpu_usage_start=self.resource_monitor.get_current_status().gpu_data if self.resource_monitor.get_current_status() else None,
+                start_time=time.time(),
+                cpu_usage_start=self.monitor.get_cpu_usage(),
+                memory_usage_start=self.monitor.get_memory_usage(),
+                gpu_usage_start=self.monitor.get_gpu_usage(),
                 metadata=metadata or {}
             )
             self.active_operations[operation_id] = metrics
 
-        timestamp = self.format_timestamp(start_time)
-        self.logger.info(f"🚀 [{timestamp}] Начата операция: {operation_name} (ID: {operation_id})")
+        self.logger.info(f"🚀 Начата операция: {operation_name} (ID: {operation_id})")
         return operation_id
 
     def end_operation(self, operation_id: str, success: bool = True, error_message: Optional[str] = None):
         """Завершить отслеживание операции"""
-        end_time = time.time()
-
         with self._lock:
             if operation_id not in self.active_operations:
                 self.logger.warning(f"Операция {operation_id} не найдена")
                 return
 
             metrics = self.active_operations[operation_id]
-            metrics.end_time = end_time
-            current_status = self.resource_monitor.get_current_status()
-            if current_status:
-                metrics.cpu_usage_end = current_status.cpu_percent
-                metrics.memory_usage_end = current_status.memory_used_gb * (1024**3)
-                metrics.gpu_usage_end = current_status.gpu_data
-            else:
-                metrics.cpu_usage_end = 0.0
-                metrics.memory_usage_end = 0
-                metrics.gpu_usage_end = None
+            metrics.end_time = time.time()
+            metrics.cpu_usage_end = self.monitor.get_cpu_usage()
+            metrics.memory_usage_end = self.monitor.get_memory_usage()
+            metrics.gpu_usage_end = self.monitor.get_gpu_usage()
             metrics.success = success
             metrics.error_message = error_message
 
@@ -341,28 +258,12 @@ class AdvancedLogger:
         status_icon = "✅" if metrics.success else "❌"
         status_text = "УСПЕХ" if metrics.success else "ОШИБКА"
 
-        # Форматирование времени операции
-        time_info = self.format_operation_time(metrics.start_time, metrics.end_time)
-
-        # Информация о ресурсах
-        resource_info = ".1f"
-        if abs(memory_delta) > 0.1:  # Показываем только значимые изменения
-            resource_info += ".1f"
-
-        # GPU информация
-        gpu_info = ""
-        if metrics.gpu_usage_start and metrics.gpu_usage_end:
-            for gpu_id in metrics.gpu_usage_start.keys():
-                if gpu_id in metrics.gpu_usage_end:
-                    start_usage = metrics.gpu_usage_start[gpu_id].get('usage', 0)
-                    end_usage = metrics.gpu_usage_end[gpu_id].get('usage', 0)
-                    if abs(end_usage - start_usage) > 1.0:  # Показываем только значимые изменения
-                        gpu_info += ".1f"
-
-        # Основное логирование с улучшенным форматом
-        timestamp = self.format_timestamp(metrics.end_time)
+        # Основное логирование
         self.logger.info(
-            f"🏁 [{timestamp}] Операция '{metrics.operation_name}' завершена - {time_info} - {resource_info}{gpu_info} - {status_icon} {status_text}"
+            ".2f"
+            ".1f"
+            ".1f"
+            f"{status_icon} {status_text}"
         )
 
         # Детальное логирование производительности
@@ -442,67 +343,15 @@ class AdvancedLogger:
         """Очистка ресурсов"""
         self.executor.shutdown(wait=True)
         # Очистка GPU памяти если возможно
-        if self.resource_monitor.gpu_available:
+        if self.monitor.gpu_available:
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
 
-    def start_resource_monitoring(self):
-        """Запуск постоянного мониторинга ресурсов"""
-        if not self.resource_monitor.is_monitoring:
-            self.resource_monitor.start_monitoring()
-            self.logger.info("🔥 Постоянный мониторинг ресурсов запущен")
-
-    def stop_resource_monitoring(self):
-        """Остановка мониторинга ресурсов"""
-        if self.resource_monitor.is_monitoring:
-            self.resource_monitor.stop_monitoring()
-            self.logger.info("⏹️ Мониторинг ресурсов остановлен")
-
-    def get_resource_status(self) -> Dict[str, Any]:
-        """Получение текущего статуса ресурсов"""
-        return self.resource_monitor.get_resource_summary()
-
-    def log_resource_status(self):
-        """Логирование текущего статуса ресурсов"""
-        status = self.get_resource_status()
-        if 'error' in status:
-            self.logger.warning(f"Не удалось получить статус ресурсов: {status['error']}")
-            return
-
-        current = status['current']
-        averages = status['averages_5min']
-
-        self.logger.info("📊 === СТАТУС РЕСУРСОВ ===")
-        self.logger.info(f"   Время: {current['timestamp']}")
-        self.logger.info(f"   CPU: {current['cpu_percent']:.1f}% (средн. 5мин: {averages['cpu_percent']:.1f}%)")
-        self.logger.info(f"   Память: {current['memory_percent']:.1f}% ({current['memory_used_gb']:.1f}GB / {current['memory_total_gb']:.1f}GB)")
-        self.logger.info(f"   Средн. память 5мин: {averages['memory_percent']:.1f}%")
-
-        if current['gpu_data']:
-            for gpu_id, gpu_info in current['gpu_data'].items():
-                self.logger.info(f"   {gpu_id}: {gpu_info.get('usage', 0):.1f}% GPU, {gpu_info.get('memory_percent', 0):.1f}% памяти, {gpu_info.get('temperature', 0):.0f}°C")
-
-        self.logger.info(f"   Оповещений: {status['alerts_count']}")
-        self.logger.info(f"   Мониторинг активен: {self.resource_monitor.is_monitoring}")
-        self.logger.info("   =======================")
-
 
 # Глобальный экземпляр логгера
 logger = AdvancedLogger()
-
-# Инициализация мониторинга ресурсов при импорте модуля
-def initialize_resource_monitoring():
-    """Инициализация постоянного мониторинга ресурсов"""
-    try:
-        if not logger.resource_monitor.is_monitoring:
-            logger.start_resource_monitoring()
-    except Exception as e:
-        print(f"⚠️ Не удалось запустить мониторинг ресурсов: {e}")
-
-# Автоматическая инициализация при импорте (можно отключить если нужно)
-# initialize_resource_monitoring()
 
 
 def timed_operation(operation_name: str, metadata: Optional[Dict[str, Any]] = None):
