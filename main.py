@@ -1,10 +1,11 @@
 from Components.YoutubeDownloader import download_youtube_video
-from Components.Edit import extractAudio, get_video_dimensions, process_highlight_unified
+from Components.Edit import extractAudio, get_video_dimensions, process_frame_for_vertical_short
 from Components.Transcription import transcribe_unified
 from faster_whisper import WhisperModel
 import torch
 import json
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt
+from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -46,6 +47,15 @@ def ensure_dir(path_like):
 
 
 def sanitize_base_name(name: str) -> str:
+    """
+    Sanitize filename to create safe base name for file operations.
+
+    Args:
+        name: Original filename or path
+
+    Returns:
+        Sanitized base name safe for file operations
+    """
     import re
     from pathlib import Path
     try:
@@ -76,9 +86,10 @@ def save_json_safely(data, path):
 
 
 def _to_float(val, default=None):
+    """Convert value to float with error handling."""
     try:
         return float(val)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -434,12 +445,14 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
              word_transcription_for_segment = {"segments": []} # Fallback to empty
 
         # --- Вызов единой функции обработки ---
-        success = process_highlight_unified(
-            source_video=ctx.video_path,
+        success = process_frame_for_vertical_short(
+            source_video_path=ctx.video_path,
+            output_path=final_output_path,
             start_time=start,
             end_time=adjusted_stop,
-            transcript_data=word_transcription_for_segment,
-            output_path=final_output_path
+            word_level_transcription=word_transcription_for_segment,
+            crop_bottom_percent=CROP_PERCENTAGE_BOTTOM,
+            face_cascade_path='haarcascade_frontalface_default.xml'
         )
 
         if not success:
@@ -563,6 +576,107 @@ def process_video(url: str = None, local_path: str = None):
         return None
 
 
+def prepare_words_for_segment(full_word_level_transcription: dict, start: float, stop: float) -> dict:
+    """
+    Подготавливает подмножество слов для одного сегмента [start, stop] из глобальной
+    словной транскрипции и нормализует их таймкоды к координатам сегмента.
+
+    Вход:
+    - full_word_level_transcription: dict в формате
+      {
+        "segments": [
+          {
+            "words": [
+              {"start": float, "end": float, "text"/"word": str, ...},
+              ...
+            ],
+            ...
+          },
+          ...
+        ]
+      }
+    - start: абсолютное время начала сегмента, секунды (float)
+    - stop:  абсолютное время конца сегмента, секунды (float)
+
+    Логика отбора и нормализации:
+    - Выбираются только те слова, которые пересекаются с интервалом [start, stop]:
+      word.start < stop и word.end > start.
+    - Нормализация в координаты сегмента:
+      start_rel = max(0.0, word.start - start)
+      end_rel   = max(start_rel, word.end - start)
+    - end_rel дополнительно ограничивается длительностью сегмента (stop - start), чтобы
+      «хвост» слова за границей сегмента был обрезан.
+    - Слова без числовых start/end пропускаются.
+    - Результат сортируется по (start_rel, end_rel).
+
+    Возврат:
+    Структура совместимая с animate_captions:
+    {
+      "segments": [{
+        "start": 0.0,
+        "end": stop - start,
+        "text": "segment",
+        "words": [
+          {"start": start_rel, "end": end_rel, "text": word_text}, ...
+        ]
+      }]}
+    
+    Предположения:
+    - Функция чистая: не изменяет входные данные, не имеет побочных эффектов.
+    - При некорректном входе возвращается сегмент с пустым списком слов и корректной длительностью.
+    """
+    try:
+        seg_duration = max(0.0, float(stop) - float(start))
+    except Exception:
+        # На всякий случай, если приведение типов не удалось
+        seg_duration = max(0.0, (stop or 0.0) - (start or 0.0))
+
+    words_out = []
+    try:
+        segments_wl = []
+        if isinstance(full_word_level_transcription, dict):
+            segments_wl = full_word_level_transcription.get("segments", []) or []
+        for seg_wl in segments_wl:
+            # Достаём список слов из dict или объекта с атрибутом .words
+            seg_words = seg_wl.get("words", []) if isinstance(seg_wl, dict) else getattr(seg_wl, "words", []) or []
+            if not seg_words:
+                continue
+            for w in seg_words:
+                if isinstance(w, dict):
+                    s = _to_float(w.get("start", None), None)
+                    e = _to_float(w.get("end", None), None)
+                    txt = w.get("text", w.get("word", ""))
+                else:
+                    s = _to_float(getattr(w, "start", None), None)
+                    e = _to_float(getattr(w, "end", None), None)
+                    txt = getattr(w, "text", getattr(w, "word", ""))
+                # Пропускаем некорректные таймкоды
+                if s is None or e is None:
+                    continue
+                # Фильтр пересечения [start, stop]
+                if e > start and s < stop:
+                    start_rel = max(0.0, s - start)
+                    end_rel = max(start_rel, e - start)
+                    # Обрезка по длительности сегмента
+                    if end_rel > seg_duration:
+                        end_rel = seg_duration
+                        if end_rel < start_rel:
+                            start_rel = end_rel
+                    words_out.append({"start": start_rel, "end": end_rel, "text": str(txt)})
+        # Сортировка стабильна для предсказуемости
+        words_out.sort(key=lambda x: (x["start"], x["end"]))
+    except Exception:
+        # В случае неожиданных проблем вернём пустой список слов, сохранив длительность
+        words_out = []
+
+    return {
+        "segments": [{
+            "start": 0.0,
+            "end": seg_duration,
+            "text": "segment",
+            "words": words_out
+        }]}
+    
 
 def find_last_word_end_time(word_level_transcription: dict, segment_end_time: float) -> Optional[float]:
     """
