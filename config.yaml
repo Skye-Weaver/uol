@@ -126,6 +126,6 @@ captions:
     center_offset_pct: 12
     boundary_padding_px: 10
   emoji:
-    enabled: true
+    enabled: false
     max_per_short: 2
     style: "shiny"           # возможные: "shiny" | "pulse" | "none"
