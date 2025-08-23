@@ -192,6 +192,52 @@ def get_video_dimensions(video_path):
         print(f"  An unexpected error occurred getting dimensions: {e}")
         return None, None
 
+def apply_blur_background_effect(input_path, output_path):
+    """
+    Applies a blur background effect to a video.
+
+    This function takes an input video and creates an output video with a blurred version
+    of the original video in the background. The original video, cropped to 70% of its
+    width, is overlaid in the center.
+
+    Args:
+        input_path (str): The path to the input video file.
+        output_path (str): The path to save the output video file.
+
+    Returns:
+        bool: True if the operation was successful, False otherwise.
+    """
+    try:
+        filter_graph = (
+            "[0:v]boxblur=luma_radius=min(h\\,w)/20:luma_power=5:chroma_radius=min(h\\,w)/20:chroma_power=1[bg];"
+            "[0:v]crop=iw*0.7:ih:iw*0.15:0[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        )
+
+        ffmpeg_command = [
+            'ffmpeg',
+            '-i', input_path,
+            '-lavfi', filter_graph,
+            '-c:a', 'copy',
+            '-y',
+            output_path
+        ]
+
+        print("Running FFmpeg command for blur background effect:")
+        cmd_string = ' '.join(shlex.quote(str(arg)) for arg in ffmpeg_command)
+        print(f"Command: {cmd_string}")
+
+        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        print(f"Successfully applied blur background effect to: {output_path}")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg for blur background effect: {e}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during blur background effect: {e}")
+        return False
 # Example usage:
 # if __name__ == "__main__":
 #    # ... (old example usage)
