@@ -194,7 +194,7 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
                 relative_end = relative_start + 0.1
             ass_content += (
                 f"Dialogue: 0,{format_time_ass(relative_start)},{format_time_ass(relative_end)},"
-                f"Default,,0,0,0,,{str(text).strip()}\\N"
+                f"Default,,0,0,0,,{str(text).strip().upper()}\\N"
             )
 
     return ass_content
@@ -750,17 +750,9 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
                     # Skip if the primary word is [*]
                     if word1_text != '[*]':
-                        words_to_display = word1_text
-                        window_words.append((word1_text, word1_info))
-                        # Try to get the next word
-                        next_word_idx = active_word_idx_in_segment + 1
-                        if next_word_idx < num_words_in_segment:
-                            word2_info = segment_words_list[next_word_idx]
-                            word2_text = (word2_info.get('text') or word2_info.get('word') or '').strip()
-                            # Also skip if the second word is [*]
-                            if word2_text != '[*]':
-                                words_to_display += f" {word2_text}"
-                                window_words.append((word2_text, word2_info))
+                        # Теперь отображаем только одно слово и в верхнем регистре
+                        words_to_display = word1_text.upper()
+                        window_words.append((words_to_display, word1_info))
 
             # --- Drawing Logic (Pillow - Max 2 words) ---
             # Draw only if we have a valid window and an active word within it
