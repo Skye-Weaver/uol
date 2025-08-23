@@ -133,15 +133,22 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
             spacing_val = 0
 
         # Alignment/MarginV
-        # positioning via bottom_offset_pct
+        # positioning via bottom_offset_pct and center_offset_pct
         # Alignment mapping: safe_bottom→2, center→5
         try:
             position = getattr(style_cfg, "position", None)
             mode = getattr(position, "mode", "safe_bottom") if position else "safe_bottom"
             bottom_offset_pct = int(getattr(position, "bottom_offset_pct", 22)) if position else 22
+            center_offset_pct = int(getattr(position, "center_offset_pct", 12)) if position else 12
             if mode == "center":
                 alignment = 5  # middle-center
-                margin_v = 0
+                # Для режима center рассчитываем margin_v как смещение ниже центра
+                try:
+                    center_y = play_res_y // 2
+                    offset_px = int(play_res_y * center_offset_pct / 100.0)
+                    margin_v = play_res_y - (center_y + offset_px)  # Расстояние от низа до позиции текста
+                except Exception:
+                    margin_v = play_res_y // 2 - 50  # Резервное значение
             else:
                 alignment = 2  # bottom-center
                 try:
@@ -473,6 +480,8 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
         # Positioning
         position_mode = "safe_bottom"
         bottom_offset_pct = None
+        center_offset_pct = None
+        boundary_padding_px = None
         if style_cfg is not None:
             pos = getattr(style_cfg, "position", None)
             position_mode = getattr(pos, "mode", "safe_bottom") if pos else "safe_bottom"
@@ -480,6 +489,14 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                 bottom_offset_pct = int(getattr(pos, "bottom_offset_pct", 22)) if pos else 22
             except Exception:
                 bottom_offset_pct = 22
+            try:
+                center_offset_pct = int(getattr(pos, "center_offset_pct", 12)) if pos else 12
+            except Exception:
+                center_offset_pct = 12
+            try:
+                boundary_padding_px = int(getattr(pos, "boundary_padding_px", 20)) if pos else 20
+            except Exception:
+                boundary_padding_px = 20
 
         # Emoji config and font (best-effort)
         emoji_enabled = False
@@ -791,7 +808,13 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     # Позиционирование (совместимо с прежним кодом)
                     # positioning via bottom_offset_pct
                     if position_mode == "center":
-                        start_y = (height - text_h) // 2
+                        # Центрируем по вертикали, затем смещаем ниже центра
+                        center_y = (height - text_h) // 2
+                        try:
+                            offset_px = int(height * center_offset_pct / 100.0)
+                        except Exception:
+                            offset_px = int(height * 0.12)  # 12% по умолчанию
+                        start_y = center_y + offset_px
                         margin_y = 0
                     else:
                         # safe_bottom
@@ -810,6 +833,16 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                             draw_ov = ImageDraw.Draw(overlay)
                             total_text_w = _measure_text_width(tmp_draw, words_to_display, font, spacing_px=letter_spacing_px)
                             start_x = (width - total_text_w) // 2
+
+                            # Проверки границ для предотвращения обрезания текста
+                            if boundary_padding_px is not None:
+                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
+                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
+
+                            # Проверки границ для предотвращения обрезания текста
+                            if boundary_padding_px is not None:
+                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
+                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
 
                             # Shadow
                             if sx != 0 or sy != 0 or (shadow_rgba and shadow_rgba[3] > 0):
@@ -851,6 +884,21 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                             ]
                             total_text_w = sum(word_widths) + (len(word_widths) - 1) * space_w if word_widths else 0
                             start_x = (width - total_text_w) // 2
+
+                            # Проверки границ для предотвращения обрезания текста
+                            if boundary_padding_px is not None:
+                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
+                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
+
+                            # Проверки границ для предотвращения обрезания текста
+                            if boundary_padding_px is not None:
+                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
+                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
+
+                            # Проверки границ для предотвращения обрезания текста
+                            if boundary_padding_px is not None:
+                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
+                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
 
                             overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                             draw_ov = ImageDraw.Draw(overlay)

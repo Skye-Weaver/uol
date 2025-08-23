@@ -123,6 +123,8 @@ captions:
   position:
     mode: "safe_bottom"      # возможные: "safe_bottom" | "center"
     bottom_offset_pct: 22    # 20–28% рекомендовано, по умолчанию 22
+    center_offset_pct: 12    # смещение ниже центра в процентах (10-15% рекомендовано)
+    boundary_padding_px: 20  # отступ от границ видео в пикселях
   emoji:
     enabled: true
     max_per_short: 2
