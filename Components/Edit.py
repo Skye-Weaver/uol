@@ -194,31 +194,26 @@ def get_video_dimensions(video_path):
 
 def apply_blur_background_effect(input_path, output_path):
     """
-    Applies a blur background effect to a video.
-
-    This function takes an input video and creates an output video with a blurred version
-    of the original video in the background. The original video, cropped to 70% of its
-    width, is overlaid in the center.
+    Применяет эффект размытого фона к видео, вписывая его в вертикальный кадр 9:16.
 
     Args:
-        input_path (str): The path to the input video file.
-        output_path (str): The path to save the output video file.
+        input_path (str): Путь к исходному видео.
+        output_path (str): Путь для сохранения обработанного видео.
 
     Returns:
-        bool: True if the operation was successful, False otherwise.
+        bool: True, если эффект успешно применен, иначе False.
     """
     try:
-        filter_graph = (
-            "[0:v]boxblur=luma_radius=min(h\\,w)/20:luma_power=5:chroma_radius=min(h\\,w)/20:chroma_power=1[bg];"
-            "[0:v]crop=iw*0.7:ih:iw*0.15:0[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
-        )
+        # Этот фильтр создает размытый фон и накладывает на него по центру оригинальное видео,
+        # вписанное по ширине в кадр 1080x1920.
+        filter_graph = "[0:v]split[a][b];[a]scale=1080:1920,boxblur=luma_radius=min(h\\,w)/40:luma_power=2.5[bg];[b]scale=1080:-1[fg];[bg][fg]overlay=0:(H-h)/2"
 
         ffmpeg_command = [
             'ffmpeg',
             '-i', input_path,
             '-lavfi', filter_graph,
-            '-c:a', 'copy',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
             '-y',
             output_path
         ]
@@ -238,7 +233,7 @@ def apply_blur_background_effect(input_path, output_path):
     except Exception as e:
         print(f"An unexpected error occurred during blur background effect: {e}")
         return False
+
 # Example usage:
 # if __name__ == "__main__":
 #    # ... (old example usage)
-
