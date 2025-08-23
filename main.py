@@ -1,5 +1,5 @@
 from Components.YoutubeDownloader import download_youtube_video
-from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions, apply_blur_background_effect
+from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
 from Components.Transcription import transcribe_unified
 from faster_whisper import WhisperModel
 import torch
@@ -409,7 +409,6 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
     temp_segment = None
     cropped_vertical_temp = None
     cropped_vertical_final = None
-    blurred_video_temp = None
     segment_audio_path = None
     transcription_result = None
 
@@ -442,7 +441,6 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp_segment.mp4")
         cropped_vertical_temp = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_temp.mp4")
         cropped_vertical_final = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical_final.mp4")
-        blurred_video_temp = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_blurred_temp.mp4")
         # Use unified naming with zero-padded index for final output (and derived temp anim path)
         final_output_with_captions, _unused_temp_anim = build_short_output_name(base_name, seq, SHORTS_DIR)
         if USE_ANIMATED_CAPTIONS:
@@ -522,25 +520,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
             print("No bottom crop applied")
             cropped_vertical_final = cropped_vertical_temp
 
-        # NEW: 4. Apply Blur Background Effect
-        with logger.operation_context("apply_blur_background", {"input": cropped_vertical_final}):
-            logger.logger.info("4. Applying blur background effect...")
-            blur_success = apply_blur_background_effect(cropped_vertical_final, blurred_video_temp)
-            if not blur_success:
-                logger.logger.error(f"Failed step 4 (blur background) for highlight {seq}. Skipping.")
-                # Basic cleanup before returning
-                if os.path.exists(temp_segment):
-                    try: os.remove(temp_segment)
-                    except Exception: pass
-                if os.path.exists(cropped_vertical_temp):
-                    try: os.remove(cropped_vertical_temp)
-                    except Exception: pass
-                if os.path.exists(cropped_vertical_final):
-                    try: os.remove(cropped_vertical_final)
-                    except Exception: pass
-                return None
-        
-        # 5. Choose Captioning Method
+        # 4. Choose Captioning Method
         captioning_success = False
         if USE_ANIMATED_CAPTIONS:
             print("Attempting Word-Level Animated Captions (reusing global word-level transcription)...")
@@ -609,7 +589,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                     pass
 
                 captioning_success = animate_captions(
-                    blurred_video_temp,
+                    cropped_vertical_final,
                     temp_segment,
                     transcription_result,
                     final_output_with_captions,
@@ -626,7 +606,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            captioning_success = burn_captions(blurred_video_temp, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
+            captioning_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
 
         # 5. Handle Captioning Result
         if not captioning_success:
@@ -636,7 +616,7 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
-            fallback_success = burn_captions(blurred_video_temp, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
+            fallback_success = burn_captions(cropped_vertical_final, temp_segment, transcriptions_legacy, start, adjusted_stop, final_output_with_captions, style_cfg=ctx.cfg.captions)
             if not fallback_success:
                 print(f"ASS fallback failed for highlight {seq}. Skipping.")
                 if os.path.exists(temp_segment):
@@ -698,11 +678,6 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                     os.remove(cropped_vertical_final)
                 except Exception as clean_e:
                     logger.logger.warning(f"Warning: Could not remove final vertical file: {clean_e}")
-            if blurred_video_temp and os.path.exists(blurred_video_temp):
-               try:
-                   os.remove(blurred_video_temp)
-               except Exception as clean_e:
-                   logger.logger.warning(f"Warning: Could not remove blurred temp file: {clean_e}")
             if segment_audio_path and os.path.exists(segment_audio_path):
                 try:
                     os.remove(segment_audio_path)
@@ -730,11 +705,6 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 os.remove(cropped_vertical_final)
             except Exception as clean_e:
                 print(f"Warning: Could not remove final vertical file: {clean_e}")
-        if blurred_video_temp and os.path.exists(blurred_video_temp):
-            try:
-                os.remove(blurred_video_temp)
-            except Exception as clean_e:
-                print(f"Warning: Could not remove blurred temp file: {clean_e}")
         if segment_audio_path and os.path.exists(segment_audio_path):
             try:
                 os.remove(segment_audio_path)
