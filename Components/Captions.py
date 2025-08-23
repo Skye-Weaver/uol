@@ -354,23 +354,32 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
         x, y = start_xy
         for idx, ch in enumerate(text):
             draw_obj.text((x, y), ch, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
-            # Измеряем ширину символа
-            bbox = draw_obj.textbbox((0, 0), ch, font=font)
-            ch_w = (bbox[2] - bbox[0]) if bbox else font.getsize(ch)[0]
+            # Используем getlength для более точного измерения ширины символа
+            try:
+                ch_w = font.getlength(ch)
+            except AttributeError:  # Fallback for older/different PIL versions
+                bbox = font.getbbox(ch) if hasattr(font, 'getbbox') else draw_obj.textbbox((0, 0), ch, font=font)
+                ch_w = (bbox[2] - bbox[0]) if bbox else font.getsize(ch)[0]
             x += ch_w + (spacing_px if idx < len(text) - 1 else 0)
 
     # Оценка ширины текста с letter-spacing
     def _measure_text_width(draw_obj, text, font, spacing_px=0):
         if not text:
             return 0
-        total = 0
-        for idx, ch in enumerate(text):
-            bbox = draw_obj.textbbox((0, 0), ch, font=font)
-            ch_w = (bbox[2] - bbox[0]) if bbox else font.getsize(ch)[0]
-            total += ch_w
-            if idx < len(text) - 1:
-                total += spacing_px
-        return total
+        try:
+            # Предпочтительный, более точный метод
+            base_width = font.getlength(text)
+            total_spacing = (len(text) - 1) * spacing_px if len(text) > 1 else 0
+            return base_width + total_spacing
+        except AttributeError:
+            # Fallback для старых версий PIL или шрифтов без getlength
+            total = 0
+            for idx, ch in enumerate(text):
+                bbox = font.getbbox(ch) if hasattr(font, 'getbbox') else draw_obj.textbbox((0, 0), ch, font=font)
+                ch_w = (bbox[2] - bbox[0]) if bbox else font.getsize(ch)[0]
+                total += ch_w
+            total += (len(text) - 1) * spacing_px if len(text) > 1 else 0
+            return total
 
     try:
         # --- Font Setup (Pillow) ---
@@ -479,24 +488,25 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
         # Positioning
         position_mode = "safe_bottom"
-        bottom_offset_pct = None
-        center_offset_pct = None
-        boundary_padding_px = None
+        bottom_offset_pct = 22
+        center_offset_pct = 12
+        boundary_padding_px = 10
         if style_cfg is not None:
             pos = getattr(style_cfg, "position", None)
-            position_mode = getattr(pos, "mode", "safe_bottom") if pos else "safe_bottom"
-            try:
-                bottom_offset_pct = int(getattr(pos, "bottom_offset_pct", 22)) if pos else 22
-            except Exception:
-                bottom_offset_pct = 22
-            try:
-                center_offset_pct = int(getattr(pos, "center_offset_pct", 12)) if pos else 12
-            except Exception:
-                center_offset_pct = 12
-            try:
-                boundary_padding_px = int(getattr(pos, "boundary_padding_px", 20)) if pos else 20
-            except Exception:
-                boundary_padding_px = 20
+            if pos:
+                position_mode = getattr(pos, "mode", "safe_bottom")
+                try:
+                    bottom_offset_pct = int(getattr(pos, "bottom_offset_pct", 22))
+                except (ValueError, TypeError):
+                    bottom_offset_pct = 22
+                try:
+                    center_offset_pct = int(getattr(pos, "center_offset_pct", 12))
+                except (ValueError, TypeError):
+                    center_offset_pct = 12
+                try:
+                    boundary_padding_px = int(getattr(pos, "boundary_padding_px", 10))
+                except (ValueError, TypeError):
+                    boundary_padding_px = 10
 
         # Emoji config and font (best-effort)
         emoji_enabled = False
@@ -805,148 +815,83 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     text_bbox = tmp_draw.textbbox((0, 0), words_to_display, font=font)
                     text_h = (text_bbox[3] - text_bbox[1]) if text_bbox else font_size
 
-                    # Позиционирование (совместимо с прежним кодом)
-                    # positioning via bottom_offset_pct
+                    # Позиционирование
                     if position_mode == "center":
                         # Центрируем по вертикали, затем смещаем ниже центра
-                        center_y = (height - text_h) // 2
                         try:
-                            offset_px = int(height * center_offset_pct / 100.0)
+                            offset_px = int(height * (center_offset_pct / 100.0))
                         except Exception:
-                            offset_px = int(height * 0.12)  # 12% по умолчанию
-                        start_y = center_y + offset_px
-                        margin_y = 0
-                    else:
-                        # safe_bottom
+                            offset_px = int(height * 0.12)  # 12% fallback
+                        start_y = (height - text_h) // 2 + offset_px
+                    else:  # safe_bottom
                         try:
                             margin_y = _compute_bottom_margin_px(height, bottom_offset_pct or 22)
                         except Exception:
                             margin_y = 120
-                        start_y = height - margin_y - font_ascent
+                        start_y = height - margin_y - text_h # Используем text_h вместо font_ascent для большей точности
+
+                    # --- Горизонтальное позиционирование и clamping ---
+                    
+                    # Общая ширина текста для центрирования
+                    total_text_w = 0
+                    
+                    if not anim_cfg and not window_words:
+                         total_text_w = _measure_text_width(tmp_draw, words_to_display, font, spacing_px=letter_spacing_px)
+                    elif window_words:
+                        space_w_bbox = tmp_draw.textbbox((0, 0), " ", font=font)
+                        space_w = (space_w_bbox[2] - space_w_bbox[0]) if space_w_bbox else max(1, font_size // 3)
+                        word_widths_local = [
+                            _measure_text_width(tmp_draw, wt, font, spacing_px=letter_spacing_px)
+                            for wt, _ in window_words
+                        ]
+                        total_text_w = sum(word_widths_local) + (len(word_widths_local) - 1) * space_w if word_widths_local else 0
+                    
+                    start_x = (width - total_text_w) // 2
+                    
+                    # Применяем boundary_padding_px для clamping
+                    padding = boundary_padding_px or 10
+                    start_x = max(padding, min(start_x, width - total_text_w - padding))
+                    start_y = max(padding, min(start_y, height - text_h - padding))
 
                     if not anim_cfg:
-                        # Без анимации — отрисовка ряда слов (до 2) и «keyword-based coloring (fallback to base_color)»
                         import re as _re_kc
-                        # Если window_words пуст, упадём к старому однострочному рендеру
+                        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                        draw_ov = ImageDraw.Draw(overlay)
+                        
+                        # Если window_words пуст, отрисовываем всю строку
                         if not window_words:
-                            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                            draw_ov = ImageDraw.Draw(overlay)
-                            total_text_w = _measure_text_width(tmp_draw, words_to_display, font, spacing_px=letter_spacing_px)
-                            start_x = (width - total_text_w) // 2
-
-                            # Проверки границ для предотвращения обрезания текста
-                            if boundary_padding_px is not None:
-                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
-                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
-
-                            # Проверки границ для предотвращения обрезания текста
-                            if boundary_padding_px is not None:
-                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
-                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
-
                             # Shadow
                             if sx != 0 or sy != 0 or (shadow_rgba and shadow_rgba[3] > 0):
-                                _draw_text_with_spacing(
-                                    draw_ov,
-                                    (start_x + sx, start_y + sy),
-                                    words_to_display,
-                                    font=font,
-                                    fill=shadow_rgba,
-                                    stroke_width=0,
-                                    stroke_fill=None,
-                                    spacing_px=letter_spacing_px
-                                )
-
+                                _draw_text_with_spacing(draw_ov, (start_x + sx, start_y + sy), words_to_display, font, shadow_rgba, 0, None, letter_spacing_px)
                             # Main text
-                            _draw_text_with_spacing(
-                                draw_ov,
-                                (start_x, start_y),
-                                words_to_display,
-                                font=font,
-                                fill=text_rgba,
-                                stroke_width=stroke_width,
-                                stroke_fill=stroke_color_rgb,
-                                spacing_px=letter_spacing_px
-                            )
-
-                            composed = Image.alpha_composite(base_rgb, overlay)
-                            # Apply emojis near text (if enabled)
-                            composed = _apply_emojis(composed, start_x, total_text_w, start_y)
-                            drawn_any_text = True
-                            frame = cv2.cvtColor(np.array(composed.convert("RGB")), cv2.COLOR_RGB2BGR)
+                            _draw_text_with_spacing(draw_ov, (start_x, start_y), words_to_display, font, text_rgba, stroke_width, stroke_color_rgb, letter_spacing_px)
                         else:
-                            # Пер-слово измерения и позиционирование по центру
+                            # Отрисовка по словам (для keyword coloring)
                             space_w_bbox = tmp_draw.textbbox((0, 0), " ", font=font)
                             space_w = (space_w_bbox[2] - space_w_bbox[0]) if space_w_bbox else max(1, font_size // 3)
-                            word_widths = [
-                                _measure_text_width(tmp_draw, wt, font, spacing_px=letter_spacing_px)
-                                for wt, _ in window_words
-                            ]
-                            total_text_w = sum(word_widths) + (len(word_widths) - 1) * space_w if word_widths else 0
-                            start_x = (width - total_text_w) // 2
-
-                            # Проверки границ для предотвращения обрезания текста
-                            if boundary_padding_px is not None:
-                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
-                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
-
-                            # Проверки границ для предотвращения обрезания текста
-                            if boundary_padding_px is not None:
-                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
-                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
-
-                            # Проверки границ для предотвращения обрезания текста
-                            if boundary_padding_px is not None:
-                                start_x = max(boundary_padding_px, min(start_x, width - total_text_w - boundary_padding_px))
-                                start_y = max(boundary_padding_px, min(start_y, height - text_h - boundary_padding_px))
-
-                            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                            draw_ov = ImageDraw.Draw(overlay)
-
+                            word_widths = [_measure_text_width(tmp_draw, wt, font, spacing_px=letter_spacing_px) for wt, _ in window_words]
+                            
                             # Shadow pass
                             if sx != 0 or sy != 0 or (shadow_rgba and shadow_rgba[3] > 0):
                                 x_cursor = start_x
                                 for idx, (w_text, _) in enumerate(window_words):
-                                    _draw_text_with_spacing(
-                                        draw_ov,
-                                        (x_cursor + sx, start_y + sy),
-                                        w_text,
-                                        font=font,
-                                        fill=shadow_rgba,
-                                        stroke_width=0,
-                                        stroke_fill=None,
-                                        spacing_px=letter_spacing_px
-                                    )
+                                    _draw_text_with_spacing(draw_ov, (x_cursor + sx, start_y + sy), w_text, font, shadow_rgba, 0, None, letter_spacing_px)
                                     x_cursor += word_widths[idx] + (space_w if idx < len(word_widths) - 1 else 0)
-
-                            # Main pass with per-word color
-                            def _sanitize_kw(token: str) -> str:
-                                return _re_kc.sub(r"[^\wа-яё]+", "", token.lower())
-
+                            
+                            # Main pass
                             x_cursor = start_x
+                            def _sanitize_kw(token: str) -> str: return _re_kc.sub(r"[^\wа-яё]+", "", token.lower())
                             for idx, (w_text, _) in enumerate(window_words):
                                 use_rgba = text_rgba
-                                if tone_color_rgba and kw_set:
-                                    token_norm = _sanitize_kw(w_text)
-                                    if token_norm in kw_set:
-                                        use_rgba = tone_color_rgba
-                                _draw_text_with_spacing(
-                                    draw_ov,
-                                    (x_cursor, start_y),
-                                    w_text,
-                                    font=font,
-                                    fill=use_rgba,
-                                    stroke_width=stroke_width,
-                                    stroke_fill=stroke_color_rgb,
-                                    spacing_px=letter_spacing_px
-                                )
+                                if tone_color_rgba and kw_set and _sanitize_kw(w_text) in kw_set:
+                                    use_rgba = tone_color_rgba
+                                _draw_text_with_spacing(draw_ov, (x_cursor, start_y), w_text, font, use_rgba, stroke_width, stroke_color_rgb, letter_spacing_px)
                                 x_cursor += word_widths[idx] + (space_w if idx < len(word_widths) - 1 else 0)
 
-                            composed = Image.alpha_composite(base_rgb, overlay)
-                            # Apply emojis near text (if enabled)
-                            composed = _apply_emojis(composed, start_x, total_text_w, start_y)
-                            drawn_any_text = True
-                            frame = cv2.cvtColor(np.array(composed.convert("RGB")), cv2.COLOR_RGB2BGR)
+                        composed = Image.alpha_composite(base_rgb, overlay)
+                        composed = _apply_emojis(composed, start_x, total_text_w, start_y)
+                        drawn_any_text = True
+                        frame = cv2.cvtColor(np.array(composed.convert("RGB")), cv2.COLOR_RGB2BGR)
                     else:
                         # --- Анимация per-word ---
                         try:

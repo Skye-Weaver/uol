@@ -145,6 +145,8 @@ class AnimateConfig:
 class PositionConfig:
     mode: str = "safe_bottom"  # "safe_bottom" | "center"
     bottom_offset_pct: int = 22  # [0, 100]
+    center_offset_pct: int = 12
+    boundary_padding_px: int = 10
 
 
 @dataclass
@@ -664,7 +666,20 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         position_in.get("bottom_offset_pct", defaults.captions.position.bottom_offset_pct),
         defaults.captions.position.bottom_offset_pct, 0, 100
     )
-    position = PositionConfig(mode=mode, bottom_offset_pct=bottom_offset_pct)
+    center_offset_pct = _clamp_int_val(
+        position_in.get("center_offset_pct", defaults.captions.position.center_offset_pct),
+        defaults.captions.position.center_offset_pct, -50, 50
+    )
+    boundary_padding_px = _clamp_int_val(
+        position_in.get("boundary_padding_px", defaults.captions.position.boundary_padding_px),
+        defaults.captions.position.boundary_padding_px, 0, 100
+    )
+    position = PositionConfig(
+        mode=mode,
+        bottom_offset_pct=bottom_offset_pct,
+        center_offset_pct=center_offset_pct,
+        boundary_padding_px=boundary_padding_px
+    )
 
     # Emoji
     emoji_in = captions_in.get("emoji", {}) or {}
