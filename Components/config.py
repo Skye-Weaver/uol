@@ -19,7 +19,6 @@ class ProcessingConfig:
     crop_bottom_percent: float = 0.0
     min_video_dimension_px: int = 100
     log_transcription_preview_len: int = 200
-    crop_mode: str = "70_percent_blur"  # "average_face" or "70_percent_blur"
 
 
 @dataclass
@@ -269,10 +268,6 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         paths_in = {}
 
     # Processing
-    crop_mode = _as_str(p_in.get("crop_mode", defaults.processing.crop_mode), defaults.processing.crop_mode)
-    if crop_mode not in ("average_face", "70_percent_blur"):
-        crop_mode = defaults.processing.crop_mode
-
     p = ProcessingConfig(
         use_animated_captions=_as_bool(
             p_in.get("use_animated_captions", defaults.processing.use_animated_captions),
@@ -300,7 +295,6 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             _as_int(p_in.get("log_transcription_preview_len", defaults.processing.log_transcription_preview_len),
                     defaults.processing.log_transcription_preview_len),
         ),
-        crop_mode=crop_mode,
     )
 
     # LLM
@@ -729,13 +723,3 @@ def get_config() -> AppConfig:
     if _CONFIG is None:
         _CONFIG = load_config()
     return _CONFIG
-
-
-def reload_config() -> AppConfig:
-    """
-    Принудительно перезагружает конфигурацию из файла, сбрасывая кэш.
-    Полезно при изменении config.yaml во время выполнения программы.
-    """
-    global _CONFIG
-    _CONFIG = None  # Сбрасываем кэш
-    return get_config()

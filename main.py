@@ -16,10 +16,9 @@ from Components.config import get_config, AppConfig
 from Components.Logger import logger, timed_operation
 from Components.Paths import build_short_output_name
 
-# Load config with reload to ensure latest changes are applied
-from Components.config import reload_config
-cfg = reload_config()
-print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}, crop_mode={cfg.processing.crop_mode}")
+# Load config once
+cfg = get_config()
+print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}")
 
 # Инициализация системы логирования
 if cfg.logging.enable_system_info_logging:
