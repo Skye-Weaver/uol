@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 from moviepy.editor import *
+import subprocess
+import os
 # Note: detect_faces_and_speakers and Frames are no longer used by crop_to_vertical_static
 # from Components.Speaker import detect_faces_and_speakers, Frames
 global Fps
@@ -314,6 +316,92 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
     out.release()
     print(f"Average face centered vertical crop complete. Saved to: {output_video_path}")
     return output_video_path
+
+
+def crop_to_70_percent_with_blur(input_video_path, output_video_path):
+    """
+    Crops video to 70% of original width while maintaining aspect ratio,
+    then adds blurred background above and below the centered original video.
+    Final output maintains 9:16 aspect ratio for shorts.
+    """
+    print("Starting 70% width crop with blur background...")
+
+    # Get video properties using ffprobe
+    try:
+        import json
+        ffprobe_cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'json',
+            input_video_path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+        probe_data = json.loads(result.stdout)
+        original_width = probe_data['streams'][0]['width']
+        original_height = probe_data['streams'][0]['height']
+    except Exception as e:
+        print(f"Error getting video dimensions: {e}")
+        return None
+
+    print(f"Original dimensions: {original_width}x{original_height}")
+
+    # Calculate new dimensions (70% of original width, maintain aspect ratio)
+    new_width = int(original_width * 0.7)
+    new_height = int(new_width * original_height / original_width)
+
+    # Ensure dimensions are even (required by some codecs)
+    if new_width % 2 != 0:
+        new_width -= 1
+    if new_height % 2 != 0:
+        new_height -= 1
+
+    print(f"New video dimensions: {new_width}x{new_height}")
+
+    # Target 9:16 dimensions for final output
+    target_height = original_height
+    target_width = int(target_height * 9 / 16)
+    if target_width % 2 != 0:
+        target_width -= 1
+
+    print(f"Target shorts dimensions: {target_width}x{target_height}")
+
+    # FFmpeg command with blur background effect
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-i', input_video_path,
+        '-filter_complex',
+        f'[0:v]scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,pad={new_width}:{new_height}:(ow-iw)/2:(oh-ih)/2:black[scaled];'
+        f'[scaled]split[original][blur_base];'
+        f'[blur_base]boxblur=luma_radius=min({new_width},{new_height})/20:luma_power=5:chroma_radius=min({new_width},{new_height})/20:chroma_power=1[blurred];'
+        f'[blurred][original]overlay=(W-w)/2:(H-h)/2[combined];'
+        f'[combined]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black[final]',
+        '-map', '[final]',
+        '-c:v', 'libx264',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-c:a', 'copy',
+        '-y',
+        output_video_path
+    ]
+
+    print("Running FFmpeg command for 70% crop with blur:")
+    cmd_string = ' '.join([str(arg) for arg in ffmpeg_cmd])
+    print(f"Command: {cmd_string}")
+
+    try:
+        result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+        print(f"Successfully created 70% crop with blur video: {output_video_path}")
+        return output_video_path
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg: {e}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return None
+    except Exception as e:
+        print(f"An error occurred during processing: {e}")
+        return None
 
 
 
