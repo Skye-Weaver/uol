@@ -367,6 +367,10 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
 
     print(f"Target shorts dimensions: {target_width}x{target_height}")
 
+    # Calculate blur radius (pre-compute to avoid FFmpeg expression issues)
+    blur_radius = min(new_width, new_height) / 20
+    print(f"Blur radius: {blur_radius}")
+
     # FFmpeg command with blur background effect
     ffmpeg_cmd = [
         'ffmpeg',
@@ -374,7 +378,7 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
         '-filter_complex',
         f'[0:v]scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,pad={new_width}:{new_height}:(ow-iw)/2:(oh-ih)/2:black[scaled];'
         f'[scaled]split[original][blur_base];'
-        f'[blur_base]boxblur=luma_radius=min({new_width},{new_height})/20:luma_power=5:chroma_radius=min({new_width},{new_height})/20:chroma_power=1[blurred];'
+        f'[blur_base]boxblur=luma_radius={blur_radius}:luma_power=5:chroma_radius={blur_radius}:chroma_power=1[blurred];'
         f'[blurred][original]overlay=(W-w)/2:(H-h)/2[combined];'
         f'[combined]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black[final]',
         '-map', '[final]',
