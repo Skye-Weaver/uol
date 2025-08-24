@@ -28,19 +28,10 @@ def crop_to_vertical_static(input_video_path, output_video_path):
 
     # Ensure the calculated width is even (required by some codecs)
     if vertical_width % 2 != 0:
-        vertical_width -= 1
+        vertical_width -= 1 
 
-    # Debug: Check aspect ratio compliance
-    current_ratio = vertical_width / vertical_height
-    target_ratio = 213 / 274
     print(f"Original Dims: {original_width}x{original_height} @ {fps:.2f}fps")
     print(f"Target Vertical Dims: {vertical_width}x{vertical_height}")
-    print(f"Current aspect ratio: {current_ratio:.3f} (9:16)")
-    print(f"Required aspect ratio: {target_ratio:.3f} (213:274)")
-    if abs(current_ratio - target_ratio) > 0.01:
-        print(f"WARNING: Aspect ratio mismatch! Difference: {abs(current_ratio - target_ratio):.3f}")
-    else:
-        print("INFO: Aspect ratio matches requirements")
 
     if original_width < vertical_width or vertical_width <= 0:
         print("Error: Original video width is less than the calculated vertical width or width is invalid.")
@@ -51,16 +42,6 @@ def crop_to_vertical_static(input_video_path, output_video_path):
     x_start = (original_width - vertical_width) // 2
     x_end = x_start + vertical_width
     print(f"Static Crop Range (Horizontal): {x_start} to {x_end}")
-
-    # Debug: Check cropping parameters
-    crop_width_actual = x_end - x_start
-    crop_height_actual = vertical_height
-    print(f"Cropped dimensions: {crop_width_actual}x{crop_height_actual}")
-    print(f"Crop coverage: {(crop_width_actual * crop_height_actual) / (original_width * original_height) * 100:.1f}% of original")
-    if crop_width_actual != vertical_width:
-        print(f"WARNING: Crop width mismatch! Expected {vertical_width}, got {crop_width_actual}")
-    else:
-        print("INFO: Crop width matches target")
 
     # Setup video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for .mp4 output
