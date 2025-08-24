@@ -5,7 +5,7 @@ from faster_whisper import WhisperModel
 import torch
 import json
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt, compute_tone_and_keywords, compute_emojis_for_segment
-from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
+from Components.FaceCrop import crop_to_vertical_average_face
 from Components.Database import VideoDatabase
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -475,25 +475,12 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 logger.logger.warning(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({ctx.initial_width}x{ctx.initial_height}).")
             logger.logger.info("--- Segment Check Done ---")
 
-        # 2. Create Vertical Crop (Based on crop_mode configuration)
+        # 2. Create Vertical Crop (Based on Average Face Position)
         with logger.operation_context("create_vertical_crop", {"segment_path": temp_segment}):
-            crop_mode = cfg.processing.crop_mode
-            if crop_mode == "70_percent_blur":
-                logger.logger.info("2. Creating 70% width crop with blur background...")
-                crop_function = crop_to_70_percent_with_blur
-                crop_error_msg = "70% crop with blur"
-            elif crop_mode == "average_face":
-                logger.logger.info("2. Creating average face centered vertical crop...")
-                crop_function = crop_to_vertical_average_face
-                crop_error_msg = "average face crop"
-            else:
-                logger.logger.warning(f"Unknown crop_mode '{crop_mode}', falling back to 70_percent_blur")
-                crop_function = crop_to_70_percent_with_blur
-                crop_error_msg = "70% crop with blur (fallback)"
-
-            vert_crop_path = crop_function(temp_segment, cropped_vertical_temp)
+            logger.logger.info("2. Creating average face centered vertical crop...")
+            vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
             if not vert_crop_path:
-                logger.logger.error(f"Failed step 2 ({crop_error_msg}) for highlight {seq}. Skipping.")
+                logger.logger.error(f"Failed step 2 (average face crop) for highlight {seq}. Skipping.")
                 if os.path.exists(temp_segment):
                     try:
                         os.remove(temp_segment)

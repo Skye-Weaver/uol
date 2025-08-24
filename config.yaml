@@ -18,7 +18,6 @@ processing:
   crop_bottom_percent: 0.0
   min_video_dimension_px: 100
   log_transcription_preview_len: 200
-  crop_mode: "70_percent_blur"  # "average_face" or "70_percent_blur"
 
 llm:
   model_name: "gemini-2.5-flash"
