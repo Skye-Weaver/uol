@@ -360,7 +360,7 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     # Calculate 70% width crop for content (maintain 213:274 aspect ratio)
     content_width = int(original_width * 0.7)
     content_aspect_ratio = 213 / 274  # ≈ 0.777
-    content_height = int(content_width / content_aspect_ratio)
+    content_height = min(int(content_width / content_aspect_ratio), original_height)
 
     # Ensure content dimensions are even
     if content_width % 2 != 0:
