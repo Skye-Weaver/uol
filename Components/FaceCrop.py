@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 from moviepy.editor import *
+import subprocess
+import os
 # Note: detect_faces_and_speakers and Frames are no longer used by crop_to_vertical_static
 # from Components.Speaker import detect_faces_and_speakers, Frames
 global Fps
@@ -30,17 +32,8 @@ def crop_to_vertical_static(input_video_path, output_video_path):
     if vertical_width % 2 != 0:
         vertical_width -= 1
 
-    # Debug: Check aspect ratio compliance
-    current_ratio = vertical_width / vertical_height
-    target_ratio = 213 / 274
     print(f"Original Dims: {original_width}x{original_height} @ {fps:.2f}fps")
     print(f"Target Vertical Dims: {vertical_width}x{vertical_height}")
-    print(f"Current aspect ratio: {current_ratio:.3f} (9:16)")
-    print(f"Required aspect ratio: {target_ratio:.3f} (213:274)")
-    if abs(current_ratio - target_ratio) > 0.01:
-        print(f"WARNING: Aspect ratio mismatch! Difference: {abs(current_ratio - target_ratio):.3f}")
-    else:
-        print("INFO: Aspect ratio matches requirements")
 
     if original_width < vertical_width or vertical_width <= 0:
         print("Error: Original video width is less than the calculated vertical width or width is invalid.")
@@ -52,16 +45,6 @@ def crop_to_vertical_static(input_video_path, output_video_path):
     x_end = x_start + vertical_width
     print(f"Static Crop Range (Horizontal): {x_start} to {x_end}")
 
-    # Debug: Check cropping parameters
-    crop_width_actual = x_end - x_start
-    crop_height_actual = vertical_height
-    print(f"Cropped dimensions: {crop_width_actual}x{crop_height_actual}")
-    print(f"Crop coverage: {(crop_width_actual * crop_height_actual) / (original_width * original_height) * 100:.1f}% of original")
-    if crop_width_actual != vertical_width:
-        print(f"WARNING: Crop width mismatch! Expected {vertical_width}, got {crop_width_actual}")
-    else:
-        print("INFO: Crop width matches target")
-
     # Setup video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for .mp4 output
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (vertical_width, vertical_height))
@@ -69,7 +52,7 @@ def crop_to_vertical_static(input_video_path, output_video_path):
         print(f"Error: Could not open video writer for {output_video_path}")
         cap.release()
         return None
-        
+
     # Set global Fps (if needed elsewhere, otherwise consider removing global)
     global Fps
     Fps = fps
@@ -145,7 +128,7 @@ def crop_to_vertical(input_video_path, output_video_path):
             if len(faces) == 0:
                 (x, y, w, h) = Frames[count]
 
-            # (x, y, w, h) = faces[0]  
+            # (x, y, w, h) = faces[0]
             try:
                 #check if face 1 is active
                 (X, Y, W, H) = Frames[count]
@@ -153,7 +136,7 @@ def crop_to_vertical(input_video_path, output_video_path):
                 print(e)
                 (X, Y, W, H) = Frames[count][0]
                 print(Frames[count][0])
-            
+
             for f in faces:
                 x1, y1, w1, h1 = f
                 center = x1+ w1//2
@@ -194,7 +177,7 @@ def crop_to_vertical(input_video_path, output_video_path):
             x_start = (original_width - vertical_width) // 2
             x_end = x_start + vertical_width
             cropped_frame = frame[:, x_start:x_end]
-        
+
         print(cropped_frame.shape)
 
         out.write(cropped_frame)
@@ -204,13 +187,13 @@ def crop_to_vertical(input_video_path, output_video_path):
     print("Cropping complete. The video has been saved to", output_video_path, count)
 
 
-# --- New Function: Average Face Centered Crop --- 
+# --- New Function: Average Face Centered Crop ---
 
 def crop_to_vertical_average_face(input_video_path, output_video_path, sample_interval_seconds=0.5):
     """Crops video to 9:16 based on the average horizontal face position sampled periodically."""
     print("Starting average face centered vertical crop...")
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    
+
     cap = cv2.VideoCapture(input_video_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"Error: Could not open video {input_video_path}")
@@ -226,7 +209,7 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
         print("Error: Invalid video properties (height or fps <= 0).")
         cap.release()
         return None
-        
+
     print(f"Input: {original_width}x{original_height} @ {fps:.2f}fps")
 
     # Calculate target 9:16 width
@@ -241,23 +224,23 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
 
     print(f"Target Vertical Dims: {vertical_width}x{vertical_height}")
 
-    # --- First Pass: Sample face positions --- 
+    # --- First Pass: Sample face positions ---
     face_centers_x = []
     frames_to_skip = int(fps * sample_interval_seconds)
     if frames_to_skip < 1: frames_to_skip = 1 # Sample at least every frame if interval is too small
-    
+
     frame_count = 0
     print(f"Sampling face position every {frames_to_skip} frames...")
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         if frame_count % frames_to_skip == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             # Adjust detection parameters if needed (e.g., scaleFactor, minNeighbors)
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-            
+
             if len(faces) > 0:
                 # Assume the largest face is the main one if multiple are detected
                 faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
@@ -267,10 +250,10 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
                 # Optional: Draw box on sample frame for debugging
                 # cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 # cv2.imshow('Sample', frame); cv2.waitKey(1)
-                
+
         frame_count += 1
-        
-    # --- Calculate Average Position --- 
+
+    # --- Calculate Average Position ---
     average_face_center_x = None
     if face_centers_x:
         average_face_center_x = np.mean(face_centers_x)
@@ -279,7 +262,7 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
         print("Warning: No faces detected during sampling. Falling back to frame center.")
         average_face_center_x = original_width / 2
 
-    # --- Calculate Static Crop Box --- 
+    # --- Calculate Static Crop Box ---
     half_vertical_width = vertical_width // 2
     x_start = int(average_face_center_x - half_vertical_width)
     x_end = x_start + vertical_width
@@ -292,18 +275,18 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
     if x_end - x_start != vertical_width:
          x_start = x_end - vertical_width
          x_start = max(0, x_start) # Re-clamp x_start just in case
-    
+
     # Final check if width calculation is still correct after clamping
     if x_end - x_start != vertical_width:
         print(f"Error: Could not calculate valid crop window ({x_start}-{x_end}) for width {vertical_width}. Check logic.")
         cap.release()
         return None
-        
+
     print(f"Calculated Static Crop Box: X = {x_start} to {x_end}")
 
-    # --- Second Pass: Apply crop and write video --- 
+    # --- Second Pass: Apply crop and write video ---
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rewind video capture
-    
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (vertical_width, vertical_height))
     if not out.isOpened():
@@ -317,14 +300,14 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         cropped_frame = frame[:, x_start:x_end]
-        
+
         # Sanity check shape before writing (optional but good)
         if cropped_frame.shape[1] != vertical_width or cropped_frame.shape[0] != vertical_height:
             print(f"Warning: Frame {written_frames} cropped shape {cropped_frame.shape} != target {vertical_width}x{vertical_height}. Resizing.")
             cropped_frame = cv2.resize(cropped_frame, (vertical_width, vertical_height))
-            
+
         out.write(cropped_frame)
         written_frames += 1
 
@@ -335,6 +318,113 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
     return output_video_path
 
 
+def crop_to_70_percent_with_blur(input_video_path, output_video_path):
+    """
+    Crops video to 70% of original width with 213:274 aspect ratio for content,
+    then creates a 9:16 final frame with blurred background and centered content.
+    Uses dynamic sizing based on original video height.
+    """
+    print("Starting 70% width crop with blur background (9:16 final aspect ratio)...")
 
+    # Get video properties using ffprobe
+    try:
+        import json
+        ffprobe_cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'json',
+            input_video_path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+        probe_data = json.loads(result.stdout)
+        original_width = probe_data['streams'][0]['width']
+        original_height = probe_data['streams'][0]['height']
+    except Exception as e:
+        print(f"Error getting video dimensions: {e}")
+        return None
 
+    print(f"Original dimensions: {original_width}x{original_height}")
 
+    # Calculate final 9:16 dimensions based on original height
+    final_height = original_height
+    final_width = int(final_height * 9 / 16)
+
+    # Ensure final dimensions are even (required by some codecs)
+    if final_width % 2 != 0:
+        final_width -= 1
+
+    print(f"Final 9:16 dimensions: {final_width}x{final_height}")
+
+    # Calculate 70% width crop for content (maintain 213:274 aspect ratio)
+    content_width = int(original_width * 0.7)
+    content_aspect_ratio = 213 / 274  # ≈ 0.777
+    content_height = int(content_width / content_aspect_ratio)
+
+    # Ensure content dimensions are even
+    if content_width % 2 != 0:
+        content_width -= 1
+    if content_height % 2 != 0:
+        content_height -= 1
+
+    print(f"Content crop dimensions (70% width, 213:274 aspect): {content_width}x{content_height}")
+
+    # Calculate scaling for content to fit in final frame while maintaining aspect ratio
+    scale_factor = min(final_width / content_width, final_height / content_height)
+    scaled_content_width = int(content_width * scale_factor)
+    scaled_content_height = int(content_height * scale_factor)
+
+    # Ensure scaled dimensions are even
+    if scaled_content_width % 2 != 0:
+        scaled_content_width -= 1
+    if scaled_content_height % 2 != 0:
+        scaled_content_height -= 1
+
+    print(f"Scaled content dimensions: {scaled_content_width}x{scaled_content_height}")
+
+    # Calculate positioning for centering content in final frame
+    content_x = (final_width - scaled_content_width) // 2
+    content_y = (final_height - scaled_content_height) // 2
+
+    print(f"Content positioning in final frame: x={content_x}, y={content_y}")
+
+    # Calculate blur radius based on original dimensions
+    blur_radius = min(original_width, original_height) / 20
+    print(f"Blur radius: {blur_radius}")
+
+    # FFmpeg command with optimized blur background and content overlay
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-i', input_video_path,
+        '-filter_complex',
+        f'[0:v]crop={content_width}:{content_height}:(iw-{content_width})/2:(ih-{content_height})/2[cropped];'
+        f'[0:v]boxblur=luma_radius={blur_radius}:luma_power=5:chroma_radius={blur_radius}:chroma_power=1[blurred_bg];'
+        f'[blurred_bg]scale={final_width}:{final_height}:force_original_aspect_ratio=decrease,pad={final_width}:{final_height}:(ow-iw)/2:(oh-ih)/2:color=black[bg_scaled];'
+        f'[cropped]scale={scaled_content_width}:{scaled_content_height}:force_original_aspect_ratio=decrease[content_scaled];'
+        f'[bg_scaled][content_scaled]overlay={content_x}:{content_y}[final]',
+        '-map', '[final]',
+        '-c:v', 'libx264',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-c:a', 'copy',
+        '-y',
+        output_video_path
+    ]
+
+    print("Running optimized FFmpeg command for 70% crop with 9:16 blur background:")
+    cmd_string = ' '.join([str(arg) for arg in ffmpeg_cmd])
+    print(f"Command: {cmd_string}")
+
+    try:
+        result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+        print(f"Successfully created 70% crop with 9:16 blur background video: {output_video_path}")
+        return output_video_path
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg: {e}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return None
+    except Exception as e:
+        print(f"An error occurred during processing: {e}")
+        return None

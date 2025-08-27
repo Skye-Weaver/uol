@@ -1,11 +1,11 @@
 from Components.YoutubeDownloader import download_youtube_video
-from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions, create_shorts_with_blur_background
+from Components.Edit import extractAudio, crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
 from Components.Transcription import transcribe_unified
 from faster_whisper import WhisperModel
 import torch
 import json
 from Components.LanguageTasks import GetHighlights, build_transcription_prompt, compute_tone_and_keywords, compute_emojis_for_segment
-from Components.FaceCrop import crop_to_vertical_average_face
+from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
 from Components.Database import VideoDatabase
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -16,9 +16,10 @@ from Components.config import get_config, AppConfig
 from Components.Logger import logger, timed_operation
 from Components.Paths import build_short_output_name
 
-# Load config once
-cfg = get_config()
-print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}")
+# Load config with reload to ensure latest changes are applied
+from Components.config import reload_config
+cfg = reload_config()
+print(f"Конфиг загружен: shorts_dir={cfg.processing.shorts_dir}, model={cfg.llm.model_name}, crop_mode={cfg.processing.crop_mode}")
 
 # Инициализация системы логирования
 if cfg.logging.enable_system_info_logging:
@@ -28,9 +29,6 @@ if cfg.logging.enable_system_info_logging:
 # Set to True to use two words-level animated captions (slower but nicer)
 # Set to False to use the default, faster ASS subtitle burning
 USE_ANIMATED_CAPTIONS = cfg.processing.use_animated_captions
-
-# Set to True to use shorts with blur background instead of standard vertical crop
-USE_BLUR_BACKGROUND_SHORTS = cfg.processing.use_blur_background_shorts
 
 # Define the output directory for final shorts
 SHORTS_DIR = cfg.processing.shorts_dir
@@ -478,66 +476,37 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
                 logger.logger.warning(f"Warning: Segment dimensions ({segment_width}x{segment_height}) differ from initial ({ctx.initial_width}x{ctx.initial_height}).")
             logger.logger.info("--- Segment Check Done ---")
 
-        # 2. Create Vertical Crop or Blur Background Shorts
+        # 2. Create Vertical Crop (Based on crop_mode configuration)
         with logger.operation_context("create_vertical_crop", {"segment_path": temp_segment}):
-            if USE_BLUR_BACKGROUND_SHORTS:
-                logger.logger.info("2. Creating shorts with blur background (213:274 aspect ratio)...")
-                # Используем новую функцию для создания shorts с размытым фоном
-                blur_success = create_shorts_with_blur_background(temp_segment, final_output_with_captions)
-                if not blur_success:
-                    logger.logger.error(f"Failed step 2 (blur background shorts) for highlight {seq}. Skipping.")
-                    if os.path.exists(temp_segment):
-                        try:
-                            os.remove(temp_segment)
-                        except Exception as clean_e:
-                            logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
-                    return None
-
-                # Пропускаем остальные шаги, так как финальное видео уже создано
-                logger.logger.info(f"Successfully created blur background shorts for highlight {seq}.")
-                ctx.outputs.append(final_output_with_captions)
-                logger.logger.info(f"Saving highlight {seq} info to database: {final_output_with_captions}")
-
-                segment_text = item.get('segment_text', '') if isinstance(item, dict) else ''
-                caption = item.get('caption_with_hashtags', '') if isinstance(item, dict) else ''
-
-                with logger.operation_context("save_to_database", {"video_id": ctx.video_id, "highlight_path": final_output_with_captions}):
-                    ctx.db.add_highlight(
-                        ctx.video_id,
-                        start,
-                        adjusted_stop,
-                        final_output_with_captions,
-                        segment_text=segment_text,
-                        caption_with_hashtags=caption
-                    )
-
-                # Очистка временных файлов
-                with logger.operation_context("cleanup_intermediate_files", {"highlight_seq": seq}):
-                    logger.logger.info("Cleaning up intermediate files for this highlight...")
-                    if os.path.exists(temp_segment):
-                        try:
-                            os.remove(temp_segment)
-                        except Exception as clean_e:
-                            logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
-
-                return final_output_with_captions
-            else:
+            crop_mode = cfg.processing.crop_mode
+            if crop_mode == "70_percent_blur":
+                logger.logger.info("2. Creating 70% width crop with blur background...")
+                crop_function = crop_to_70_percent_with_blur
+                crop_error_msg = "70% crop with blur"
+            elif crop_mode == "average_face":
                 logger.logger.info("2. Creating average face centered vertical crop...")
-                vert_crop_path = crop_to_vertical_average_face(temp_segment, cropped_vertical_temp)
-                if not vert_crop_path:
-                    logger.logger.error(f"Failed step 2 (average face crop) for highlight {seq}. Skipping.")
-                    if os.path.exists(temp_segment):
-                        try:
-                            os.remove(temp_segment)
-                        except Exception as clean_e:
-                            logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
-                    if os.path.exists(cropped_vertical_temp):
-                        try:
-                            os.remove(cropped_vertical_temp)
-                        except Exception as clean_e:
-                            logger.logger.warning(f"Warning: Could not remove temp vertical crop file: {clean_e}")
-                    return None
-                cropped_vertical_temp = vert_crop_path
+                crop_function = crop_to_vertical_average_face
+                crop_error_msg = "average face crop"
+            else:
+                logger.logger.warning(f"Unknown crop_mode '{crop_mode}', falling back to 70_percent_blur")
+                crop_function = crop_to_70_percent_with_blur
+                crop_error_msg = "70% crop with blur (fallback)"
+
+            vert_crop_path = crop_function(temp_segment, cropped_vertical_temp)
+            if not vert_crop_path:
+                logger.logger.error(f"Failed step 2 ({crop_error_msg}) for highlight {seq}. Skipping.")
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp segment file: {clean_e}")
+                if os.path.exists(cropped_vertical_temp):
+                    try:
+                        os.remove(cropped_vertical_temp)
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Warning: Could not remove temp vertical crop file: {clean_e}")
+                return None
+            cropped_vertical_temp = vert_crop_path
 
         # 3. Crop Bottom Off Vertical Video (Temporary Fix)
         if CROP_PERCENTAGE_BOTTOM > 0:
