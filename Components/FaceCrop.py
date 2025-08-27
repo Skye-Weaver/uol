@@ -393,18 +393,29 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     blur_radius = min(original_width, original_height) / 20
     print(f"Blur radius: {blur_radius}")
 
-    # FFmpeg command with optimized blur background and content overlay
+    # Build filter_complex to eliminate black bars and use blurred background that fills the entire frame.
+    # Background: scale with force_original_aspect_ratio=increase then crop to FINAL WxH, apply boxblur, setsar=1.
+    # Foreground: center crop to 70% width (CROP_W x CROP_H), then scale to FINAL_CONTENT_W x FINAL_CONTENT_H, setsar=1.
+    # Compose: overlay at computed offsets, finalize as yuv420p.
+    filter_complex = (
+        "[0:v]split=2[fg_src][bg_src];"
+        f"[bg_src]scale={final_width}:{final_height}:force_original_aspect_ratio=increase,"
+        f"crop={final_width}:{final_height},"
+        f"boxblur=luma_radius={blur_radius}:luma_power=5:chroma_radius={blur_radius}:chroma_power=1,setsar=1[bg];"
+        f"[fg_src]crop={content_width}:{content_height}:(iw-{content_width})/2:(ih-{content_height})/2,"
+        f"scale={scaled_content_width}:{scaled_content_height}:force_original_aspect_ratio=decrease,setsar=1[fg];"
+        f"[bg][fg]overlay={content_x}:{content_y}:shortest=1,format=yuv420p[vout]"
+    )
+
+    # FFmpeg command using new filter and mappings; keep current crf/preset values
     ffmpeg_cmd = [
         'ffmpeg',
         '-i', input_video_path,
-        '-filter_complex',
-        f'[0:v]crop={content_width}:{content_height}:(iw-{content_width})/2:(ih-{content_height})/2[cropped];'
-        f'[0:v]boxblur=luma_radius={blur_radius}:luma_power=5:chroma_radius={blur_radius}:chroma_power=1[blurred_bg];'
-        f'[blurred_bg]scale={final_width}:{final_height}:force_original_aspect_ratio=decrease,pad={final_width}:{final_height}:(ow-iw)/2:(oh-ih)/2:color=black[bg_scaled];'
-        f'[cropped]scale={scaled_content_width}:{scaled_content_height}:force_original_aspect_ratio=decrease[content_scaled];'
-        f'[bg_scaled][content_scaled]overlay={content_x}:{content_y}[final]',
-        '-map', '[final]',
+        '-filter_complex', filter_complex,
+        '-map', '[vout]',
+        '-map', '0:a?',
         '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
         '-crf', '23',
         '-preset', 'medium',
         '-c:a', 'copy',
@@ -412,19 +423,48 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
         output_video_path
     ]
 
-    print("Running optimized FFmpeg command for 70% crop with 9:16 blur background:")
-    cmd_string = ' '.join([str(arg) for arg in ffmpeg_cmd])
-    print(f"Command: {cmd_string}")
+    # Logging: print and, if logger available, logger.debug
+    try:
+        from Components.Logger import logger  # type: ignore
+    except Exception:
+        logger = None
+
+    print("FFmpeg filter_complex:", filter_complex)
+    print("FFmpeg command:", ' '.join([str(a) for a in ffmpeg_cmd]))
+    if logger:
+        try:
+            logger.debug(f"FFmpeg filter_complex: {filter_complex}")
+            logger.debug(f"FFmpeg command: {' '.join([str(a) for a in ffmpeg_cmd])}")
+        except Exception:
+            pass
 
     try:
         result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-        print(f"Successfully created 70% crop with 9:16 blur background video: {output_video_path}")
+        print(f"Successfully created 70% crop with blurred background video: {output_video_path}")
+        if logger:
+            try:
+                logger.debug(f"ffmpeg stdout: {result.stdout}")
+                logger.debug(f"ffmpeg stderr: {result.stderr}")
+            except Exception:
+                pass
         return output_video_path
     except subprocess.CalledProcessError as e:
         print(f"Error running FFmpeg: {e}")
         print(f"FFmpeg stdout: {e.stdout}")
         print(f"FFmpeg stderr: {e.stderr}")
+        if logger:
+            try:
+                logger.error(f"Error running FFmpeg: {e}")
+                logger.error(f"FFmpeg stdout: {e.stdout}")
+                logger.error(f"FFmpeg stderr: {e.stderr}")
+            except Exception:
+                pass
         return None
     except Exception as e:
         print(f"An error occurred during processing: {e}")
+        if logger:
+            try:
+                logger.error(f"An error occurred during processing: {e}")
+            except Exception:
+                pass
         return None
