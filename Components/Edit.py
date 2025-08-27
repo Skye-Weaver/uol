@@ -192,12 +192,12 @@ def get_video_dimensions(video_path):
         return None, None
     except Exception as e:
         print(f"  An unexpected error occurred getting dimensions: {e}")
-def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
+def create_shorts_video(input_path, output_path, crop_width_percentage=0.7, left_crop_percent=0.15, right_crop_percent=0.15):
     """
     Creates a 9:16 "shorts" video from a source video.
 
     The process involves:
-    1. Cropping the central part of the video (defaulting to 70% of the width).
+    1. Cropping the central part of the video with specified left and right crop percentages.
     2. Creating a 9:16 canvas.
     3. Placing a blurred version of the original video as the background.
     4. Overlaying the cropped video in the center.
@@ -206,6 +206,10 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
         input_path (str): Path to the source video file.
         output_path (str): Path to save the resulting shorts video.
         crop_width_percentage (float): The percentage of the original width to keep (0.0 to 1.0).
+            This parameter is kept for backward compatibility but will be ignored if
+            left_crop_percent and right_crop_percent are provided.
+        left_crop_percent (float): The percentage of the original width to crop from the left side (0.0 to 1.0).
+        right_crop_percent (float): The percentage of the original width to crop from the right side (0.0 to 1.0).
 
     Returns:
         bool: True if successful, False otherwise.
@@ -220,8 +224,17 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
         # 2. Рассчитать новые размеры
         target_aspect_ratio = 9 / 16
         
-        # Ширина кадрирования - 70% от оригинала
-        crop_width = int(original_width * crop_width_percentage)
+        # Рассчитать ширину кадрирования на основе процентов обрезки слева и справа
+        # Если заданы left_crop_percent и right_crop_percent, используем их
+        # В противном случае используем crop_width_percentage для обратной совместимости
+        if left_crop_percent is not None and right_crop_percent is not None:
+            crop_width = int(original_width * (1.0 - left_crop_percent - right_crop_percent))
+            # Убедимся, что crop_width положительный
+            crop_width = max(1, crop_width)
+        else:
+            # Использовать crop_width_percentage для обратной совместимости
+            crop_width = int(original_width * crop_width_percentage)
+        
         # Высота остается прежней
         crop_height = original_height
         
@@ -233,7 +246,15 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
         # Убедимся, что ширина четная
         output_width = output_width if output_width % 2 == 0 else output_width + 1
 
-        # 3. Собрать команду FFmpeg с filter_complex
+        # 3. Рассчитать позицию обрезки
+        # Для новых параметров обрезки слева и справа
+        if left_crop_percent is not None and right_crop_percent is not None:
+            crop_x = int(original_width * left_crop_percent)
+        else:
+            # Для обратной совместимости (обрезка по центру)
+            crop_x = int((original_width - crop_width) / 2)
+
+        # 4. Собрать команду FFmpeg с filter_complex
         ffmpeg_command = [
             'ffmpeg', '-y', '-i', input_path,
             '-filter_complex',
@@ -245,8 +266,8 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
                 #    - применяем сильное размытие
                 f"[bg]scale={output_width}:{output_height},gblur=sigma=25[bg_blurred];"
                 # 3. Обрабатываем основное видео:
-                #    - обрезаем центральную часть (70% ширины)
-                f"[main]crop={crop_width}:{crop_height}:(in_w-{crop_width})/2:(in_h-{crop_height})/2[main_cropped];"
+                #    - обрезаем с учетом процентов обрезки слева и справа
+                f"[main]crop={crop_width}:{crop_height}:{crop_x}:0[main_cropped];"
                 # 4. Накладываем обрезанное видео на размытый фон:
                 #    - (W-w)/2 и (H-h)/2 центрируют наложение
                 "[bg_blurred][main_cropped]overlay=(W-w)/2:(H-h)/2"
@@ -262,7 +283,7 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
         cmd_string = ' '.join(shlex.quote(arg) for arg in ffmpeg_command)
         print(f"Command: {cmd_string}")
         
-        # 4. Запустить FFmpeg
+        # 5. Запустить FFmpeg
         process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
         print(f"Successfully created shorts video: {output_path}")
         return True
