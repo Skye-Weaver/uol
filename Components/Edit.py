@@ -6,6 +6,8 @@ import tempfile
 import os
 import shlex
 import json # For ffprobe output
+import numpy as np
+import cv2
 
 # Import caption functions from the new module
 from .Captions import burn_captions, animate_captions
@@ -190,7 +192,89 @@ def get_video_dimensions(video_path):
         return None, None
     except Exception as e:
         print(f"  An unexpected error occurred getting dimensions: {e}")
-        return None, None
+def create_shorts_video(input_path, output_path, crop_width_percentage=0.7):
+    """
+    Creates a 9:16 "shorts" video from a source video.
+
+    The process involves:
+    1. Cropping the central part of the video (defaulting to 70% of the width).
+    2. Creating a 9:16 canvas.
+    3. Placing a blurred version of the original video as the background.
+    4. Overlaying the cropped video in the center.
+
+    Args:
+        input_path (str): Path to the source video file.
+        output_path (str): Path to save the resulting shorts video.
+        crop_width_percentage (float): The percentage of the original width to keep (0.0 to 1.0).
+
+    Returns:
+        bool: True if successful, False otherwise.
+    """
+    try:
+        # 1. Получить размеры видео
+        original_width, original_height = get_video_dimensions(input_path)
+        if not original_width or not original_height:
+            print("Error: Could not get video dimensions.")
+            return False
+
+        # 2. Рассчитать новые размеры
+        target_aspect_ratio = 9 / 16
+        
+        # Ширина кадрирования - 70% от оригинала
+        crop_width = int(original_width * crop_width_percentage)
+        # Высота остается прежней
+        crop_height = original_height
+        
+        # Конечная ширина и высота для формата 9:16
+        # Конечная высота равна высоте кадрирования
+        output_height = crop_height
+        # Конечная ширина вычисляется из соотношения 9:16
+        output_width = int(output_height * target_aspect_ratio)
+        # Убедимся, что ширина четная
+        output_width = output_width if output_width % 2 == 0 else output_width + 1
+
+        # 3. Собрать команду FFmpeg с filter_complex
+        ffmpeg_command = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-filter_complex',
+            (
+                # 1. Клонируем видеопоток дважды для фона и основного видео.
+                "[0:v]split=2[main][bg];"
+                # 2. Обрабатываем фон:
+                #    - масштабируем до конечного размера output_width x output_height
+                #    - применяем сильное размытие
+                f"[bg]scale={output_width}:{output_height},gblur=sigma=25[bg_blurred];"
+                # 3. Обрабатываем основное видео:
+                #    - обрезаем центральную часть (70% ширины)
+                f"[main]crop={crop_width}:{crop_height}:(in_w-{crop_width})/2:(in_h-{crop_height})/2[main_cropped];"
+                # 4. Накладываем обрезанное видео на размытый фон:
+                #    - (W-w)/2 и (H-h)/2 центрируют наложение
+                "[bg_blurred][main_cropped]overlay=(W-w)/2:(H-h)/2"
+            ),
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '22',
+            '-c:a', 'copy', # Простое копирование аудио без перекодирования
+            output_path
+        ]
+
+        print("Running FFmpeg command to create shorts video:")
+        cmd_string = ' '.join(shlex.quote(arg) for arg in ffmpeg_command)
+        print(f"Command: {cmd_string}")
+        
+        # 4. Запустить FFmpeg
+        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        print(f"Successfully created shorts video: {output_path}")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg for shorts creation: {e}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during shorts creation: {e}")
+        return False
 
 # Example usage:
 # if __name__ == "__main__":
