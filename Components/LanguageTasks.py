@@ -314,29 +314,35 @@ def extract_highlights(
     """Extracts highlight time segments from transcription, validates, checks overlaps, with retry logic."""
     # System instruction based on Google AI Studio code
     system_instruction_text = f"""
-Ты — креативный ИИ-ассистент, который помогает находить лучшие моменты в видео для создания коротких роликов (shorts). Проанализируй транскрипцию и выдели несколько наиболее интересных и содержательных фрагментов.
+Ты — креатор коротких видео для соцсетей. По предоставленной транскрипции выдели как можно больше непересекающихся отрезков, которые подойдут для увлекательных коротких роликов. Отдавай приоритет разнообразию валидных сегментов.
+Верни ТОЛЬКО JSON-массив объектов. Каждый объект обязан содержать ключи "start" и "end" (на английском) с точными временными метками начала и конца сегмента из транскрипта. Никакого текста, объяснений или форматирования вне JSON.
 
-Твоя задача — вернуть JSON-массив объектов. Каждый объект должен представлять один хайлайт и содержать:
-- "start": время начала (float)
-- "end": время окончания (float)
+Критерии выбора:
+• Ключевые мысли, объяснения, вопросы, выводы и вообще наиболее «цепляющие» места.
+• Старайся включать завершённые мысли/предложения.
+• Предпочтительны моменты с понятным контекстом, но при необходимости соблюдай ограничение по времени.
+• Естественные паузы и переходы — плюс, но не обязательны.
 
-Пожалуйста, верни только JSON, без каких-либо дополнительных пояснений или текста.
-
-Рекомендации по выбору хайлайта:
-- Содержит ключевую мысль, яркий момент, вопрос или вывод.
-- Является относительно законченным по смыслу.
-- Длительность (end - start) в идеале составляет от {cfg.llm.highlight_min_sec} до {cfg.llm.highlight_max_sec} секунд. Смысл важнее точной длительности.
-- Сегменты не должны пересекаться. Постарайся найти до {cfg.llm.max_highlights} наиболее подходящих сегментов.
+Требования к длительности:
+• Длительность каждого сегмента (end - start) СТРОГО ОТ {cfg.llm.highlight_min_sec} ДО {cfg.llm.highlight_max_sec} секунд (включительно).
+• Сегменты не должны перекрываться.
+• Найди и верни от 10 до {cfg.llm.max_highlights} валидных сегментов — не больше.
 
 Точность таймкодов:
-- Используй временные метки, которые присутствуют в транскрипте. Не придумывай свои.
+• Используй ИМЕННО те таймкоды, что присутствуют/логически вытекают из транскрипта.
+• Нельзя придумывать или править таймкоды.
 
-Пример твоего ответа:
+Пример JSON-вывода:
 [
-  {{"start": 8.96, "end": 42.20}},
-  {{"start": 115.08, "end": 156.12}}
+  {{"start": "8.96", "end": "42.20"}},
+  {{"start": "115.08", "end": "156.12"}},
+  {{"start": "1381.68", "end": "1427.40"}}
 ]
-"""
+
+• Главная цель — найти несколько сегментов со сроком строго {cfg.llm.highlight_min_sec}–{cfg.llm.highlight_max_sec} секунд.
+• Убедись, что таймкоды соответствуют фактическим маркерам/границам смысла.
+• Сегменты не должны пересекаться.
+    """
 
     # Define generation config based on AI Studio code
     generation_config = make_generation_config(system_instruction_text, temperature=cfg.llm.temperature_highlights)
@@ -360,9 +366,8 @@ def extract_highlights(
             if not response or not response.text:
                  print(f"Неудача на попытке {attempt + 1}: пустой ответ от LLM.")
                  continue
- 
-            print(f"Сырой ответ LLM на попытке {attempt + 1}:\n---\n{response.text}\n---")
-             # Extract JSON from response
+
+            # Extract JSON from response
             response_text = response.text
             # Handle potential markdown code blocks
             match = re.search(r"```json\s*([\s\S]*?)\s*```", response_text)
@@ -379,59 +384,37 @@ def extract_highlights(
                  print(f"Сырой ответ LLM: {response.text}")
                  continue
 
-            # --- Улучшенная валидация и обработка пересечений ---
-            print(f"LLM вернула {len(raw_highlights)} потенциальных сегментов. Начинаю валидацию.")
-            
-            # 1. Индивидуальная валидация (формат, длительность)
-            individually_valid_highlights = []
-            for h in raw_highlights:
-                if validate_highlight(h):
-                    individually_valid_highlights.append(h)
-                else:
-                    print(f"Отбракован сегмент из-за индивидуальной валидации: {h}")
+            # Filter the highlights: Keep only those passing individual validation
+            valid_highlights = [h for h in raw_highlights if validate_highlight(h)]
 
-            print(f"После проверки формата и длительности осталось {len(individually_valid_highlights)} валидных сегментов.")
+            if not valid_highlights:
+                print("No highlights passed individual duration/format validation in this attempt.")
+                continue # Try next attempt
 
-            if not individually_valid_highlights:
-                print("Ни один из сегментов не прошел индивидуальную валидацию. Следующая попытка.")
-                continue
+            # Check for overlaps ONLY among the valid duration highlights
+            # Sort again just to be sure, although validate_highlights also sorts internally for its check
+            sorted_highlights = sorted(valid_highlights, key=lambda x: float(x["start"]))
+            overlaps_found = False
+            for i in range(len(sorted_highlights) - 1):
+                if float(sorted_highlights[i]["end"]) > float(sorted_highlights[i + 1]["start"]):
+                    print(f"Обнаружено пересечение между {sorted_highlights[i]} и {sorted_highlights[i+1]}")
+                    overlaps_found = True
+                    break # No need to check further overlaps in this attempt
 
-            # 2. Обработка пересечений: просто отбрасываем пересекающиеся
-            sorted_highlights = sorted(individually_valid_highlights, key=lambda x: float(x.get("start", 0.0)))
-            
-            non_overlapping_highlights = []
-            if sorted_highlights:
-                last_valid_segment = sorted_highlights[0]
-                non_overlapping_highlights.append(last_valid_segment)
-                
-                for i in range(1, len(sorted_highlights)):
-                    current_segment = sorted_highlights[i]
-                    last_end = float(last_valid_segment.get("end", 0.0))
-                    current_start = float(current_segment.get("start", 0.0))
-
-                    if current_start < last_end:
-                        print(f"Обнаружено и отброшено пересечение: {current_segment} (start: {current_start}) начинается раньше, чем заканчивается предыдущий (end: {last_end}).")
-                        continue
-                    else:
-                        non_overlapping_highlights.append(current_segment)
-                        last_valid_segment = current_segment
-
-            if not non_overlapping_highlights:
-                print("После обработки пересечений не осталось валидных сегментов.")
-                continue
+            if overlaps_found:
+                print("Проверка на пересечения провалена для этой попытки.")
+                continue # Try next attempt
 
             # If we reach here, we have a non-empty list of valid, non-overlapping highlights
-            print(f"Успех на попытке {attempt + 1}. Найдено валидных сегментов: {len(non_overlapping_highlights)}.")
+            print(f"Успех на попытке {attempt + 1}. Найдено валидных сегментов: {len(sorted_highlights)}.")
             # Apply max_highlights cap from config
             try:
                 max_h = int(cfg.llm.max_highlights)
                 if max_h > 0:
-                    return non_overlapping_highlights[:max_h]
+                    return sorted_highlights[:max_h]
             except Exception:
                 pass
-            return non_overlapping_highlights # Return the validated and sorted list
-
-            # If we reach here, we have a non-empty list of valid, non-overlapping highlights
+            return sorted_highlights # Return the validated and sorted list
 
         except json.JSONDecodeError:
              print(f"Неудача на попытке {attempt + 1}: некорректный JSON от LLM.")
