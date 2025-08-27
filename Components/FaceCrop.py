@@ -330,17 +330,13 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     try:
         import json
         ffprobe_cmd = [
-            'ffprobe',
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'json',
-            input_video_path
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height', '-of', 'json', input_video_path
         ]
         result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
         probe_data = json.loads(result.stdout)
-        original_width = probe_data['streams'][0]['width']
-        original_height = probe_data['streams'][0]['height']
+        original_width = int(probe_data['streams'][0]['width'])
+        original_height = int(probe_data['streams'][0]['height'])
     except Exception as e:
         print(f"Error getting video dimensions: {e}")
         return None
@@ -400,8 +396,8 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
         return output_video_path
     except subprocess.CalledProcessError as e:
         print(f"Error running FFmpeg: {e}")
-        print(f"FFmpeg stdout: {e.stdout}")
-        print(f"FFmpeg stderr: {e.stderr}")
+        print(f"FFmpeg stdout: {e.stdout.strip()}")
+        print(f"FFmpeg stderr: {e.stderr.strip()}")
         return None
     except Exception as e:
         print(f"An error occurred during processing: {e}")
