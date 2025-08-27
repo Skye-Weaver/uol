@@ -11,6 +11,8 @@ import cv2
 
 # Import caption functions from the new module
 from .Captions import burn_captions, animate_captions
+# Logger for detailed debug output
+from .Logger import logger
 
 def extractAudio(video_path):
     try:
@@ -192,98 +194,82 @@ def get_video_dimensions(video_path):
         return None, None
     except Exception as e:
         print(f"  An unexpected error occurred getting dimensions: {e}")
-def create_shorts_video(input_path, output_path, crop_width_percentage=0.7, left_crop_percent=0.15, right_crop_percent=0.15):
+def create_shorts_video(
+    input_path,
+    output_path,
+    crop_width_percentage=0.7,
+    left_crop_percent=0.15,
+    right_crop_percent=0.15,
+    debug: bool = False
+):
     """
-    Creates a 9:16 "shorts" video from a source video.
+    Создает вертикальный клип с размытым фоном из исходного видео.
 
-    The process involves:
-    1. Cropping the central part of the video with specified left and right crop percentages.
-    2. Creating a 9:16 canvas.
-    3. Placing a blurred version of the original video as the background.
-    4. Overlaying the cropped video in the center.
-
-    Args:
-        input_path (str): Path to the source video file.
-        output_path (str): Path to save the resulting shorts video.
-        crop_width_percentage (float): The percentage of the original width to keep (0.0 to 1.0).
-            This parameter is kept for backward compatibility but will be ignored if
-            left_crop_percent and right_crop_percent are provided.
-        left_crop_percent (float): The percentage of the original width to crop from the left side (0.0 to 1.0).
-        right_crop_percent (float): The percentage of the original width to crop from the right side (0.0 to 1.0).
-
-    Returns:
-        bool: True if successful, False otherwise.
+    Требования:
+    - Две ветки из входа 0:v:
+      Фон: scale=OUT_W:OUT_H, blur (boxblur или gblur), setsar=1
+      Контент: crop (70% или лев/прав проценты), затем scale до FG_W:FG_H, setsar=1
+    - Никакого pad=color=black
+    - Сведение: [bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p
+    - Совместимость контейнера: -pix_fmt yuv420p, -map 0:a? -c:a copy
+    - OUT_W:OUT_H = 213:274
+    - Обратная совместимость параметров crop_width_percentage, left_crop_percent, right_crop_percent
     """
     try:
-        # 1. Получить размеры видео
+        # 1) Размеры исходного видео
         original_width, original_height = get_video_dimensions(input_path)
         if not original_width or not original_height:
             print("Error: Could not get video dimensions.")
             return False
 
-        # 2. Рассчитать новые размеры
-        target_aspect_ratio = 9 / 16
-        
-        # Рассчитать ширину кадрирования на основе процентов обрезки слева и справа
-        # Если заданы left_crop_percent и right_crop_percent, используем их
-        # В противном случае используем crop_width_percentage для обратной совместимости
+        # 2) Целевые размеры кадра и внутренняя логика кропа
+        OUT_W, OUT_H = 213, 274  # Требуемые целевые размеры кадра
+        # Вычисляем ширину и смещение кропа
         if left_crop_percent is not None and right_crop_percent is not None:
             crop_width = int(original_width * (1.0 - left_crop_percent - right_crop_percent))
-            # Убедимся, что crop_width положительный
             crop_width = max(1, crop_width)
-        else:
-            # Использовать crop_width_percentage для обратной совместимости
-            crop_width = int(original_width * crop_width_percentage)
-        
-        # Высота остается прежней
-        crop_height = original_height
-        
-        # Конечная ширина и высота для формата 9:16
-        # Конечная высота равна высоте кадрирования
-        output_height = crop_height
-        # Конечная ширина вычисляется из соотношения 9:16
-        output_width = int(output_height * target_aspect_ratio)
-        # Убедимся, что ширина четная
-        output_width = output_width if output_width % 2 == 0 else output_width + 1
-
-        # 3. Рассчитать позицию обрезки
-        # Для новых параметров обрезки слева и справа
-        if left_crop_percent is not None and right_crop_percent is not None:
             crop_x = int(original_width * left_crop_percent)
         else:
-            # Для обратной совместимости (обрезка по центру)
+            crop_width = int(original_width * crop_width_percentage)
+            crop_width = max(1, crop_width)
             crop_x = int((original_width - crop_width) / 2)
+        crop_height = original_height
 
-        # 4. Собрать команду FFmpeg с filter_complex
+        # 3) Построение filter_complex:
+        #    - Фон: из того же 0:v, растянуть до OUT_W:OUT_H, размыть, выровнять SAR
+        #    - Контент: кроп по логике выше, затем масштаб по высоте до OUT_H с сохранением AR, выровнять SAR
+        #    - Оверлей: центрировать, shortest=1, финально привести к yuv420p
+        filter_complex = (
+            f"[0:v]split=2[fg_src][bg_src];"
+            f"[bg_src]scale={OUT_W}:{OUT_H}:flags=bicubic,boxblur=20:1,setsar=1[bg];"
+            f"[fg_src]crop={crop_width}:{crop_height}:{crop_x}:0,scale=-2:{OUT_H},setsar=1[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p[vout]"
+        )
+
+        # 4) Полная команда FFmpeg с маппингом аудио, libx264 и yuv420p
         ffmpeg_command = [
-            'ffmpeg', '-y', '-i', input_path,
-            '-filter_complex',
-            (
-                # 1. Клонируем видеопоток дважды для фона и основного видео.
-                "[0:v]split=2[main][bg];"
-                # 2. Обрабатываем фон:
-                #    - масштабируем до конечного размера output_width x output_height
-                #    - применяем сильное размытие
-                f"[bg]scale={output_width}:{output_height},gblur=sigma=25[bg_blurred];"
-                # 3. Обрабатываем основное видео:
-                #    - обрезаем с учетом процентов обрезки слева и справа
-                f"[main]crop={crop_width}:{crop_height}:{crop_x}:0[main_cropped];"
-                # 4. Накладываем обрезанное видео на размытый фон:
-                #    - (W-w)/2 и (H-h)/2 центрируют наложение
-                "[bg_blurred][main_cropped]overlay=(W-w)/2:(H-h)/2"
-            ),
+            'ffmpeg', '-y',
+            '-i', input_path,
+            '-filter_complex', filter_complex,
+            '-map', '[vout]', '-map', '0:a?',
             '-c:v', 'libx264',
             '-preset', 'fast',
             '-crf', '22',
-            '-c:a', 'copy', # Простое копирование аудио без перекодирования
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy',
             output_path
         ]
 
-        print("Running FFmpeg command to create shorts video:")
+        # 5) Подробное логирование команды и filter_complex
         cmd_string = ' '.join(shlex.quote(arg) for arg in ffmpeg_command)
+        logger.logger.debug(f"FFmpeg filter_complex: {filter_complex}")
+        logger.logger.debug(f"FFmpeg command: {cmd_string}")
+        print("Running FFmpeg command to create shorts video:")
         print(f"Command: {cmd_string}")
-        
-        # 5. Запустить FFmpeg
+        if debug:
+            print(f"Filter graph:\n{filter_complex}")
+
+        # 6) Запуск FFmpeg
         process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
         print(f"Successfully created shorts video: {output_path}")
         return True
@@ -292,9 +278,12 @@ def create_shorts_video(input_path, output_path, crop_width_percentage=0.7, left
         print(f"Error running FFmpeg for shorts creation: {e}")
         print(f"FFmpeg stdout: {e.stdout}")
         print(f"FFmpeg stderr: {e.stderr}")
+        logger.logger.error(f"FFmpeg failed. STDOUT: {e.stdout}")
+        logger.logger.error(f"FFmpeg failed. STDERR: {e.stderr}")
         return False
     except Exception as e:
         print(f"An unexpected error occurred during shorts creation: {e}")
+        logger.logger.error(f"Unexpected error in create_shorts_video: {e}")
         return False
 
 # Example usage:
