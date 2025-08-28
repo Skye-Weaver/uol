@@ -1055,23 +1055,75 @@ if __name__ == "__main__":
         local_file = input("Enter path to local video file: ")
         output = process_video(local_path=local_file)
     elif choice == "3":
-        print("\nFilm Mode - Analysis of best moments")
-        print("Choose input source:")
-        print("1. YouTube URL")
-        print("2. Local File")
-        film_choice = input("Enter your choice (1 or 2): ")
+        print("\n🎬 Режим 'Фильм' - Анализ лучших моментов")
+        print("Выберите источник видео:")
 
-        if film_choice == "1":
-            url = input("Enter YouTube URL: ")
-            from Components.FilmMode import analyze_film_main
-            result = analyze_film_main(url=url)
-        elif film_choice == "2":
-            local_file = input("Enter path to local video file: ")
-            from Components.FilmMode import analyze_film_main
-            result = analyze_film_main(local_path=local_file)
+        # Импортируем функции для работы с папкой movies
+        from Components.FilmMode import scan_movies_folder, display_movie_selection, select_movie_by_number, analyze_film_main
+
+        # Сканируем папку movies
+        video_files = scan_movies_folder()
+
+        # Показываем список файлов
+        display_movie_selection(video_files)
+
+        # Если есть файлы, предлагаем выбрать
+        if video_files:
+            selected_file = select_movie_by_number(video_files)
+
+            if selected_file == "URL_INPUT":
+                # Пользователь выбрал ручной ввод
+                print("\nВыберите тип источника:")
+                print("1. YouTube URL")
+                print("2. Путь к локальному файлу")
+                manual_choice = input("Введите ваш выбор (1 или 2): ").strip()
+
+                if manual_choice == "1":
+                    url = input("Введите YouTube URL: ").strip()
+                    result = analyze_film_main(url=url)
+                elif manual_choice == "2":
+                    local_file = input("Введите путь к видео файлу: ").strip()
+                    if not os.path.exists(local_file):
+                        print(f"❌ Ошибка: Файл не найден: {local_file}")
+                        result = None
+                    else:
+                        result = analyze_film_main(local_path=local_file)
+                else:
+                    print("❌ Неверный выбор")
+                    result = None
+            elif selected_file:
+                # Выбран файл из папки movies
+                # Дополнительная проверка существования файла
+                if not os.path.exists(selected_file):
+                    print(f"❌ Ошибка: Файл не найден: {selected_file}")
+                    print("Файл мог быть удален после сканирования.")
+                    result = None
+                else:
+                    result = analyze_film_main(local_path=selected_file)
+            else:
+                # Отмена выбора
+                print("Выбор отменен.")
+                result = None
         else:
-            print("Invalid choice")
-            result = None
+            # Папка movies пуста, предлагаем ручной ввод
+            print("\nПапка movies пуста. Выберите тип источника:")
+            print("1. YouTube URL")
+            print("2. Путь к локальному файлу")
+            manual_choice = input("Введите ваш выбор (1 или 2): ").strip()
+
+            if manual_choice == "1":
+                url = input("Введите YouTube URL: ").strip()
+                result = analyze_film_main(url=url)
+            elif manual_choice == "2":
+                local_file = input("Введите путь к видео файлу: ").strip()
+                if not os.path.exists(local_file):
+                    print(f"❌ Ошибка: Файл не найден: {local_file}")
+                    result = None
+                else:
+                    result = analyze_film_main(local_path=local_file)
+            else:
+                print("❌ Неверный выбор")
+                result = None
 
         if result:
             print(f"\nFilm analysis completed successfully!")

@@ -551,6 +551,159 @@ class FilmAnalyzer:
         )
 
 
+def scan_movies_folder() -> List[str]:
+    """
+    Сканирует папку movies и возвращает список видео файлов.
+    Поддерживаемые форматы: .mp4, .avi, .mkv, .mov, .wmv
+
+    Returns:
+        List[str]: Список путей к видео файлам
+    """
+    movies_dir = os.path.join(os.getcwd(), "movies")
+    supported_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv'}
+
+    if not os.path.exists(movies_dir):
+        logger.logger.warning(f"Папка movies не найдена: {movies_dir}")
+        return []
+
+    video_files = []
+    try:
+        for file in os.listdir(movies_dir):
+            if os.path.isfile(os.path.join(movies_dir, file)):
+                _, ext = os.path.splitext(file.lower())
+                if ext in supported_extensions:
+                    video_files.append(os.path.join(movies_dir, file))
+    except Exception as e:
+        logger.logger.error(f"Ошибка при сканировании папки movies: {e}")
+        return []
+
+    return sorted(video_files)
+
+
+def display_movie_selection(video_files: List[str]) -> None:
+    """
+    Отображает список видео файлов с номерами для выбора.
+
+    Args:
+        video_files: Список путей к видео файлам
+    """
+    if not video_files:
+        print("\n📁 Папка movies пуста или не содержит поддерживаемых видео файлов.")
+        print("Поддерживаемые форматы: .mp4, .avi, .mkv, .mov, .wmv")
+        print("Поместите видео файлы в папку 'movies' в корне проекта.")
+        return
+
+    print(f"\n🎬 Найдено {len(video_files)} видео файлов в папке movies:")
+    print("-" * 60)
+
+    for i, file_path in enumerate(video_files, 1):
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+
+        # Получаем информацию о длительности, если возможно
+        duration_str = ""
+        try:
+            from Components.Edit import get_video_dimensions
+            # Для получения длительности можно использовать ffprobe
+            duration = _get_video_duration_quick(file_path)
+            if duration and duration > 0:
+                duration_str = f" ({duration:.1f} мин)"
+        except:
+            pass
+
+        print("2d")
+
+    print("-" * 60)
+    print("0. Вернуться в главное меню")
+    print("URL. Ввести YouTube URL или путь к файлу вручную")
+
+
+def select_movie_by_number(video_files: List[str]) -> Optional[str]:
+    """
+    Позволяет пользователю выбрать видео файл по номеру.
+
+    Args:
+        video_files: Список путей к видео файлам
+
+    Returns:
+        Optional[str]: Выбранный путь к файлу или None при отмене
+    """
+    if not video_files:
+        return None
+
+    while True:
+        try:
+            choice = input("\nВведите номер видео (1-{}) или 0 для отмены: ".format(len(video_files))).strip()
+
+            if choice == "0":
+                return None
+
+            if choice.upper() == "URL":
+                # Возвращаем специальный маркер для ручного ввода
+                return "URL_INPUT"
+
+            choice_num = int(choice)
+
+            if 1 <= choice_num <= len(video_files):
+                selected_file = video_files[choice_num - 1]
+
+                # Проверяем, что файл все еще существует
+                if not os.path.exists(selected_file):
+                    print(f"❌ Файл не найден: {os.path.basename(selected_file)}")
+                    print("Файл мог быть удален или перемещен.")
+                    return None
+
+                file_name = os.path.basename(selected_file)
+                file_size = os.path.getsize(selected_file) / (1024 * 1024)  # MB
+                print(f"\n✅ Выбрано: {file_name} ({file_size:.1f} MB)")
+                return selected_file
+            else:
+                print(f"❌ Неверный номер. Введите число от 1 до {len(video_files)}")
+
+        except ValueError:
+            print("❌ Неверный ввод. Введите число или 'URL' для ручного ввода")
+        except KeyboardInterrupt:
+            print("\n\nОтмена выбора.")
+            return None
+        except Exception as e:
+            print(f"❌ Ошибка при выборе файла: {e}")
+            return None
+
+
+def _get_video_duration_quick(video_path: str) -> Optional[float]:
+    """
+    Быстрое получение длительности видео через ffprobe.
+
+    Args:
+        video_path: Путь к видео файлу
+
+    Returns:
+        Optional[float]: Длительность в минутах или None при ошибке
+    """
+    try:
+        import subprocess
+        import json
+
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            video_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            duration = float(data['format']['duration'])
+            return duration / 60  # в минутах
+        else:
+            return None
+    except Exception:
+        return None
+
+
 def analyze_film_main(url: Optional[str] = None, local_path: Optional[str] = None) -> FilmAnalysisResult:
     """
     Основная функция для анализа фильма.
