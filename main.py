@@ -1045,7 +1045,8 @@ if __name__ == "__main__":
     print("\nVideo Processing Options:")
     print("1. Process YouTube URL")
     print("2. Process Local File")
-    choice = input("Enter your choice (1 or 2): ")
+    print("3. Process Film Mode (analyze best moments)")
+    choice = input("Enter your choice (1, 2, or 3): ")
 
     if choice == "1":
         url = input("Enter YouTube URL: ")
@@ -1053,6 +1054,58 @@ if __name__ == "__main__":
     elif choice == "2":
         local_file = input("Enter path to local video file: ")
         output = process_video(local_path=local_file)
+    elif choice == "3":
+        print("\nFilm Mode - Analysis of best moments")
+        print("Choose input source:")
+        print("1. YouTube URL")
+        print("2. Local File")
+        film_choice = input("Enter your choice (1 or 2): ")
+
+        if film_choice == "1":
+            url = input("Enter YouTube URL: ")
+            from Components.FilmMode import analyze_film_main
+            result = analyze_film_main(url=url)
+        elif film_choice == "2":
+            local_file = input("Enter path to local video file: ")
+            from Components.FilmMode import analyze_film_main
+            result = analyze_film_main(local_path=local_file)
+        else:
+            print("Invalid choice")
+            result = None
+
+        if result:
+            print(f"\nFilm analysis completed successfully!")
+            print(f"Video ID: {result.video_id}")
+            print(f"Duration: {result.duration:.1f} seconds")
+            print(f"Found {len(result.keep_ranges)} best moments")
+            print(f"Preview: {result.preview_text}")
+
+            # Сохраняем JSON результат
+            import json
+            import os
+            from datetime import datetime
+
+            output_dir = "film_analysis_results"
+            os.makedirs(output_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(output_dir, f"film_analysis_{result.video_id}_{timestamp}.json")
+
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'video_id': result.video_id,
+                    'duration': result.duration,
+                    'keep_ranges': result.keep_ranges,
+                    'scores': result.scores,
+                    'preview_text': result.preview_text,
+                    'risks': result.risks,
+                    'metadata': result.metadata
+                }, f, ensure_ascii=False, indent=2)
+
+            print(f"Results saved to: {output_file}")
+        else:
+            print("\nFilm analysis failed!")
+        output = None  # Не устанавливаем output для совместимости
     else:
         print("Invalid choice")
         output = None

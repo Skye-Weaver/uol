@@ -30,6 +30,31 @@ llm:
   highlight_max_sec: 61
   max_highlights: 20
 
+# Настройки режима "фильм"
+film_mode:
+  enabled: true
+  combo_duration: [10, 20]  # секунды для COMBO моментов
+  single_duration: [30, 60]  # секунды для SINGLE моментов
+  max_moments: 15  # максимальное количество моментов для анализа
+  pause_threshold: 0.7  # порог для определения длинных пауз (секунды)
+  filler_words: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"]  # слова-заполнители для обрезки
+
+  # Весовые коэффициенты для ранжирования моментов
+  ranking_weights:
+    emotional_peaks: 0.20      # Эмоциональные пики и переломы статуса
+    conflict_escalation: 0.18  # Конфликт и эскалация
+    punchlines_wit: 0.16       # Панчлайны и остроумие
+    quotability_memes: 0.14    # Цитатность/мемность
+    stakes_goals: 0.12         # Ставки и цель
+    hooks_cliffhangers: 0.10   # Крючки/клиффхэнгеры
+    visual_penalty: -0.10      # Штраф за визуальную зависимость
+
+  # Настройки LLM для анализа фильма
+  llm:
+    model: "gemini-2.5-flash"
+    temperature: 0.3
+    max_attempts: 3
+
 logging:
   # Основные настройки логирования
   log_dir: "logs"

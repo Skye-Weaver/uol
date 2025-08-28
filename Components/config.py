@@ -35,6 +35,33 @@ class LLMConfig:
 
 
 @dataclass
+class FilmModeConfig:
+    """Конфигурация для режима 'фильм'"""
+    enabled: bool = True
+    combo_duration: list = field(default_factory=lambda: [10, 20])  # секунды для COMBO моментов
+    single_duration: list = field(default_factory=lambda: [30, 60])  # секунды для SINGLE моментов
+    max_moments: int = 15  # максимальное количество моментов для анализа
+    pause_threshold: float = 0.7  # порог для определения длинных пауз (секунды)
+    filler_words: list = field(default_factory=lambda: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"])  # слова-заполнители
+
+    # Весовые коэффициенты для ранжирования моментов
+    ranking_weights: dict = field(default_factory=lambda: {
+        'emotional_peaks': 0.20,      # Эмоциональные пики и переломы статуса
+        'conflict_escalation': 0.18,  # Конфликт и эскалация
+        'punchlines_wit': 0.16,       # Панчлайны и остроумие
+        'quotability_memes': 0.14,    # Цитатность/мемность
+        'stakes_goals': 0.12,         # Ставки и цель
+        'hooks_cliffhangers': 0.10,   # Крючки/клиффхэнгеры
+        'visual_penalty': -0.10       # Штраф за визуальную зависимость
+    })
+
+    # Настройки LLM для анализа фильма
+    llm_model: str = "gemini-2.5-flash"
+    llm_temperature: float = 0.3
+    llm_max_attempts: int = 3
+
+
+@dataclass
 class LoggingConfig:
     # Основные настройки логирования
     log_dir: str = "logs"
@@ -182,6 +209,7 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     captions: CaptionsConfig = field(default_factory=CaptionsConfig)
+    film_mode: FilmModeConfig = field(default_factory=FilmModeConfig)
 
 
 def _as_bool(v: Any, default: bool) -> bool:
@@ -264,6 +292,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     l_in = data.get("llm", {}) or {}
     log_in = data.get("logging", {}) or {}
     paths_in = data.get("paths", {}) or {}
+    film_in = data.get("film_mode", {}) or {}
     if not isinstance(p_in, dict):
         p_in = {}
     if not isinstance(l_in, dict):
@@ -272,6 +301,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         log_in = {}
     if not isinstance(paths_in, dict):
         paths_in = {}
+    if not isinstance(film_in, dict):
+        film_in = {}
 
     # Processing
     crop_mode = _as_str(p_in.get("crop_mode", defaults.processing.crop_mode), defaults.processing.crop_mode)
@@ -742,7 +773,40 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         fade_out_seconds=fade_out_seconds,
     )
 
-    return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions)
+    # Film Mode
+    film_enabled = _as_bool(film_in.get("enabled", defaults.film_mode.enabled), defaults.film_mode.enabled)
+    film_combo_duration = film_in.get("combo_duration", defaults.film_mode.combo_duration)
+    film_single_duration = film_in.get("single_duration", defaults.film_mode.single_duration)
+    film_max_moments = max(1, _as_int(film_in.get("max_moments", defaults.film_mode.max_moments), defaults.film_mode.max_moments))
+    film_pause_threshold = _clamp(_as_float(film_in.get("pause_threshold", defaults.film_mode.pause_threshold), defaults.film_mode.pause_threshold), 0.1, 2.0)
+    film_filler_words = film_in.get("filler_words", defaults.film_mode.filler_words)
+    if not isinstance(film_filler_words, list):
+        film_filler_words = defaults.film_mode.filler_words
+
+    # Ranking weights
+    film_ranking_weights = film_in.get("ranking_weights", defaults.film_mode.ranking_weights)
+    if not isinstance(film_ranking_weights, dict):
+        film_ranking_weights = defaults.film_mode.ranking_weights
+
+    # LLM settings for film mode
+    film_llm_model = _as_str(film_in.get("llm", {}).get("model", defaults.film_mode.llm_model), defaults.film_mode.llm_model)
+    film_llm_temperature = _clamp(_as_float(film_in.get("llm", {}).get("temperature", defaults.film_mode.llm_temperature), defaults.film_mode.llm_temperature), 0.0, 2.0)
+    film_llm_max_attempts = max(1, _as_int(film_in.get("llm", {}).get("max_attempts", defaults.film_mode.llm_max_attempts), defaults.film_mode.llm_max_attempts))
+
+    film = FilmModeConfig(
+        enabled=film_enabled,
+        combo_duration=film_combo_duration,
+        single_duration=film_single_duration,
+        max_moments=film_max_moments,
+        pause_threshold=film_pause_threshold,
+        filler_words=film_filler_words,
+        ranking_weights=film_ranking_weights,
+        llm_model=film_llm_model,
+        llm_temperature=film_llm_temperature,
+        llm_max_attempts=film_llm_max_attempts,
+    )
+
+    return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions, film_mode=film)
 
 
 _CONFIG: Optional[AppConfig] = None
