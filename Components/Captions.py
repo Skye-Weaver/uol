@@ -1,4 +1,5 @@
 import math
+import string
 import cv2
 import numpy as np # Add numpy import
 import os
@@ -181,21 +182,47 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         f"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    for segment in transcriptions:
-        text, seg_start, seg_end = segment
-        if str(text).strip() == '[*]':
+    # Итерация по сегментам и словам для создания "караоке" эффекта (появление слов по одному)
+    segments = transcriptions.get("segments", [])
+    for segment in segments:
+        # Пропускаем сегменты без слов
+        if not segment.get("words"):
             continue
-        if seg_start >= start_time and seg_end <= end_time:
-            relative_start = seg_start - start_time
-            relative_end = seg_end - start_time
-            if relative_start < 0:
-                relative_start = 0.0
-            if relative_end <= relative_start:
-                relative_end = relative_start + 0.1
-            ass_content += (
-                f"Dialogue: 0,{format_time_ass(relative_start)},{format_time_ass(relative_end)},"
-                f"Default,,0,0,0,,{str(text).strip().upper()}\\N"
-            )
+
+        for word_info in segment.get("words", []):
+            # В новой структуре текст слова в 'word', но для совместимости проверим и 'text'
+            word_text = (word_info.get('word') or word_info.get('text', '')).strip()
+
+            # Пропускаем пустые слова или специальные маркеры
+            if not word_text or word_text == '[*]':
+                continue
+
+            word_start = word_info.get('start')
+            word_end = word_info.get('end')
+
+            # Пропускаем слова без временных меток
+            if word_start is None or word_end is None:
+                continue
+
+            # Проверяем, что слово попадает в указанный временной диапазон
+            if word_start >= start_time and word_end <= end_time:
+                relative_start = word_start - start_time
+                relative_end = word_end - start_time
+                
+                if relative_start < 0:
+                    relative_start = 0.0
+                # Убедимся, что длительность положительная
+                if relative_end <= relative_start:
+                    relative_end = relative_start + 0.1
+
+                # Применяем очистку от пунктуации и перевод в верхний регистр к каждому слову
+                clean_text = word_text.upper().translate(str.maketrans('', '', string.punctuation))
+
+                # Генерируем событие 'Dialogue' для каждого слова
+                ass_content += (
+                    f"Dialogue: 0,{format_time_ass(relative_start)},{format_time_ass(relative_end)},"
+                    f"Default,,0,0,0,,{clean_text}\\N"
+                )
 
     return ass_content
 
@@ -751,7 +778,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     # Skip if the primary word is [*]
                     if word1_text != '[*]':
                         # Теперь отображаем только одно слово и в верхнем регистре
-                        words_to_display = word1_text.upper()
+                        words_to_display = word1_text.upper().translate(str.maketrans('', '', string.punctuation))
                         window_words.append((words_to_display, word1_info))
 
             # --- Drawing Logic (Pillow - Max 2 words) ---
