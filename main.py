@@ -368,8 +368,7 @@ def run_unified_transcription(ctx: ProcessingContext, model: WhisperModel) -> bo
     print("Cache incomplete. Running unified transcription for segments and words...")
     
     # Используется унифицированный подход для повышения эффективности
-    word_level_transcription = transcribe_unified(ctx.audio_path, model)
-    segments_legacy = word_level_transcription.get("segments")
+    segments_legacy, word_level_transcription = transcribe_unified(ctx.audio_path, model)
 
     if not segments_legacy:
         print("Unified transcription failed. Cannot proceed.")
