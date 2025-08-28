@@ -85,10 +85,16 @@ class FilmAnalyzer:
         if not video_path or not transcription_data:
             raise ValueError("Не удалось получить видео или транскрибацию")
 
+        # Логируем информацию о полученных данных
+        duration = transcription_data.get('duration', 0)
+        segments_count = len(transcription_data.get('segments', []))
+        logger.logger.info(f"Получены данные транскрибации: длительность={duration:.2f}s, сегментов={segments_count}")
+
         # 2. Анализ моментов через ИИ
         moments = self._analyze_moments(transcription_data)
         if not moments:
             logger.logger.warning("Не найдено подходящих моментов для анализа")
+            logger.logger.warning(f"Данные транскрибации: duration={duration}, segments={segments_count}")
             return self._create_empty_result(video_path)
 
         # 3. Ранжирование моментов
@@ -119,15 +125,29 @@ class FilmAnalyzer:
             if not video_path or not os.path.exists(video_path):
                 raise FileNotFoundError(f"Видео файл не найден: {video_path}")
 
-            # Получение длительности видео
-            from Components.Edit import get_video_dimensions
-            # Для получения длительности можно использовать ffprobe
-            duration = self._get_video_duration(video_path)
-
             # Транскрибация
             logger.logger.info("Начало транскрибации видео")
             model = self._load_whisper_model()
             segments_legacy, word_level_transcription = transcribe_unified(video_path, model)
+
+            # Используем длительность из модели Whisper вместо ffprobe
+            duration = 0.0
+            if word_level_transcription and 'segments' in word_level_transcription:
+                # Извлекаем длительность из последнего сегмента
+                segments = word_level_transcription['segments']
+                if segments:
+                    last_segment = segments[-1]
+                    duration = float(last_segment.get('end', 0.0))
+
+            # Если длительность все еще 0, пробуем ffprobe как fallback
+            if duration == 0.0:
+                try:
+                    duration = self._get_video_duration(video_path)
+                    logger.logger.info(f"Длительность получена через ffprobe: {duration:.2f} секунд")
+                except Exception as e:
+                    logger.logger.warning(f"Не удалось получить длительность через ffprobe: {e}")
+
+            logger.logger.info(f"Финальная длительность видео: {duration:.2f} секунд")
 
             transcription_data = {
                 'segments': segments_legacy,
@@ -199,8 +219,23 @@ class FilmAnalyzer:
     def _analyze_moments(self, transcription_data: Dict[str, Any]) -> List[FilmMoment]:
         """Анализ моментов через ИИ"""
         try:
+            # Преобразование формата сегментов для build_transcription_prompt
+            segments_legacy = transcription_data.get('segments', [])
+            segments_dict = []
+
+            # Преобразуем список списков в список словарей
+            for seg in segments_legacy:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                    segments_dict.append({
+                        'text': str(seg[0]),
+                        'start': float(seg[1]),
+                        'end': float(seg[2])
+                    })
+                elif isinstance(seg, dict):
+                    segments_dict.append(seg)
+
             # Формирование текста транскрибации
-            transcription_text = build_transcription_prompt(transcription_data.get('segments', []))
+            transcription_text = build_transcription_prompt(segments_dict)
 
             # Анализ через LLM
             moments = self._extract_film_moments(transcription_text)
@@ -242,6 +277,9 @@ class FilmAnalyzer:
         """
 
         try:
+            logger.logger.info(f"Отправка запроса к LLM для анализа моментов (модель: {self.film_config.llm_model})")
+            logger.logger.debug(f"Длина транскрибации: {len(transcription)} символов")
+
             generation_config = make_generation_config(system_instruction, temperature=0.3)
 
             response = call_llm_with_retry(
@@ -257,29 +295,55 @@ class FilmAnalyzer:
 
             # Парсинг JSON ответа
             response_text = response.text.strip()
+            logger.logger.debug(f"Сырой ответ LLM: {response_text[:500]}...")
+
             if response_text.startswith('```json'):
                 response_text = response_text[7:]
             if response_text.endswith('```'):
                 response_text = response_text[:-3]
 
-            moments_data = json.loads(response_text.strip())
+            response_text = response_text.strip()
+
+            try:
+                moments_data = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                logger.logger.error(f"Ошибка парсинга JSON от LLM: {e}")
+                logger.logger.error(f"Текст для парсинга: {response_text[:200]}...")
+                return []
+
+            if not isinstance(moments_data, list):
+                logger.logger.error(f"LLM вернул не массив, а {type(moments_data)}")
+                return []
 
             moments = []
-            for item in moments_data:
-                moment = FilmMoment(
-                    moment_type=item.get('moment_type', 'SINGLE'),
-                    start_time=float(item.get('start_time', 0)),
-                    end_time=float(item.get('end_time', 0)),
-                    text=item.get('text', ''),
-                    context=item.get('context', ''),
-                    segments=item.get('segments', [])
-                )
-                moments.append(moment)
+            for i, item in enumerate(moments_data):
+                try:
+                    if not isinstance(item, dict):
+                        logger.logger.warning(f"Элемент {i} не является словарем, пропускаю")
+                        continue
 
+                    moment = FilmMoment(
+                        moment_type=item.get('moment_type', 'SINGLE'),
+                        start_time=float(item.get('start_time', 0)),
+                        end_time=float(item.get('end_time', 0)),
+                        text=item.get('text', ''),
+                        context=item.get('context', ''),
+                        segments=item.get('segments', [])
+                    )
+                    moments.append(moment)
+                    logger.logger.debug(f"Обработан момент {i+1}: {moment.moment_type} {moment.start_time:.1f}-{moment.end_time:.1f}")
+
+                except Exception as e:
+                    logger.logger.warning(f"Ошибка при обработке момента {i}: {e}")
+                    continue
+
+            logger.logger.info(f"Успешно извлечено {len(moments)} моментов из {len(moments_data)}")
             return moments
 
         except Exception as e:
             logger.logger.error(f"Ошибка при извлечении моментов через LLM: {e}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
     def _rank_moments(self, moments: List[FilmMoment]) -> List[RankedMoment]:
