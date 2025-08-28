@@ -168,6 +168,11 @@ class CaptionsConfig:
     animate: AnimateConfig = field(default_factory=AnimateConfig)
     position: PositionConfig = field(default_factory=PositionConfig)
     emoji: EmojiConfig = field(default_factory=EmojiConfig)
+    strip_punctuation: bool = True
+    # New sync/animation fields
+    align_to_audio: bool = True
+    fade_in_seconds: float = 0.15
+    fade_out_seconds: float = 0.12
 
 
 @dataclass
@@ -701,6 +706,26 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         style = defaults.captions.emoji.style
     emoji = EmojiConfig(enabled=enabled, max_per_short=max_per_short, style=style)
 
+    # Strip punctuation flag (default True if missing)
+    strip_punct = _as_bool(
+        captions_in.get("strip_punctuation", defaults.captions.strip_punctuation),
+        defaults.captions.strip_punctuation
+    )
+
+    # New sync/animation fields with safe defaults and ranges
+    align_to_audio = _as_bool(
+        captions_in.get("align_to_audio", defaults.captions.align_to_audio),
+        defaults.captions.align_to_audio
+    )
+    fade_in_seconds = _clamp_float_val(
+        captions_in.get("fade_in_seconds", defaults.captions.fade_in_seconds),
+        defaults.captions.fade_in_seconds, 0.0, 5.0
+    )
+    fade_out_seconds = _clamp_float_val(
+        captions_in.get("fade_out_seconds", defaults.captions.fade_out_seconds),
+        defaults.captions.fade_out_seconds, 0.0, 5.0
+    )
+
     captions = CaptionsConfig(
         font_size_px=fs,
         letter_spacing_px=ls,
@@ -711,6 +736,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         animate=animate,
         position=position,
         emoji=emoji,
+        strip_punctuation=strip_punct,
+        align_to_audio=align_to_audio,
+        fade_in_seconds=fade_in_seconds,
+        fade_out_seconds=fade_out_seconds,
     )
 
     return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions)

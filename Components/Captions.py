@@ -4,9 +4,13 @@ import numpy as np # Add numpy import
 import os
 import subprocess
 import traceback # For detailed error printing in animate_captions
+import unicodedata
 from PIL import Image, ImageDraw, ImageFont # Pillow imports for custom font
 from Components.Paths import fonts_path
+from Components.config import get_config
 
+# Epsilon for time comparisons (inclusive start, exclusive end)
+EPS_TIME = 1e-6
 # pure helper for unit tests and reuse
 def _compute_bottom_margin_px(frame_h: int, bottom_offset_pct: int) -> int:
     try:
@@ -39,6 +43,46 @@ def format_time_ass(seconds):
     hours = minutes // 60
     minutes %= 60
     return f"{hours:d}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+# Display text sanitizer: remove punctuation for visual layer only
+def sanitize_display_text(s: str) -> str:
+    """
+    Remove all Unicode punctuation characters from the given string for display purposes.
+    Explicitly removes the ellipsis character '…' and any sequences of two or more dots
+    ('..', '...', etc.). Does not alter spaces, letters, digits, emoji or the case of
+    characters. Whitespace is not normalized (no trimming/collapsing).
+    """
+    try:
+        if not isinstance(s, str):
+            return str(s)
+        if s == "":
+            return ""
+    except Exception:
+        return str(s)
+
+    # 1) Explicit removals: ellipsis and runs of >=2 dots (keep surrounding spaces intact)
+    tmp = s.replace("…", "")
+    out_chars = []
+    i = 0
+    n = len(tmp)
+    while i < n:
+        ch = tmp[i]
+        if ch == ".":
+            j = i
+            while j < n and tmp[j] == ".":
+                j += 1
+            if (j - i) >= 2:
+                # Skip entire run of dots
+                i = j
+                continue
+            # Single dot will be removed by punctuation filtering below
+        out_chars.append(ch)
+        i += 1
+    tmp2 = "".join(out_chars)
+
+    # 2) Filter out any Unicode punctuation (categories starting with 'P')
+    cleaned = "".join(ch for ch in tmp2 if not unicodedata.category(ch).startswith("P"))
+    return cleaned
 
 # Function to generate ASS content (more compatible with ffmpeg filter)
 def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, video_w=None, video_h=None):
@@ -180,21 +224,43 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         f"[Events]\n"
         f"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+    # Determine whether to strip punctuation for display (default True if absent)
+    try:
+        _cfg = get_config()
+        _strip_punct = bool(getattr(_cfg.captions, "strip_punctuation", True))
+        _align_to_audio = bool(getattr(_cfg.captions, "align_to_audio", True))
+    except Exception:
+        _strip_punct = True
+        _align_to_audio = True
 
     for segment in transcriptions:
         text, seg_start, seg_end = segment
         if str(text).strip() == '[*]':
             continue
-        if seg_start >= start_time and seg_end <= end_time:
-            relative_start = seg_start - start_time
-            relative_end = seg_end - start_time
-            if relative_start < 0:
-                relative_start = 0.0
-            if relative_end <= relative_start:
-                relative_end = relative_start + 0.1
+
+        # Include if there is any overlap with [start_time, end_time) using EPS
+        try:
+            s0 = float(seg_start)
+            s1 = float(seg_end)
+        except Exception:
+            s0 = seg_start
+            s1 = seg_end
+
+        if (s1 > start_time + EPS_TIME) and (s0 < end_time - EPS_TIME):
+            # Clip to window
+            clip_start = max(s0, start_time)
+            clip_end = min(s1, end_time)
+
+            # Relative times from window start, enforcing [start, end)
+            relative_start = max(0.0, clip_start - start_time)
+            relative_end = max(relative_start, clip_end - start_time)
+
+            t_raw = str(text)
+            sanitized = sanitize_display_text(t_raw) if _strip_punct else t_raw
+            line_text = sanitized.strip().upper()
             ass_content += (
                 f"Dialogue: 0,{format_time_ass(relative_start)},{format_time_ass(relative_end)},"
-                f"Default,,0,0,0,,{str(text).strip().upper()}\\N"
+                f"Default,,0,0,0,,{line_text}\\N"
             )
 
     return ass_content
@@ -303,14 +369,26 @@ def find_active_segment_and_word(transcription_result, current_time):
     active_word_index_in_segment = -1 # Index within the segment's word list
 
     for segment in transcription_result.get("segments", []):
-        # Use segment boundaries to find the active segment
-        if segment['start'] <= current_time < segment['end']:
+        # Use segment boundaries with EPS: start inclusive, end exclusive
+        try:
+            seg_start = float(segment['start'])
+            seg_end = float(segment['end'])
+        except Exception:
+            seg_start = segment['start']
+            seg_end = segment['end']
+        if (seg_start - EPS_TIME) <= current_time < (seg_end - EPS_TIME):
             active_segment = segment
             # Find the specific word within this segment based on word timings
             for i, word_info in enumerate(segment.get("words", [])):
                 # Ensure word timings exist before comparing
                 if 'start' in word_info and 'end' in word_info:
-                    if word_info['start'] <= current_time < word_info['end']:
+                    try:
+                        w_start = float(word_info['start'])
+                        w_end = float(word_info['end'])
+                    except Exception:
+                        w_start = word_info['start']
+                        w_end = word_info['end']
+                    if (w_start - EPS_TIME) <= current_time < (w_end - EPS_TIME):
                         active_word_index_in_segment = i
                         break # Found the active word
             # If no specific word is active but the segment is, keep active_segment
@@ -486,6 +564,16 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
             except Exception:
                 letter_spacing_px = 0
 
+        # Fade config from AppConfig.captions
+        try:
+            _cfg_fade = get_config()
+            _cap_cfg = getattr(_cfg_fade, "captions", None)
+            fade_in_seconds = float(getattr(_cap_cfg, "fade_in_seconds", 0.15) or 0.15) if _cap_cfg else 0.15
+            fade_out_seconds = float(getattr(_cap_cfg, "fade_out_seconds", 0.12) or 0.12) if _cap_cfg else 0.12
+        except Exception:
+            fade_in_seconds = 0.15
+            fade_out_seconds = 0.12
+
         # Positioning
         position_mode = "safe_bottom"
         bottom_offset_pct = 22
@@ -596,10 +684,23 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     except Exception:
                         seg_t0 = 0.0
 
-                # Общее окно показа эмодзи ~1.0 c от начала сегмента (совместимость)
+                # Учитываем границы сегмента с EPS и масштабируем окно показа
+                seg_t1 = seg_t0
+                if isinstance(active_segment, dict):
+                    try:
+                        seg_t1 = float(active_segment.get("end", seg_t0) or seg_t0)
+                    except Exception:
+                        seg_t1 = seg_t0
+                # Ограничение по границам сегмента [start, end)
+                if not (seg_t0 - EPS_TIME <= current_time < seg_t1 - EPS_TIME):
+                    return base_img
+
+                seg_dur = max(0.0, seg_t1 - seg_t0)
+                emoji_window_dyn = min(1.0, 0.3 + 0.4 * seg_dur)
+
                 dt = current_time - seg_t0
-                if not (0.0 <= dt <= emoji_window_s):
-                    # Вне окна показа — ведём себя как раньше (не показываем)
+                if not (0.0 <= dt <= emoji_window_dyn):
+                    # Вне окна показа — не отображаем эмодзи
                     return base_img
 
                 # Нормированное время эффекта
@@ -723,6 +824,13 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
             cap.release() # Release resource
             return False
 
+        # Read strip_punctuation flag from config (default True for backward compatibility)
+        try:
+            _cfg = get_config()
+            strip_punct = bool(getattr(_cfg.captions, "strip_punctuation", True))
+        except Exception:
+            strip_punct = True
+
         frame_count = 0
         drawn_any_text = False
         while True:
@@ -750,8 +858,11 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
                     # Skip if the primary word is [*]
                     if word1_text != '[*]':
-                        # Теперь отображаем только одно слово и в верхнем регистре
-                        words_to_display = word1_text.upper()
+                        # Очистка пунктуации (только для визуализации), затем верхний регистр
+                        raw = word1_text
+                        if strip_punct:
+                            raw = sanitize_display_text(raw)
+                        words_to_display = raw.upper()
                         window_words.append((words_to_display, word1_info))
 
             # --- Drawing Logic (Pillow - Max 2 words) ---
@@ -784,6 +895,23 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     # Расширенный путь с наложением RGBA + опциональная анимация per-word
                     base_rgb = Image.fromarray(frame_rgb).convert("RGBA")
                     anim_cfg = getattr(style_cfg, "animate", None)
+
+                    # Segment fade-in/out alpha multiplier
+                    seg_alpha_factor = 1.0
+                    if active_segment:
+                        try:
+                            seg_start = float(active_segment.get("start", 0.0) or 0.0)
+                            seg_end = float(active_segment.get("end", seg_start) or seg_start)
+                            seg_dur = max(0.0, seg_end - seg_start)
+                            fin = min(fade_in_seconds, 0.2 * seg_dur)
+                            fout = min(fade_out_seconds, 0.15 * seg_dur)
+                            t_seg = current_time - seg_start
+                            fade_in_factor = 1.0 if fin <= EPS_TIME else _clamp01(t_seg / (fin if fin > 0.0 else 1.0))
+                            time_to_end = max(0.0, seg_end - current_time)
+                            fade_out_factor = 1.0 if fout <= EPS_TIME else _clamp01(time_to_end / (fout if fout > 0.0 else 1.0))
+                            seg_alpha_factor = min(fade_in_factor, fade_out_factor)
+                        except Exception:
+                            seg_alpha_factor = 1.0
 
                     # Easing helpers + clamp (локальные)
                     def _clamp01(v):
@@ -880,6 +1008,12 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                                 _draw_text_with_spacing(draw_ov, (x_cursor, start_y), w_text, font, use_rgba, stroke_width, stroke_color_rgb, letter_spacing_px)
                                 x_cursor += word_widths[idx] + (space_w if idx < len(word_widths) - 1 else 0)
 
+                        # Apply segment fade to overlay alpha
+                        if seg_alpha_factor < 0.999:
+                            r, g, b, a = overlay.split()
+                            a = a.point(lambda v, am=seg_alpha_factor: int(v * am))
+                            overlay = Image.merge("RGBA", (r, g, b, a))
+
                         composed = Image.alpha_composite(base_rgb, overlay)
                         composed = _apply_emojis(composed, start_x, total_text_w, start_y)
                         drawn_any_text = True
@@ -949,12 +1083,12 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                                     # pop-in: scale 0.85->1.0, alpha = final, translateY=0
                                     scale = 0.85 + 0.15 * final
                                     translateY = 0
-                                    alpha_mult = final
+                                    alpha_mult = final * seg_alpha_factor
                                 else:
                                     # slide-up: смещение снизу, лёгкий scale 0.98->1.0, alpha = final
                                     translateY = int(round((1.0 - final) * offsetY0))
                                     scale = 0.98 + 0.02 * final
-                                    alpha_mult = final
+                                    alpha_mult = final * seg_alpha_factor
 
                                 # Если слово ещё не началось с учётом stagger — не показываем
                                 if progress <= 0.0 or alpha_mult <= 0.0:
