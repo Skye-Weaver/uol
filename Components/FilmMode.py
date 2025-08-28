@@ -20,6 +20,9 @@ from Components.LanguageTasks import (
 from Components.Database import VideoDatabase
 from Components.config import get_config, AppConfig
 from Components.Logger import logger
+from Components.Edit import crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
+from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
+from Components.Paths import build_short_output_name
 from faster_whisper import WhisperModel
 
 
@@ -53,6 +56,7 @@ class FilmAnalysisResult:
     preview_text: str
     risks: List[str]
     metadata: Dict[str, Any]
+    generated_shorts: List[str] = field(default_factory=list)  # Пути к сгенерированным шортам
 
 
 class FilmAnalyzer:
@@ -76,7 +80,8 @@ class FilmAnalyzer:
         3. Анализ моментов через ИИ
         4. Ранжирование
         5. Обрезка скучных секунд
-        6. Формирование результата
+        6. Генерация шортов (если включено)
+        7. Формирование результата
         """
         logger.logger.info("Начало анализа фильма в режиме 'фильм'")
 
@@ -99,14 +104,24 @@ class FilmAnalyzer:
 
         # 3. Ранжирование моментов
         ranked_moments = self._rank_moments(moments)
+        if not ranked_moments:
+            logger.logger.warning("После фильтрации по качеству не осталось подходящих моментов")
+            return self._create_empty_result(video_path)
 
         # 4. Обрезка скучных секунд
         trimmed_moments = self._trim_boring_segments(ranked_moments, transcription_data)
 
-        # 5. Формирование результата
-        result = self._create_result(video_path, trimmed_moments, transcription_data)
+        # 5. Генерация шортов (если включено)
+        generated_shorts = []
+        if self.film_config.generate_shorts and trimmed_moments:
+            logger.logger.info("Генерация шортов из найденных моментов...")
+            generated_shorts = self._generate_shorts_from_moments(video_path, trimmed_moments, transcription_data)
+            logger.logger.info(f"Сгенерировано {len(generated_shorts)} шортов")
 
-        logger.logger.info(f"Анализ фильма завершен. Найдено {len(trimmed_moments)} моментов")
+        # 6. Формирование результата
+        result = self._create_result(video_path, trimmed_moments, transcription_data, generated_shorts)
+
+        logger.logger.info(f"Анализ фильма завершен. Найдено {len(trimmed_moments)} моментов, сгенерировано {len(generated_shorts)} шортов")
         return result
 
     def _get_video_and_transcription(self, url: Optional[str], local_path: Optional[str]) -> tuple:
@@ -357,6 +372,11 @@ class FilmAnalyzer:
                 for score_name, score in scores.items()
             )
 
+            # Фильтрация по минимальному порогу качества
+            if total_score < self.film_config.min_quality_score:
+                logger.logger.debug(f"Момент {i+1} отфильтрован по порогу качества: {total_score:.2f} < {self.film_config.min_quality_score}")
+                continue
+
             ranked_moment = RankedMoment(
                 moment=moment,
                 scores=scores,
@@ -372,7 +392,9 @@ class FilmAnalyzer:
         for i, rm in enumerate(ranked_moments):
             rm.rank = i + 1
 
-        logger.logger.info(f"Ранжирование завершено. Лучший момент имеет балл {ranked_moments[0].total_score:.2f}" if ranked_moments else "Нет моментов для ранжирования")
+        logger.logger.info(f"Ранжирование завершено. Найдено {len(ranked_moments)} моментов с качеством >= {self.film_config.min_quality_score}")
+        if ranked_moments:
+            logger.logger.info(f"Лучший момент имеет балл {ranked_moments[0].total_score:.2f}")
 
         return ranked_moments
 
@@ -457,29 +479,33 @@ class FilmAnalyzer:
             seg_end = float(seg[2])
             seg_text = str(seg[0]).strip()
 
-            # Проверка на вхождение в момент
-            if not (seg_start >= moment.start_time and seg_end <= moment.end_time):
+            # Проверка на ПЕРЕСЕЧЕНИЕ с моментом (не полное вхождение!)
+            # Сегмент должен пересекаться с моментом хотя бы частично
+            if not (seg_end > moment.start_time and seg_start < moment.end_time):
                 continue
 
-            # Критерии скучного сегмента
-            duration = seg_end - seg_start
+            # Ограничиваем сегмент границами момента для корректного анализа
+            effective_start = max(seg_start, moment.start_time)
+            effective_end = min(seg_end, moment.end_time)
+            duration = effective_end - effective_start
 
+            # Критерии скучного сегмента
             # Длинные паузы
             if duration > threshold:
                 boring_segments.append({
-                    'start': seg_start,
-                    'end': seg_end,
+                    'start': effective_start,
+                    'end': effective_end,
                     'reason': 'long_pause',
                     'duration': duration
                 })
                 continue
 
             # Филлеры
-            filler_words = ['э-э', 'м-м', 'ну', 'эээ', 'гм', 'кхм']
+            filler_words = self.film_config.filler_words
             if any(filler in seg_text.lower() for filler in filler_words):
                 boring_segments.append({
-                    'start': seg_start,
-                    'end': seg_end,
+                    'start': effective_start,
+                    'end': effective_end,
                     'reason': 'filler_words',
                     'text': seg_text
                 })
@@ -542,7 +568,154 @@ class FilmAnalyzer:
             context=f"{moment.context} (обрезан: {len(boring_segments)} скучных сегментов)"
         )
 
-    def _create_result(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any]) -> FilmAnalysisResult:
+    def _generate_shorts_from_moments(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any]) -> List[str]:
+        """Генерация шортов из найденных моментов"""
+        generated_shorts = []
+        video_id = os.path.splitext(os.path.basename(video_path))[0]
+
+        # Получаем размеры видео для валидации
+        try:
+            initial_width, initial_height = get_video_dimensions(video_path)
+        except Exception as e:
+            logger.logger.error(f"Не удалось получить размеры видео: {e}")
+            return []
+
+        # Используем только топ моментов (максимум 10)
+        top_moments = ranked_moments[:10]
+
+        for i, rm in enumerate(top_moments):
+            try:
+                moment = rm.moment
+                logger.logger.info(f"Генерация шорта {i+1}/{len(top_moments)} из момента {rm.rank} (балл: {rm.total_score:.2f})")
+
+                # Создаем структуру highlight для совместимости с process_highlight
+                highlight_item = {
+                    'start': moment.start_time,
+                    'end': moment.end_time,
+                    'caption_with_hashtags': f"Film Moment {rm.rank}: {moment.text[:100]}...",
+                    'segment_text': moment.text,
+                    '_seq': i + 1,
+                    '_total': len(top_moments)
+                }
+
+                # Создаем контекст обработки для совместимости
+                processing_context = self._create_processing_context_for_moment(
+                    video_path, video_id, transcription_data, initial_width, initial_height
+                )
+
+                # Генерируем шорт
+                short_path = self._process_moment_to_short(processing_context, highlight_item, i + 1)
+
+                if short_path:
+                    generated_shorts.append(short_path)
+                    logger.logger.info(f"Успешно сгенерирован шорт: {short_path}")
+                else:
+                    logger.logger.warning(f"Не удалось сгенерировать шорт для момента {rm.rank}")
+
+            except Exception as e:
+                logger.logger.error(f"Ошибка при генерации шорта для момента {rm.rank}: {e}")
+                continue
+
+        return generated_shorts
+
+    def _create_processing_context_for_moment(self, video_path: str, video_id: str, transcription_data: Dict[str, Any], width: int, height: int):
+        """Создание контекста обработки для генерации шорта"""
+        # Импортируем необходимые классы
+        from Components.Database import VideoDatabase
+
+        class MockProcessingContext:
+            def __init__(self, video_path, video_id, transcription_data, width, height, config):
+                self.video_path = video_path
+                self.video_id = video_id
+                self.transcription_segments = transcription_data.get('segments', [])
+                self.word_level_transcription = transcription_data.get('word_level', {})
+                self.initial_width = width
+                self.initial_height = height
+                self.cfg = config
+                self.db = VideoDatabase()
+                self.outputs = []
+
+        return MockProcessingContext(video_path, video_id, transcription_data, width, height, self.config)
+
+    def _process_moment_to_short(self, ctx, highlight_item, seq: int) -> Optional[str]:
+        """Обработка момента в шорт (упрощенная версия process_highlight)"""
+        try:
+            start = float(highlight_item["start"])
+            stop = float(highlight_item["end"])
+
+            # Корректировка длительности
+            adjusted_stop = stop
+            if adjusted_stop <= start:
+                adjusted_stop = start + 1.0
+
+            logger.logger.debug(f"Обработка момента: {start:.2f}s - {adjusted_stop:.2f}s")
+
+            # Определяем пути файлов
+            base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
+            output_base = f"{base_name}_film_moment_{seq}"
+            temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
+            cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
+            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir, prefix="film_moment")
+
+            # 1. Извлечение сегмента
+            extract_success = crop_video(ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height)
+            if not extract_success:
+                logger.logger.error(f"Не удалось извлечь сегмент для момента {seq}")
+                return None
+
+            # 2. Создание вертикального кропа
+            crop_mode = ctx.cfg.processing.crop_mode
+            if crop_mode == "70_percent_blur":
+                crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+            elif crop_mode == "average_face":
+                crop_success = crop_to_vertical_average_face(temp_segment, cropped_vertical)
+            else:
+                crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+
+            if not crop_success:
+                logger.logger.error(f"Не удалось создать вертикальный кроп для момента {seq}")
+                # Очистка
+                if os.path.exists(temp_segment):
+                    os.remove(temp_segment)
+                return None
+
+            # 3. Добавление субтитров
+            transcription_segments = [[
+                str(seg.get("text", "")),
+                float(seg.get("start", 0.0)),
+                float(seg.get("end", 0.0)),
+            ] for seg in (ctx.transcription_segments or [])]
+
+            caption_success = burn_captions(cropped_vertical, temp_segment, transcription_segments, start, adjusted_stop, final_output, style_cfg=ctx.cfg.captions)
+
+            # Очистка временных файлов
+            for temp_file in [temp_segment, cropped_vertical]:
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+
+            if caption_success:
+                # Сохраняем информацию в БД
+                ctx.db.add_highlight(
+                    ctx.video_id,
+                    start,
+                    adjusted_stop,
+                    final_output,
+                    segment_text=highlight_item.get('segment_text', ''),
+                    caption_with_hashtags=highlight_item.get('caption_with_hashtags', '')
+                )
+                return final_output
+            else:
+                logger.logger.error(f"Не удалось добавить субтитры для момента {seq}")
+                return None
+
+        except Exception as e:
+            logger.logger.error(f"Ошибка при обработке момента {seq}: {e}")
+            return None
+
+    def _create_result(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any], generated_shorts: List[str] = None) -> FilmAnalysisResult:
         """Создание финального результата анализа"""
         video_id = os.path.splitext(os.path.basename(video_path))[0]
         duration = transcription_data.get('duration', 0)
@@ -582,12 +755,21 @@ class FilmAnalyzer:
             risks.append("Не найдено ни одного подходящего момента")
 
         # Метаданные
+        if generated_shorts is None:
+            generated_shorts = []
+
         metadata = {
             'processed_at': datetime.now().isoformat(),
             'model_version': self.config.llm.model_name,
             'total_segments_analyzed': len(transcription_data.get('segments', [])),
             'video_duration': duration,
-            'moments_found': len(ranked_moments)
+            'moments_found': len(ranked_moments),
+            'shorts_generated': len(generated_shorts),
+            'film_config': {
+                'min_quality_score': self.film_config.min_quality_score,
+                'generate_shorts': self.film_config.generate_shorts,
+                'pause_threshold': self.film_config.pause_threshold
+            }
         }
 
         return FilmAnalysisResult(
@@ -597,7 +779,8 @@ class FilmAnalyzer:
             scores=scores,
             preview_text=preview_text,
             risks=risks,
-            metadata=metadata
+            metadata=metadata,
+            generated_shorts=generated_shorts
         )
 
     def _create_empty_result(self, video_path: str) -> FilmAnalysisResult:
@@ -611,7 +794,8 @@ class FilmAnalyzer:
             scores=[],
             preview_text="Не удалось проанализировать видео",
             risks=["Ошибка обработки видео"],
-            metadata={'error': True}
+            metadata={'error': True},
+            generated_shorts=[]
         )
 
 

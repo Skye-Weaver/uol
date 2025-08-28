@@ -1130,7 +1130,14 @@ if __name__ == "__main__":
             print(f"Video ID: {result.video_id}")
             print(f"Duration: {result.duration:.1f} seconds")
             print(f"Found {len(result.keep_ranges)} best moments")
+            print(f"Generated {len(result.generated_shorts)} shorts")
             print(f"Preview: {result.preview_text}")
+
+            # Выводим информацию о сгенерированных шортах
+            if result.generated_shorts:
+                print(f"\nGenerated shorts:")
+                for i, short_path in enumerate(result.generated_shorts, 1):
+                    print(f"  {i}. {os.path.basename(short_path)}")
 
             # Сохраняем JSON результат
             import json
@@ -1151,13 +1158,17 @@ if __name__ == "__main__":
                     'scores': result.scores,
                     'preview_text': result.preview_text,
                     'risks': result.risks,
-                    'metadata': result.metadata
+                    'metadata': result.metadata,
+                    'generated_shorts': result.generated_shorts
                 }, f, ensure_ascii=False, indent=2)
 
             print(f"Results saved to: {output_file}")
+
+            # Устанавливаем output для совместимости с остальной логикой
+            output = result.generated_shorts if result.generated_shorts else None
         else:
             print("\nFilm analysis failed!")
-        output = None  # Не устанавливаем output для совместимости
+            output = None
     else:
         print("Invalid choice")
         output = None

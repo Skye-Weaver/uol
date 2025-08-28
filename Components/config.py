@@ -43,6 +43,8 @@ class FilmModeConfig:
     max_moments: int = 15  # максимальное количество моментов для анализа
     pause_threshold: float = 0.7  # порог для определения длинных пауз (секунды)
     filler_words: list = field(default_factory=lambda: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"])  # слова-заполнители
+    min_quality_score: float = 0.5  # минимальный порог качества для включения момента
+    generate_shorts: bool = True  # генерировать шорты из найденных моментов
 
     # Весовые коэффициенты для ранжирования моментов
     ranking_weights: dict = field(default_factory=lambda: {
