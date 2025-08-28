@@ -28,14 +28,17 @@ def transcribe_unified(audio_path, model):
         model (WhisperModel): Загруженная модель faster-whisper.
 
     Returns:
-        dict: Полная транскрипция на уровне слов в формате
-              {'segments': [{'text': str, 'start': float, 'end': float, 'words': [...]}, ...]}.
+        tuple[list, dict]: Кортеж, содержащий:
+        - list: Список сегментов в формате [[text, start, end], ...].
+        - dict: Полная транскрипция на уровне слов в формате
+                {'segments': [{'text': str, 'start': float, 'end': float, 'words': [...]}, ...]}.
     """
     logger.logger.info(f"Запуск единой транскрипции аудио: {audio_path}")
 
     # Логирование начальных системных ресурсов
     _log_system_resources("Начало транскрипции")
 
+    segments_legacy = []
     word_level_transcription = {"segments": []}
 
     try:
@@ -93,6 +96,9 @@ def transcribe_unified(audio_path, model):
             seg_dict["words"] = words_arr
             word_level_transcription["segments"].append(seg_dict)
 
+            # 2. Формируем "старую" структуру сегментов
+            segments_legacy.append([seg.text, float(seg.start), float(seg.end)])
+
             processed_segments += 1
 
             # Обновляем прогресс-бар
@@ -118,8 +124,8 @@ def transcribe_unified(audio_path, model):
 
         total_time = time.time() - start_time
         logger.logger.info(f"Транскрипция завершена за {total_time:.2f} секунд")
-        logger.logger.info(f"Обработано {len(word_level_transcription['segments'])} сегментов, "
-                           f"скорость: {audio_duration/total_time:.2f}x")
+        logger.logger.info(f"Обработано {len(segments_legacy)} сегментов, "
+                          f"скорость: {audio_duration/total_time:.2f}x")
 
         # Финальное логирование ресурсов
         _log_system_resources("Завершение транскрипции")
@@ -134,14 +140,14 @@ def transcribe_unified(audio_path, model):
             logger.logger.error(f"Ошибка при сохранении транскрипции на диск: {ex}")
             raise
 
-        return word_level_transcription
+        return segments_legacy, word_level_transcription
 
     except Exception as e:
         logger.logger.error(f"Ошибка в единой функции транскрипции: {e}")
         import traceback
         traceback.print_exc()
         # Возвращаем пустые структуры в случае ошибки
-        return {"segments": []}
+        return [], {"segments": []}
 
 
 def _format_timestamp_srt(seconds: float) -> str:
