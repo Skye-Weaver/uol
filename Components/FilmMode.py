@@ -1004,6 +1004,49 @@ class FilmAnalyzer:
             logger.logger.error(f"❌ Ошибка при проверке выходного видео: {e}")
             return False
 
+    def _get_video_duration_from_transcription(self, ctx) -> Optional[float]:
+        """Получение длительности видео из данных транскрибации с улучшенной логикой"""
+        try:
+            # 1. Сначала пробуем получить из word_level_transcription
+            if ctx.word_level_transcription and 'segments' in ctx.word_level_transcription:
+                segments = ctx.word_level_transcription['segments']
+                if segments:
+                    # Берем время окончания последнего сегмента
+                    last_segment = segments[-1]
+                    if isinstance(last_segment, dict) and 'end' in last_segment:
+                        duration = float(last_segment['end'])
+                        logger.logger.debug(f"Длительность из word_level_transcription: {duration:.2f}s")
+                        return duration
+
+            # 2. Пробуем из обычных segments
+            if ctx.transcription_segments:
+                # Ищем последний сегмент с корректными данными
+                for seg in reversed(ctx.transcription_segments):
+                    if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                        try:
+                            end_time = float(seg[2])
+                            if end_time > 0:
+                                logger.logger.debug(f"Длительность из transcription_segments: {end_time:.2f}s")
+                                return end_time
+                        except (ValueError, IndexError):
+                            continue
+
+            # 3. Fallback: пытаемся получить через ffprobe
+            try:
+                duration = self._get_video_duration(ctx.video_path)
+                if duration and duration > 0:
+                    logger.logger.debug(f"Длительность через ffprobe: {duration:.2f}s")
+                    return duration
+            except Exception as e:
+                logger.logger.warning(f"Не удалось получить длительность через ffprobe: {e}")
+
+            logger.logger.warning("Не удалось определить длительность видео из доступных источников")
+            return None
+
+        except Exception as e:
+            logger.logger.error(f"Ошибка при определении длительности видео: {e}")
+            return None
+
     def _create_processing_context_for_moment(self, video_path: str, video_id: str, transcription_data: Dict[str, Any], width: int, height: int):
         """Создание контекста обработки для генерации шорта"""
         # Импортируем необходимые классы
@@ -1027,6 +1070,11 @@ class FilmAnalyzer:
         """Обработка момента в шорт (упрощенная версия process_highlight)"""
         logger.logger.info(f"--- НАЧАЛО ОБРАБОТКИ МОМЕНТА {seq} ---")
 
+        # Инициализация переменных перед try-блоком
+        final_output = None
+        temp_segment = None
+        cropped_vertical = None
+
         try:
             # 1. Извлечение и валидация таймкодов
             logger.logger.debug("--- ИЗВЛЕЧЕНИЕ ТАЙМКОДОВ ---")
@@ -1044,11 +1092,13 @@ class FilmAnalyzer:
             logger.logger.info(f"Финальные таймкоды: {start:.2f}s - {adjusted_stop:.2f}s")
             logger.logger.info(f"Длительность сегмента: {duration:.2f}s")
 
-            # Проверяем границы видео
-            if ctx.word_level_transcription and 'segments' in ctx.word_level_transcription:
-                video_duration = len(ctx.word_level_transcription['segments']) * 0.1  # приблизительно
-                if adjusted_stop > video_duration:
-                    logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {video_duration:.2f}s")
+            # Проверяем границы видео с улучшенной логикой определения длительности
+            video_duration = self._get_video_duration_from_transcription(ctx)
+            if video_duration and adjusted_stop > video_duration:
+                logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {video_duration:.2f}s")
+                # Корректируем конец сегмента до границы видео
+                adjusted_stop = video_duration
+                logger.logger.info(f"✅ Скорректирован конец сегмента до {adjusted_stop:.2f}s")
 
             # 2. Определение путей файлов
             logger.logger.info("--- ОПРЕДЕЛЕНИЕ ПУТЕЙ ФАЙЛОВ ---")
@@ -1058,7 +1108,8 @@ class FilmAnalyzer:
 
             temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
             cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
-            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir, prefix="film_moment")
+            # Исправленный вызов build_short_output_name без параметра prefix
+            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
             logger.logger.info(f"✅ Сформирован путь финального файла через build_short_output_name: {final_output}")
 
             logger.logger.info("Пути файлов:")
@@ -1098,12 +1149,16 @@ class FilmAnalyzer:
                 logger.logger.debug(f"✅ Директория shorts_dir существует: {shorts_dir}")
 
             # 4. Извлечение сегмента видео
-            extract_success = self._extract_video_segment(
+            extract_success = self._safe_file_operation(
+                f"извлечение сегмента видео для момента {seq}",
+                self._extract_video_segment,
                 ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
             )
 
             if not extract_success:
                 logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
+                # Очистка и возврат None
+                self._cleanup_temp_files([temp_segment], f" после неудачного извлечения сегмента {seq}")
                 return None
 
             logger.logger.info("✅ Шаг 1 УСПЕШЕН: Сегмент извлечен и проверен")
@@ -1123,19 +1178,32 @@ class FilmAnalyzer:
                 input_size = os.path.getsize(temp_segment) / (1024 * 1024)  # MB
                 logger.logger.debug(f"✅ Входной файл существует: {input_size:.2f} MB")
 
-            # Вызываем соответствующую функцию кропа
+            # Вызываем соответствующую функцию кропа с безопасной обработкой
+            crop_success = False
             try:
                 if crop_mode == "70_percent_blur":
                     logger.logger.info("Вызов crop_to_70_percent_with_blur...")
-                    crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+                    crop_success = self._safe_file_operation(
+                        f"crop_to_70_percent_with_blur для момента {seq}",
+                        crop_to_70_percent_with_blur,
+                        temp_segment, cropped_vertical
+                    )
                     logger.logger.info(f"Результат crop_to_70_percent_with_blur: {crop_success}")
                 elif crop_mode == "average_face":
                     logger.logger.info("Вызов crop_to_vertical_average_face...")
-                    crop_success = crop_to_vertical_average_face(temp_segment, cropped_vertical)
+                    crop_success = self._safe_file_operation(
+                        f"crop_to_vertical_average_face для момента {seq}",
+                        crop_to_vertical_average_face,
+                        temp_segment, cropped_vertical
+                    )
                     logger.logger.info(f"Результат crop_to_vertical_average_face: {crop_success}")
                 else:
                     logger.logger.warning(f"⚠️ Неизвестный режим кропа: {crop_mode}, используем 70_percent_blur")
-                    crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+                    crop_success = self._safe_file_operation(
+                        f"crop_to_70_percent_with_blur (fallback) для момента {seq}",
+                        crop_to_70_percent_with_blur,
+                        temp_segment, cropped_vertical
+                    )
                     logger.logger.info(f"Результат crop_to_70_percent_with_blur (fallback): {crop_success}")
 
             except Exception as e:
@@ -1210,8 +1278,10 @@ class FilmAnalyzer:
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
 
-            # Вызываем новый метод добавления субтитров
-            caption_success = self._add_captions_to_short(
+            # Вызываем новый метод добавления субтитров с graceful degradation
+            caption_success = self._safe_file_operation(
+                f"добавление субтитров для момента {seq}",
+                self._add_captions_to_short,
                 cropped_vertical, final_output, transcription_segments,
                 start, adjusted_stop, style_cfg=ctx.cfg.captions
             )
@@ -1219,22 +1289,27 @@ class FilmAnalyzer:
             # 7. Обработка результата субтитров и финализация
             logger.logger.info("--- ОБРАБОТКА РЕЗУЛЬТАТА СУБТИТРОВ ---")
 
+            # Graceful degradation: если субтитры не удалось добавить, пробуем скопировать видео без субтитров
+            if not caption_success:
+                logger.logger.warning(f"⚠️ Не удалось добавить субтитры, пробуем сохранить видео без субтитров")
+                try:
+                    import shutil
+                    shutil.copy2(cropped_vertical, final_output)
+                    logger.logger.info(f"✅ Видео сохранено без субтитров: {final_output}")
+                    caption_success = True  # Отмечаем как успешное завершение
+                except Exception as e:
+                    logger.logger.error(f"❌ Не удалось сохранить видео без субтитров: {e}")
+                    # Очистка и возврат None
+                    self._cleanup_temp_files([temp_segment, cropped_vertical, final_output],
+                                           f" после неудачи с субтитрами для момента {seq}")
+                    return None
+
             # Очистка временных файлов
             temp_files_to_clean = [temp_segment, cropped_vertical]
-            logger.logger.info("Очистка временных файлов...")
-            for temp_file in temp_files_to_clean:
-                if os.path.exists(temp_file):
-                    try:
-                        file_size = os.path.getsize(temp_file) / (1024 * 1024)  # MB
-                        os.remove(temp_file)
-                        logger.logger.info(f"✅ Удален временный файл: {temp_file} ({file_size:.2f} MB)")
-                    except Exception as e:
-                        logger.logger.warning(f"⚠️ Не удалось удалить временный файл {temp_file}: {e}")
-                else:
-                    logger.logger.debug(f"Временный файл уже не существует: {temp_file}")
+            self._cleanup_temp_files(temp_files_to_clean, f" после обработки момента {seq}")
 
             if caption_success:
-                logger.logger.info("✅ Субтитры добавлены успешно")
+                logger.logger.info("✅ Субтитры добавлены успешно (или видео сохранено без субтитров)")
 
                 # Проверяем финальный результат
                 if not os.path.exists(final_output):
@@ -1254,7 +1329,7 @@ class FilmAnalyzer:
                             logger.logger.warning(f"Не удалось удалить пустой файл: {e}")
                         return None
 
-                # Сохраняем информацию в БД
+                # Сохраняем информацию в БД (с graceful degradation)
                 logger.logger.info("Сохранение информации в базу данных...")
                 try:
                     ctx.db.add_highlight(
@@ -1268,13 +1343,14 @@ class FilmAnalyzer:
                     logger.logger.info("✅ Информация успешно сохранена в БД")
                 except Exception as e:
                     logger.logger.warning(f"⚠️ Не удалось сохранить в БД: {e}")
+                    logger.logger.warning("Продолжаем без сохранения в БД")
                     import traceback
                     logger.logger.warning(f"Traceback: {traceback.format_exc()}")
 
                 logger.logger.info(f"--- МОМЕНТ {seq} ОБРАБОТАН УСПЕШНО ---")
                 return final_output
             else:
-                logger.logger.error(f"❌ Шаг 3 ПРОВАЛЕН: Не удалось добавить субтитры для момента {seq}")
+                logger.logger.error(f"❌ Шаг 3 ПРОВАЛЕН: Не удалось обработать момент {seq}")
                 return None
 
         except Exception as e:
@@ -1294,6 +1370,33 @@ class FilmAnalyzer:
                         logger.logger.warning(f"Не удалось удалить файл после ошибки {temp_file}: {clean_e}")
 
             return None
+
+    def _safe_file_operation(self, operation_name: str, operation_func, *args, **kwargs) -> Optional[Any]:
+        """Безопасное выполнение файловой операции с graceful degradation"""
+        try:
+            logger.logger.debug(f"Выполнение операции: {operation_name}")
+            result = operation_func(*args, **kwargs)
+            logger.logger.debug(f"✅ Операция {operation_name} выполнена успешно")
+            return result
+        except Exception as e:
+            logger.logger.warning(f"⚠️ Операция {operation_name} завершилась с ошибкой: {e}")
+            logger.logger.warning(f"Продолжаем выполнение несмотря на ошибку в {operation_name}")
+            return None
+
+    def _cleanup_temp_files(self, files_to_clean: List[str], context: str = "") -> None:
+        """Безопасная очистка временных файлов"""
+        if not files_to_clean:
+            return
+
+        logger.logger.info(f"Очистка временных файлов{context}...")
+        for temp_file in files_to_clean:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    file_size = os.path.getsize(temp_file) / (1024 * 1024)  # MB
+                    os.remove(temp_file)
+                    logger.logger.info(f"✅ Удален временный файл: {temp_file} ({file_size:.2f} MB)")
+                except Exception as e:
+                    logger.logger.warning(f"⚠️ Не удалось удалить временный файл {temp_file}: {e}")
 
     def _create_result(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any], generated_shorts: List[str] = None) -> FilmAnalysisResult:
         """Создание финального результата анализа"""
