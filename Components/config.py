@@ -40,11 +40,26 @@ class FilmModeConfig:
     enabled: bool = True
     combo_duration: list = field(default_factory=lambda: [10, 20])  # секунды для COMBO моментов
     single_duration: list = field(default_factory=lambda: [30, 60])  # секунды для SINGLE моментов
-    max_moments: int = 15  # максимальное количество моментов для анализа
+    max_moments: int = 15  # монолитный режим: максимум моментов для анализа (для коротких видео)
     pause_threshold: float = 0.7  # порог для определения длинных пауз (секунды)
     filler_words: list = field(default_factory=lambda: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"])  # слова-заполнители
     min_quality_score: float = 0.5  # минимальный порог качества для включения момента
     generate_shorts: bool = True  # генерировать шорты из найденных моментов
+
+    # Оконный сбор кандидатов (LLM-sweep)
+    window_minutes: int = 12
+    window_overlap_minutes: int = 3
+    max_moments_per_window: int = 6
+
+    # Цели и лимиты генерации
+    target_shorts_count: int = 30
+    generator_top_k: int = 30
+
+    # Дедупликация/диверсификация
+    dedupe_iou_threshold: float = 0.5
+    diversity_bucket_minutes: int = 5
+    min_combo_segments: int = 2
+    max_combo_segments: int = 4
 
     # Весовые коэффициенты для ранжирования моментов
     ranking_weights: dict = field(default_factory=lambda: {
@@ -54,7 +69,10 @@ class FilmModeConfig:
         'quotability_memes': 0.14,    # Цитатность/мемность
         'stakes_goals': 0.12,         # Ставки и цель
         'hooks_cliffhangers': 0.10,   # Крючки/клиффхэнгеры
-        'visual_penalty': -0.10       # Штраф за визуальную зависимость
+        'visual_penalty': -0.10,      # Штраф за визуальную зависимость
+        'pace_score': 0.08,           # Плотность речи (слова/сек)
+        'silence_penalty': -0.08,     # Наказание за долю длинных пауз
+        'diversity_bonus': 0.05       # Бонус за диверсификацию (может заполняться в ранжировании)
     })
 
     # Пороговые настройки ранжирования и fallback
@@ -63,7 +81,7 @@ class FilmModeConfig:
         'soft_min_quality': 0.35,
         'allow_fallback': True,
         'fallback_top_n': 2,
-        'max_best_moments': 10,
+        'max_best_moments': 30,
     })
 
     # Настройки LLM для анализа фильма
@@ -837,6 +855,17 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         "max_best_moments": max_best,
     }
  
+    # Дополнительные поля Film Mode v2 (с безопасными дефолтами и возможностью переопределения из YAML)
+    film_window_minutes = max(1, _as_int(film_in.get("window_minutes", defaults.film_mode.window_minutes), defaults.film_mode.window_minutes))
+    film_window_overlap_minutes = max(0, _as_int(film_in.get("window_overlap_minutes", defaults.film_mode.window_overlap_minutes), defaults.film_mode.window_overlap_minutes))
+    film_max_mom_per_win = max(1, _as_int(film_in.get("max_moments_per_window", defaults.film_mode.max_moments_per_window), defaults.film_mode.max_moments_per_window))
+    film_target_shorts = max(1, _as_int(film_in.get("target_shorts_count", defaults.film_mode.target_shorts_count), defaults.film_mode.target_shorts_count))
+    film_generator_top_k = max(1, _as_int(film_in.get("generator_top_k", defaults.film_mode.generator_top_k), defaults.film_mode.generator_top_k))
+    film_dedupe_iou = _clamp(_as_float(film_in.get("dedupe_iou_threshold", defaults.film_mode.dedupe_iou_threshold), defaults.film_mode.dedupe_iou_threshold), 0.0, 1.0)
+    film_diversity_bucket = max(1, _as_int(film_in.get("diversity_bucket_minutes", defaults.film_mode.diversity_bucket_minutes), defaults.film_mode.diversity_bucket_minutes))
+    film_min_combo_segments = max(1, _as_int(film_in.get("min_combo_segments", defaults.film_mode.min_combo_segments), defaults.film_mode.min_combo_segments))
+    film_max_combo_segments = max(film_min_combo_segments, _as_int(film_in.get("max_combo_segments", defaults.film_mode.max_combo_segments), defaults.film_mode.max_combo_segments))
+
     film = FilmModeConfig(
         enabled=film_enabled,
         combo_duration=film_combo_duration,
@@ -849,6 +878,17 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         llm_model=film_llm_model,
         llm_temperature=film_llm_temperature,
         llm_max_attempts=film_llm_max_attempts,
+
+        # v2 поля
+        window_minutes=film_window_minutes,
+        window_overlap_minutes=film_window_overlap_minutes,
+        max_moments_per_window=film_max_mom_per_win,
+        target_shorts_count=film_target_shorts,
+        generator_top_k=film_generator_top_k,
+        dedupe_iou_threshold=film_dedupe_iou,
+        diversity_bucket_minutes=film_diversity_bucket,
+        min_combo_segments=film_min_combo_segments,
+        max_combo_segments=film_max_combo_segments,
     )
 
     return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions, film_mode=film)

@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
 from datetime import datetime
@@ -75,6 +75,8 @@ class FilmAnalyzer:
         # Настройки для режима фильм
         self.film_config = config.film_mode
         self._last_ranking_info = {}
+        # Контекст транскрипции для расширенного скоринга (pace/silence)
+        self._ctx_transcription_data = None
 
     def analyze_film(self, url: Optional[str] = None, local_path: Optional[str] = None) -> FilmAnalysisResult:
         """
@@ -100,6 +102,11 @@ class FilmAnalyzer:
         resolved_duration = self._resolve_video_duration(video_path, transcription_data)
         logger.logger.info(f"Получены данные транскрибации: сегментов={segments_count}")
         logger.logger.info(f"Duration: {resolved_duration:.2f} seconds")
+        # Сохраняем транскрипцию в контекст для последующих фаз (скоринг pace/silence)
+        try:
+            self._ctx_transcription_data = transcription_data
+        except Exception:
+            self._ctx_transcription_data = None
 
         # 2. Анализ моментов через ИИ
         moments = self._analyze_moments(transcription_data)
@@ -342,13 +349,23 @@ class FilmAnalyzer:
         return float(chosen)
 
     def _analyze_moments(self, transcription_data: Dict[str, Any]) -> List[FilmMoment]:
-        """Анализ моментов через ИИ"""
+        """Анализ моментов через ИИ (Film Mode v2: оконный сбор для длинных фильмов)"""
         try:
-            # Преобразование формата сегментов для build_transcription_prompt
+            duration = float(transcription_data.get('duration', 0.0) or 0.0)
+        except Exception:
+            duration = 0.0
+
+        try:
+            # Для длительных фильмов — оконный LLM-sweep
+            if duration >= 45 * 60:
+                logger.logger.info(f"[WINDOW] Активирован оконный режим извлечения кандидатов (duration={duration:.2f}s)")
+                moments = self._extract_film_moments_windowed(transcription_data)
+                logger.logger.info(f"[WINDOW] Найдено {len(moments)} кандидатов после дедупликации")
+                return moments
+
+            # Короткие видео: прежняя монолитная логика
             segments_legacy = transcription_data.get('segments', [])
             segments_dict = []
-
-            # Преобразуем список списков в список словарей
             for seg in segments_legacy:
                 if isinstance(seg, (list, tuple)) and len(seg) >= 3:
                     segments_dict.append({
@@ -359,18 +376,14 @@ class FilmAnalyzer:
                 elif isinstance(seg, dict):
                     segments_dict.append(seg)
 
-            # Формирование текста транскрибации
             logger.logger.info("Формирование текста транскрибации через build_transcription_prompt...")
             transcription_text = build_transcription_prompt(segments_dict)
             logger.logger.info(f"✅ Текст транскрибации сформирован: {len(transcription_text)} символов")
 
-            # Анализ через LLM
-            logger.logger.info("Анализ моментов через LLM...")
+            logger.logger.info("Анализ моментов через LLM (монолитный вызов)...")
             moments = self._extract_film_moments(transcription_text)
-
-            logger.logger.info(f"Найдено {len(moments)} потенциальных моментов")
+            logger.logger.info(f"Найдено {len(mомents)} потенциальных моментов")
             return moments
-
         except Exception as e:
             logger.logger.error(f"Ошибка при анализе моментов: {e}")
             return []
@@ -401,7 +414,7 @@ class FilmAnalyzer:
         Для COMBO также добавь:
         - segments: массив суб-сегментов с start/end/text
 
-        Найди максимум {self.film_config.max_moments} лучших моментов.
+        Найди до {self.film_config.max_moments} лучших моментов.
         """
 
         try:
@@ -478,78 +491,112 @@ class FilmAnalyzer:
             return []
 
     def _rank_moments(self, moments: List[FilmMoment]) -> List[RankedMoment]:
-        """Ранжирование моментов с fallback top-N"""
-        # Конфигурация ранжирования с обратной совместимостью
+        """Ранжирование моментов с динамическим порогом и покрытием по таймлайнам"""
+        # Конфигурация ранжирования
         rc = getattr(self.film_config, "ranking", {}) or {}
-        min_thr = rc.get("min_quality_threshold", getattr(self.film_config, "min_quality_score", 0.5))
-        soft_min = rc.get("soft_min_quality", 0.35)
+        min_thr_cfg = float(rc.get("min_quality_threshold", getattr(self.film_config, "min_quality_score", 0.5)))
+        soft_min = float(rc.get("soft_min_quality", 0.35))
         allow_fb = bool(rc.get("allow_fallback", True))
         fb_top_n = int(max(1, rc.get("fallback_top_n", 2)))
-        max_best = int(max(1, rc.get("max_best_moments", 10)))
+        max_best_cfg = int(max(1, rc.get("max_best_moments", 30)))
+        target_n = int(max(1, getattr(self.film_config, "target_shorts_count", max_best_cfg)))
+        bucket_min = int(max(1, getattr(self.film_config, "diversity_bucket_minutes", 5)))
+        bucket_sec = bucket_min * 60
+        gen_top_k = int(max(1, getattr(self.film_config, "generator_top_k", target_n)))
 
-        # Шаг a) Подсчет и сортировка по score
+        # Подсчет и сортировка по score
         scored: List[RankedMoment] = []
-        for i, moment in enumerate(moments):
+        for moment in moments or []:
             scores = self._calculate_moment_scores(moment)
             total_score = sum(
-                score * self.film_config.ranking_weights.get(score_name, 0)
-                for score_name, score in scores.items()
+                scores.get(name, 0.0) * self.film_config.ranking_weights.get(name, 0.0)
+                for name in self.film_config.ranking_weights.keys()
             )
             scored.append(RankedMoment(moment=moment, scores=scores, total_score=total_score, rank=0))
 
         scored.sort(key=lambda x: x.total_score, reverse=True)
         M = len(scored)
+        logger.logger.info(f"Кандидатов: {M}, min_thr_cfg={min_thr_cfg}, soft={soft_min}, target_n={target_n}, max_best_cfg={max_best_cfg}, generator_top_k={gen_top_k}")
 
-        # Лог до выбора
-        logger.logger.info(f"Кандидатов: {M}, threshold={min_thr}, soft={soft_min}, max_best={max_best}, fallback_top_n={fb_top_n}, allow_fallback={allow_fb}")
+        if M == 0:
+            return []
 
-        # Шаг b) Фильтр по порогу
-        primary_selected = [rm for rm in scored if rm.total_score >= min_thr]
-        selected = primary_selected
-        strategy = "quality_threshold"
+        # Динамический порог: p75
+        totals = [rm.total_score for rm in scored]
+        totals_sorted = sorted(totals)
+        try:
+            p75_idx = max(0, min(len(totals_sorted) - 1, int(round(0.75 * (len(totals_sorted) - 1)))))
+            p75 = float(totals_sorted[p75_idx])
+        except Exception:
+            p75 = min_thr_cfg
+        min_thr_dyn = max(min_thr_cfg, p75)
+        logger.logger.info(f"[RANK] dynamic threshold p75={p75:.3f} -> min_thr_dyn={min_thr_dyn:.3f}")
 
-        # Шаг c) Fallback top-N
-        if not selected and allow_fb and scored:
+        selected = [rm for rm in scored if rm.total_score >= min_thr_dyn]
+
+        strategy = "dynamic_p75"
+        if not selected and allow_fb:
+            # Fallback: берем top-N
             K = max(1, fb_top_n)
             selected = scored[:K]
             strategy = "fallback_topN"
-            min_s = min(rm.total_score for rm in selected) if selected else 0.0
-            max_s = max(rm.total_score for rm in selected) if selected else 0.0
-            logger.logger.warning(f"Fallback top-N активирован: threshold={min_thr}, soft={soft_min}, выбранных={len(selected)} из {M}, min_score={min_s:.3f}, max_score={max_s:.3f}")
-            logger.logger.info(f"[OK] Fallback applied: top-K={len(selected)}, min_score={min_s:.3f}, max_score={max_s:.3f}")
+            logger.logger.warning(f"Fallback top-N активирован: выбранных={len(selected)} из {M}")
 
-        # Шаг e) Ограничение до max_best_moments
+        # Ограничение предварительное
         if selected:
-            selected = selected[:max_best]
+            selected = selected[:max_best_cfg]
 
-        # Мини-валидация: гарантировать >=1 при allow_fallback
-        if not selected and allow_fb and scored:
-            logger.logger.error("После ранжирования не выбрано ни одного момента при allow_fallback=true — форсируем top-1")
-            selected = scored[:1]
-            strategy = "fallback_topN"
+        # Покрытие по таймлайнам (diversity buckets) с round-robin
+        if selected:
+            buckets: Dict[int, List[RankedMoment]] = {}
+            for rm in selected:
+                try:
+                    b = int(max(0, rm.moment.start_time) // bucket_sec)
+                except Exception:
+                    b = 0
+                buckets.setdefault(b, []).append(rm)
+
+            # внутри каждого бакета уже по убыванию total_score
+            for b in buckets.values():
+                b.sort(key=lambda x: x.total_score, reverse=True)
+
+            covered: List[RankedMoment] = []
+            keys = sorted(buckets.keys())
+            # Итоговый лимит
+            limit_k = min(gen_top_k, target_n, max_best_cfg, len(selected))
+            idx = 0
+            while len(covered) < limit_k:
+                progressed = False
+                for k in keys:
+                    bucket_list = buckets.get(k, [])
+                    if idx < len(bucket_list):
+                        covered.append(bucket_list[idx])
+                        progressed = True
+                        if len(covered) >= limit_k:
+                            break
+                if not progressed:
+                    # все бакеты исчерпаны на данном idx
+                    break
+                idx += 1
+            selected = covered
 
         # Присвоение рангов
         for i, rm in enumerate(selected):
             rm.rank = i + 1
 
-        # Логи после выбора
-        if selected:
-            first_score = selected[0].total_score
-            last_score = selected[-1].total_score
-        else:
-            first_score = last_score = 0.0
+        first_score = selected[0].total_score if selected else 0.0
+        last_score = selected[-1].total_score if selected else 0.0
         logger.logger.info(f"Выбрано {len(selected)} моментов (strategy={strategy}), первый score={first_score:.3f}, последний score={last_score:.3f}")
-        logger.logger.info(f"[OK] Ranking: candidates={M}, threshold={min_thr}, soft={soft_min}, selected={len(selected)} (strategy={strategy})")
+        logger.logger.info(f"[OK] Ranking: candidates={M}, dynamic_thr={min_thr_dyn:.3f}, selected={len(selected)} (strategy={strategy})")
         if len(selected) >= 1:
             logger.logger.info("[VALIDATION] Ranking produced N>=1: OK")
 
-        # Сохранение информации о последнем ранжировании для интеграционных логов/метаданных
         try:
             self._last_ranking_info = {
                 "selection_strategy": strategy,
                 "candidates": M,
                 "selected": len(selected),
-                "threshold": float(min_thr),
+                "threshold": float(min_thr_dyn),
                 "soft": float(soft_min),
             }
         except Exception:
@@ -559,9 +606,9 @@ class FilmAnalyzer:
 
     def _calculate_moment_scores(self, moment: FilmMoment) -> Dict[str, float]:
         """Расчет оценок момента по критериям"""
-        scores = {}
+        scores: Dict[str, float] = {}
 
-        text = moment.text.lower()
+        text = (moment.text or "").lower()
 
         # Эмоциональные пики и переломы статуса
         emotional_keywords = ['признание', 'угроза', 'ультиматум', 'увольнение', 'я твой отец', 'ухожу', 'мы всё теряем', 'это был он']
@@ -591,9 +638,23 @@ class FilmAnalyzer:
         visual_keywords = ['визуально', 'зрительно', 'видно', 'картинка', 'изображение']
         scores['visual_penalty'] = -sum(1 for keyword in visual_keywords if keyword in text) * 0.5
 
+        # Расширенные метрики: pace/silence из контекста транскрипции
+        try:
+            td = getattr(self, "_ctx_transcription_data", None) or {}
+            pace, sil = self._compute_pace_silence_scores(moment, td)
+            scores['pace_score'] = max(0.0, min(10.0, float(pace)))
+            scores['silence_penalty'] = max(0.0, min(10.0, float(sil)))
+        except Exception:
+            # по умолчанию 0, если что-то пошло не так
+            scores.setdefault('pace_score', 0.0)
+            scores.setdefault('silence_penalty', 0.0)
+
         # Нормализация оценок к шкале 0-10
-        for key in scores:
-            scores[key] = min(max(scores[key], 0), 10)
+        for key in list(scores.keys()):
+            try:
+                scores[key] = min(max(float(scores[key]), 0.0), 10.0)
+            except Exception:
+                scores[key] = 0.0
 
         return scores
 
@@ -795,9 +856,9 @@ class FilmAnalyzer:
 
         # 4. Выбор топ моментов для обработки
         logger.logger.info("--- ВЫБОР ТОП МОМЕНТОВ ---")
-        max_moments = 10
-        top_moments = ranked_moments[:max_moments]
-        logger.logger.info(f"Выбрано топ-{len(top_moments)} моментов из {len(ranked_moments)} (максимум {max_moments})")
+        top_k = int(max(1, getattr(self.film_config, "generator_top_k", getattr(self.film_config, "target_shorts_count", 30))))
+        top_moments = ranked_moments[:top_k]
+        logger.logger.info(f"Выбрано топ-{len(top_moments)} моментов из {len(ranked_moments)} (максимум {top_k})")
 
         # 5. Дополнительная валидация моментов
         logger.logger.info("--- ДОПОЛНИТЕЛЬНАЯ ВАЛИДАЦИЯ МОМЕНТОВ ---")
@@ -1088,12 +1149,27 @@ class FilmAnalyzer:
             logger.logger.info("Фильтрация релевантных сегментов...")
             relevant_segments = []
             for seg in transcription_segments:
-                if len(seg) >= 3:
-                    seg_start = float(seg[1])
-                    seg_end = float(seg[2])
-                    # Проверяем пересечение с моментом
-                    if seg_end > start_time and seg_start < end_time:
-                        relevant_segments.append(seg)
+                try:
+                    # Обработка нормализованного формата [text, start, end]
+                    if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                        seg_start = float(seg[1])
+                        seg_end = float(seg[2])
+                        # Проверяем пересечение с моментом
+                        if seg_end > start_time and seg_start < end_time:
+                            relevant_segments.append(seg)
+                    # Обработка dict формата (если вдруг попал)
+                    elif isinstance(seg, dict):
+                        seg_start = float(seg.get("start", 0.0))
+                        seg_end = float(seg.get("end", 0.0))
+                        if seg_end > start_time and seg_start < end_time:
+                            # Конвертируем в список для совместимости
+                            text = str(seg.get("text", ""))
+                            relevant_segments.append([text, seg_start, seg_end])
+                    else:
+                        logger.logger.debug(f"Пропускаем сегмент неизвестного формата: {type(seg)}")
+                except Exception as e:
+                    logger.logger.debug(f"Ошибка при обработке сегмента: {e}, пропускаем")
+                    continue
 
             logger.logger.info(f"Релевантных сегментов: {len(relevant_segments)} из {len(transcription_segments)}")
             if relevant_segments:
@@ -1473,12 +1549,69 @@ class FilmAnalyzer:
                             logger.logger.warning(f"Не удалось удалить временный файл: {e}")
                 return None
 
-            # Подготовка данных транскрибации
-            transcription_segments = [[
-                str(seg.get("text", "")),
-                float(seg.get("start", 0.0)),
-                float(seg.get("end", 0.0)),
-            ] for seg in (ctx.transcription_segments or [])]
+            # Подготовка данных транскрибации: нормализация к формату [text, start, end]
+            source_segments = (ctx.transcription_segments or [])
+            if (not source_segments) and isinstance(getattr(ctx, "word_level_transcription", None), dict):
+                wl = ctx.word_level_transcription
+                wls = wl.get("segments") or []
+                if isinstance(wls, list) and wls:
+                    source_segments = wls
+
+            transcription_segments = []
+            norm_ok = 0
+            norm_skipped = 0
+            for seg in source_segments:
+                try:
+                    if isinstance(seg, dict):
+                        text = str(seg.get("text", "") or "")
+                        st = float(seg.get("start", 0.0) or 0.0)
+                        en = float(seg.get("end", 0.0) or 0.0)
+                        if en > st:
+                            transcription_segments.append([text, st, en])
+                            norm_ok += 1
+                        else:
+                            norm_skipped += 1
+                    elif isinstance(seg, (list, tuple)):
+                        # Case A: legacy [text, start, end]
+                        if len(seg) >= 3 and (isinstance(seg[0], (str, bytes))):
+                            text = str(seg[0])
+                            st = float(seg[1] or 0.0)
+                            en = float(seg[2] or 0.0)
+                            if en > st:
+                                transcription_segments.append([text, st, en])
+                                norm_ok += 1
+                            else:
+                                norm_skipped += 1
+                        # Case B: список словарей-подсегментов [{'text', 'start', 'end'}, ...]
+                        elif seg and all(isinstance(s, dict) for s in seg):
+                            texts, starts, ends = [], [], []
+                            for s in seg:
+                                try:
+                                    texts.append(str(s.get("text", "") or ""))
+                                    starts.append(float(s.get("start", 0.0) or 0.0))
+                                    ends.append(float(s.get("end", 0.0) or 0.0))
+                                except Exception:
+                                    continue
+                            if starts and ends:
+                                st = min(starts)
+                                en = max(ends)
+                                if en > st:
+                                    text = " ".join(t for t in texts if t)
+                                    transcription_segments.append([text, st, en])
+                                    norm_ok += 1
+                                else:
+                                    norm_skipped += 1
+                            else:
+                                norm_skipped += 1
+                        else:
+                            norm_skipped += 1
+                    else:
+                        norm_skipped += 1
+                except Exception:
+                    norm_skipped += 1
+                    continue
+
+            logger.logger.info(f"Нормализация сегментов для субтитров: вход={len(source_segments)}, ok={norm_ok}, skipped={norm_skipped}")
 
             # Вызываем новый метод добавления субтитров с graceful degradation
             caption_success = self._safe_file_operation(
@@ -1606,8 +1739,10 @@ class FilmAnalyzer:
         duration = transcription_data.get('duration', 0)
 
         # Формирование keep_ranges
+        k = int(max(1, getattr(self.film_config, "generator_top_k", getattr(self.film_config, "target_shorts_count", 30))))
+        top_n = min(k, len(ranked_moments))
         keep_ranges = []
-        for rm in ranked_moments[:10]:  # Топ-10 моментов
+        for rm in ranked_moments[:top_n]:
             keep_ranges.append({
                 'start': rm.moment.start_time,
                 'end': rm.moment.end_time,
@@ -1618,7 +1753,7 @@ class FilmAnalyzer:
 
         # Формирование scores
         scores = []
-        for rm in ranked_moments[:10]:
+        for rm in ranked_moments[:top_n]:
             score_dict = {
                 'moment_id': f"{rm.moment.moment_type.lower()}_{rm.rank}",
                 'total': round(rm.total_score, 2)
@@ -1681,6 +1816,314 @@ class FilmAnalyzer:
             metadata=metadata,
             generated_shorts=generated_shorts
         )
+# ========== Film Mode v2 helpers (windowed extraction, dedupe, extended scoring) ==========
+
+    def _iter_windows(self, duration_sec: float, win_min: int, overlap_min: int):
+        """Итератор окон (start, end) в секундах по длительности видео."""
+        try:
+            W = max(60.0, float(win_min) * 60.0)
+        except Exception:
+            W = 12 * 60.0
+        try:
+            O = max(0.0, float(overlap_min) * 60.0)
+        except Exception:
+            O = 3 * 60.0
+
+        if duration_sec is None or duration_sec <= 0:
+            return
+        if W <= 0:
+            W = min(12 * 60.0, max(60.0, duration_sec))
+
+        step = max(1.0, W - O)
+        t = 0.0
+        while t < duration_sec:
+            start = t
+            end = min(duration_sec, t + W)
+            if end - start >= 10.0:  # пропускаем слишком короткие окна
+                yield (start, end)
+            if end >= duration_sec:
+                break
+            t += step
+
+    def _extract_film_moments_windowed(self, transcription_data: Dict[str, Any]) -> List[FilmMoment]:
+        """
+        Оконное извлечение кандидатов: идем по таймлайну окнами и для каждого окна просим LLM
+        вернуть до K лучших моментов в рамках этого окна.
+        """
+        moments: List[FilmMoment] = []
+        try:
+            duration = float(transcription_data.get('duration', 0.0) or 0.0)
+        except Exception:
+            duration = 0.0
+
+        if duration <= 0.0:
+            logger.logger.warning("duration<=0 для windowed-извлечения — возвращаю пустой список")
+            return []
+
+        # Готовим segments в dict-формате для build_transcription_prompt
+        segments_legacy = transcription_data.get('segments', []) or []
+        segs_dict: List[Dict[str, Any]] = []
+        for seg in segments_legacy:
+            try:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                    segs_dict.append({'text': str(seg[0]), 'start': float(seg[1]), 'end': float(seg[2])})
+                elif isinstance(seg, dict):
+                    st = float(seg.get('start', 0.0) or 0.0)
+                    en = float(seg.get('end', 0.0) or 0.0)
+                    tx = str(seg.get('text', '') or '')
+                    segs_dict.append({'text': tx, 'start': st, 'end': en})
+            except Exception:
+                continue
+
+        win_min = getattr(self.film_config, "window_minutes", 12)
+        ov_min = getattr(self.film_config, "window_overlap_minutes", 3)
+        k_per_win = int(max(1, getattr(self.film_config, "max_moments_per_window", 6)))
+
+        # Общая системная инструкция для окна (нагружаем правилами SINGLE/COMBO)
+        def _build_window_system_instruction(w_start: float, w_end: float) -> str:
+            return f"""
+Ты — эксперт по анализу фильмов для создания вирусных Shorts. Твоя задача — в пределах окна [{w_start:.2f}s, {w_end:.2f}s] найти лучшие моменты двух типов и вернуть ТОЛЬКО JSON-массив:
+
+Типы моментов:
+- COMBO (10–20 сек): 2–4 суб-сегмента одной сцены в хронологическом порядке
+- SINGLE (30–60 сек): самодостаточный момент с мини-аркой (завязка → нарастание → развязка)
+
+Критерии качества:
+- Эмоциональные пики, переломы статуса
+- Конфликт/эскалация
+- Панчлайны/остроумие
+- Цитатность/мемность
+- Ставки/цели
+- Крючки/клиффхэнгеры
+- Избегай моментов, где смысл критически зависит от картинки
+
+Формат каждого объекта:
+- moment_type: "COMBO" | "SINGLE"
+- start_time: секунды (абсолютные таймкоды фильма)
+- end_time: секунды
+- text: краткий текст/реплики момента
+- context: почему момент подходит (кратко)
+Для COMBO:
+- segments: массив объектов {{"start":sec,"end":sec,"text":"..."}}
+
+Условия:
+- Верни до {k_per_win} лучших моментов ТОЛЬКО в границах окна.
+- Таймкоды указывай абсолютные, соответствующие фильму.
+- Строго JSON без пояснений.
+"""
+
+        # Идем по окнам
+        total_windows = 0
+        for w_start, w_end in self._iter_windows(duration, win_min, ov_min):
+            total_windows += 1
+            # Подтягиваем сегменты окна
+            win_segments = []
+            for s in segs_dict:
+                try:
+                    if s['end'] > w_start and s['start'] < w_end:
+                        win_segments.append(s)
+                except Exception:
+                    continue
+
+            if not win_segments:
+                logger.logger.debug(f"[WINDOW] пустое окно без сегментов: {w_start:.2f}-{w_end:.2f}")
+                continue
+
+            try:
+                # Текст окна
+                trans_text = build_transcription_prompt(win_segments)
+                system_instruction = _build_window_system_instruction(w_start, w_end)
+                generation_config = make_generation_config(system_instruction, temperature=self.film_config.llm_temperature)
+
+                response = call_llm_with_retry(
+                    system_instruction=None,
+                    content=trans_text,
+                    generation_config=generation_config,
+                    model=self.film_config.llm_model,
+                )
+                if not response or not getattr(response, "text", None):
+                    logger.logger.warning(f"[WINDOW] пустой ответ LLM на окно {w_start:.2f}-{w_end:.2f}")
+                    continue
+
+                resp = response.text.strip()
+                if resp.startswith("```json"):
+                    resp = resp[7:].strip()
+                if resp.endswith("```"):
+                    resp = resp[:-3].strip()
+
+                try:
+                    arr = json.loads(resp)
+                except json.JSONDecodeError as je:
+                    logger.logger.warning(f"[WINDOW] JSONDecodeError в окне {w_start:.2f}-{w_end:.2f}: {je}")
+                    logger.logger.debug(f"RAW: {resp[:300]}...")
+                    continue
+
+                if not isinstance(arr, list):
+                    logger.logger.warning(f"[WINDOW] LLM вернул не массив в окне {w_start:.2f}-{w_end:.2f}")
+                    continue
+
+                for i, item in enumerate(arr):
+                    try:
+                        if not isinstance(item, dict):
+                            continue
+                        st = float(item.get('start_time', 0.0) or 0.0)
+                        en = float(item.get('end_time', 0.0) or 0.0)
+                        # Жестко клиппим в границы видео
+                        st = max(0.0, min(st, duration))
+                        en = max(0.0, min(en, duration))
+                        if en <= st:
+                            continue
+                        mtype = str(item.get('moment_type', 'SINGLE') or 'SINGLE').upper()
+                        txt = str(item.get('text', '') or '')
+                        ctx = str(item.get('context', '') or '')
+                        segs = item.get('segments', [])
+                        # Валидация по типу
+                        if mtype == 'COMBO':
+                            if not isinstance(segs, list) or len(segs) < getattr(self.film_config, "min_combo_segments", 2):
+                                # если плохие sub-сегменты — конвертируем в SINGLE
+                                mtype = 'SINGLE'
+                        # Приводим sub-сегменты к ожидаемому формату (если есть)
+                        norm_segments: List[Dict[str, Any]] = []
+                        if isinstance(segs, list):
+                            for ss in segs:
+                                try:
+                                    if isinstance(ss, dict):
+                                        sst = float(ss.get('start', st))
+                                        sse = float(ss.get('end', en))
+                                        sst = max(0.0, min(sst, duration))
+                                        sse = max(0.0, min(sse, duration))
+                                        if sse > sst:
+                                            norm_segments.append({'start': sst, 'end': sse, 'text': str(ss.get('text', '') or '')})
+                                except Exception:
+                                    continue
+
+                        fm = FilmMoment(
+                            moment_type=mtype,
+                            start_time=st,
+                            end_time=en,
+                            text=txt,
+                            segments=norm_segments,
+                            context=ctx
+                        )
+                        moments.append(fm)
+                    except Exception:
+                        continue
+
+            except Exception as e:
+                logger.logger.warning(f"[WINDOW] ошибка при обработке окна {w_start:.2f}-{w_end:.2f}: {e}")
+                continue
+
+        logger.logger.info(f"[WINDOW] собрано сырых кандидатов: {len(moments)} из {total_windows} окон")
+
+        # Дедупликация/слияние
+        deduped = self._dedupe_and_merge_moments(moments)
+        logger.logger.info(f"[WINDOW] после дедупликации: {len(deduped)}")
+        return deduped
+
+    def _interval_iou(self, a0: float, a1: float, b0: float, b1: float) -> float:
+        """IoU для одномерных интервалов [a0, a1] и [b0, b1]."""
+        try:
+            if a1 <= a0 or b1 <= b0:
+                return 0.0
+            inter = max(0.0, min(a1, b1) - max(a0, b0))
+            uni = max(a1, b1) - min(a0, b0)
+            if uni <= 0:
+                return 0.0
+            return inter / uni
+        except Exception:
+            return 0.0
+
+    def _dedupe_and_merge_moments(self, candidates: List[FilmMoment]) -> List[FilmMoment]:
+        """
+        Простая NMS-подобная дедупликация по времени с выбором лучшего кандидата.
+        Критерий "лучше": больший total_score (оценим через текущую систему скоринга),
+        при равенстве — более подходящая длительность (ближе к центру допустимого интервала).
+        """
+        if not candidates:
+            return []
+
+        thr = float(getattr(self.film_config, "dedupe_iou_threshold", 0.5) or 0.5)
+        # Предварительная оценка total_score для сортировки
+        scored_list: List[RankedMoment] = []
+        for c in candidates:
+            try:
+                sc = self._calculate_moment_scores(c)
+                total = sum(sc.get(k, 0.0) * self.film_config.ranking_weights.get(k, 0.0) for k in sc.keys())
+                scored_list.append(RankedMoment(moment=c, scores=sc, total_score=total, rank=0))
+            except Exception:
+                scored_list.append(RankedMoment(moment=c, scores={}, total_score=0.0, rank=0))
+
+        # Сортируем по total_score по убыванию, чтобы первыми оставить лучших
+        scored_list.sort(key=lambda x: x.total_score, reverse=True)
+
+        kept: List[RankedMoment] = []
+        for rm in scored_list:
+            ok = True
+            for kept_rm in kept:
+                iou = self._interval_iou(rm.moment.start_time, rm.moment.end_time, kept_rm.moment.start_time, kept_rm.moment.end_time)
+                if iou >= thr:
+                    ok = False
+                    break
+            if ok:
+                kept.append(rm)
+
+        # Возвращаем списком FilmMoment (без рангов)
+        return [rm.moment for rm in kept]
+
+    def _compute_pace_silence_scores(self, moment: FilmMoment, transcription_data: Dict[str, Any]) -> tuple[float, float]:
+        """
+        Возвращает (pace_score_0_10, silence_penalty_0_10):
+        - pace_score: плотность слов/сек (нормирована на [0..10] при cap=4.0 слов/сек)
+        - silence_penalty: доля длинных пауз в моменте -> [0..10]
+        """
+        try:
+            st = float(moment.start_time)
+            en = float(moment.end_time)
+            dur = max(1e-6, en - st)
+        except Exception:
+            return (0.0, 0.0)
+
+        # Плотность слов/сек по legacy segments
+        segments = transcription_data.get('segments', []) or []
+        words = 0
+        overlapped_dur = 0.0
+        for seg in segments:
+            try:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                    sst = float(seg[1]); sse = float(seg[2])
+                    if sse > st and sst < en:
+                        ov = max(0.0, min(sse, en) - max(sst, st))
+                        if ov > 0:
+                            txt = str(seg[0]) or ""
+                            # Простейшая оценка количества слов: split по пробелам
+                            wcnt = len([w for w in txt.strip().split() if w])
+                            words += wcnt
+                            overlapped_dur += ov
+            except Exception:
+                continue
+
+        pace = 0.0
+        if overlapped_dur > 0:
+            pace_wps = float(words) / overlapped_dur
+            # Нормируем: 0 -> 0, 4 слов/сек -> 10, cap
+            pace = max(0.0, min(10.0, (pace_wps / 4.0) * 10.0))
+
+        # Silence penalty: используем уже реализованный детектор скучных сегментов в режиме признака
+        try:
+            boring = self._detect_boring_segments_in_moment(moment, transcription_data) or []
+            boring_total = 0.0
+            for b in boring:
+                try:
+                    b0 = float(b.get('start', st)); b1 = float(b.get('end', st))
+                    boring_total += max(0.0, b1 - b0)
+                except Exception:
+                    continue
+            frac = max(0.0, min(1.0, boring_total / dur))
+            silence_penalty = min(10.0, frac * 10.0)
+        except Exception:
+            silence_penalty = 0.0
+
+        return (pace, silence_penalty)
 
     def _create_empty_result(self, video_path: str) -> FilmAnalysisResult:
         """Создание пустого результата при ошибке"""

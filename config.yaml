@@ -36,9 +36,24 @@ film_mode:
   generate_shorts: true  # ВКЛЮЧЕНА генерация шортов
   combo_duration: [10, 20]  # секунды для COMBO моментов
   single_duration: [30, 60]  # секунды для SINGLE моментов
-  max_moments: 15  # максимальное количество моментов для анализа
+  max_moments: 15  # максимальное количество моментов для анализа (монолитный режим)
   pause_threshold: 0.7  # порог для определения длинных пауз (секунды)
   filler_words: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"]  # слова-заполнители для обрезки
+
+  # Film Mode v2: Оконный LLM-конвейер для длинных фильмов
+  window_minutes: 12  # размер окна в минутах
+  window_overlap_minutes: 3  # перекрытие окон в минутах
+  max_moments_per_window: 6  # максимум моментов на окно
+
+  # Цели генерации и лимиты
+  target_shorts_count: 30  # целевое количество финальных шортов
+  generator_top_k: 30  # сколько топ моментов брать для генерации
+
+  # Дедупликация и диверсификация
+  dedupe_iou_threshold: 0.5  # порог IoU для дедупликации по времени
+  diversity_bucket_minutes: 5  # размер бакетов для диверсификации по таймлайну
+  min_combo_segments: 2  # минимум суб-сегментов в COMBO
+  max_combo_segments: 4  # максимум суб-сегментов в COMBO
 
   # Весовые коэффициенты для ранжирования моментов
   ranking_weights:
@@ -49,6 +64,17 @@ film_mode:
     stakes_goals: 0.12         # Ставки и цель
     hooks_cliffhangers: 0.10   # Крючки/клиффхэнгеры
     visual_penalty: -0.10      # Штраф за визуальную зависимость
+    pace_score: 0.08           # Плотность речи (слова/сек)
+    silence_penalty: -0.08     # Наказание за долю длинных пауз
+    diversity_bonus: 0.05      # Бонус за диверсификацию
+
+  # Настройки ранжирования и fallback
+  ranking:
+    min_quality_threshold: 0.5
+    soft_min_quality: 0.35
+    allow_fallback: true
+    fallback_top_n: 2
+    max_best_moments: 30
 
   # Настройки LLM для анализа фильма
   llm:
