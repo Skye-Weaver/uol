@@ -33,6 +33,7 @@ llm:
 # Настройки режима "фильм"
 film_mode:
   enabled: true
+  generate_shorts: true  # ВКЛЮЧЕНА генерация шортов
   combo_duration: [10, 20]  # секунды для COMBO моментов
   single_duration: [30, 60]  # секунды для SINGLE моментов
   max_moments: 15  # максимальное количество моментов для анализа

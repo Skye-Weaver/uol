@@ -66,8 +66,11 @@ class FilmAnalyzer:
     """
 
     def __init__(self, config: AppConfig):
+        logger.logger.info("Инициализация FilmAnalyzer...")
         self.config = config
+        logger.logger.info("Создание подключения к базе данных VideoDatabase...")
         self.db = VideoDatabase()
+        logger.logger.info("✅ FilmAnalyzer инициализирован успешно")
 
         # Настройки для режима фильм
         self.film_config = config.film_mode
@@ -113,10 +116,19 @@ class FilmAnalyzer:
 
         # 5. Генерация шортов (если включено)
         generated_shorts = []
+        logger.logger.info(f"Проверка условий для генерации шортов:")
+        logger.logger.info(f"  generate_shorts: {self.film_config.generate_shorts}")
+        logger.logger.info(f"  количество моментов: {len(trimmed_moments)}")
+
         if self.film_config.generate_shorts and trimmed_moments:
-            logger.logger.info("Генерация шортов из найденных моментов...")
+            logger.logger.info("✅ Условия выполнены, начинаем генерацию шортов...")
             generated_shorts = self._generate_shorts_from_moments(video_path, trimmed_moments, transcription_data)
             logger.logger.info(f"Сгенерировано {len(generated_shorts)} шортов")
+        else:
+            if not self.film_config.generate_shorts:
+                logger.logger.warning("⚠️ Генерация шортов отключена в конфигурации")
+            if not trimmed_moments:
+                logger.logger.warning("⚠️ Нет подходящих моментов для генерации шортов")
 
         # 6. Формирование результата
         result = self._create_result(video_path, trimmed_moments, transcription_data, generated_shorts)
@@ -250,9 +262,12 @@ class FilmAnalyzer:
                     segments_dict.append(seg)
 
             # Формирование текста транскрибации
+            logger.logger.info("Формирование текста транскрибации через build_transcription_prompt...")
             transcription_text = build_transcription_prompt(segments_dict)
+            logger.logger.info(f"✅ Текст транскрибации сформирован: {len(transcription_text)} символов")
 
             # Анализ через LLM
+            logger.logger.info("Анализ моментов через LLM...")
             moments = self._extract_film_moments(transcription_text)
 
             logger.logger.info(f"Найдено {len(moments)} потенциальных моментов")
@@ -295,8 +310,11 @@ class FilmAnalyzer:
             logger.logger.info(f"Отправка запроса к LLM для анализа моментов (модель: {self.film_config.llm_model})")
             logger.logger.debug(f"Длина транскрибации: {len(transcription)} символов")
 
+            logger.logger.info("Создание конфигурации генерации через make_generation_config...")
             generation_config = make_generation_config(system_instruction, temperature=0.3)
+            logger.logger.info("✅ Конфигурация генерации создана")
 
+            logger.logger.info("Отправка запроса к LLM через call_llm_with_retry...")
             response = call_llm_with_retry(
                 system_instruction=None,
                 content=transcription,
@@ -570,23 +588,120 @@ class FilmAnalyzer:
 
     def _generate_shorts_from_moments(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any]) -> List[str]:
         """Генерация шортов из найденных моментов"""
-        generated_shorts = []
-        video_id = os.path.splitext(os.path.basename(video_path))[0]
+        logger.logger.info("=== НАЧАЛО ГЕНЕРАЦИИ ШОРТОВ ===")
 
-        # Получаем размеры видео для валидации
-        try:
-            initial_width, initial_height = get_video_dimensions(video_path)
-        except Exception as e:
-            logger.logger.error(f"Не удалось получить размеры видео: {e}")
+        # 1. Логирование входных параметров
+        logger.logger.info("--- ВХОДНЫЕ ПАРАМЕТРЫ ---")
+        logger.logger.info(f"video_path: {video_path}")
+        logger.logger.info(f"video_path существует: {os.path.exists(video_path)}")
+        if os.path.exists(video_path):
+            video_size = os.path.getsize(video_path) / (1024 * 1024)  # MB
+            logger.logger.info(f"Размер видео файла: {video_size:.2f} MB")
+
+        logger.logger.info(f"ranked_moments: {len(ranked_moments)} моментов")
+        for i, rm in enumerate(ranked_moments):
+            moment = rm.moment
+            logger.logger.debug(f"  Момент {i+1}: {moment.moment_type} {moment.start_time:.2f}s-{moment.end_time:.2f}s, score={rm.total_score:.2f}")
+
+        logger.logger.info(f"transcription_data ключи: {list(transcription_data.keys())}")
+        if 'segments' in transcription_data:
+            logger.logger.info(f"Количество сегментов транскрибации: {len(transcription_data['segments'])}")
+        if 'duration' in transcription_data:
+            logger.logger.info(f"Длительность видео по транскрибации: {transcription_data['duration']:.2f}s")
+
+        # 2. Валидация входных данных
+        logger.logger.info("--- ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ---")
+        if not video_path or not os.path.exists(video_path):
+            logger.logger.error(f"❌ Видео файл не найден: {video_path}")
             return []
 
-        # Используем только топ моментов (максимум 10)
-        top_moments = ranked_moments[:10]
+        if not ranked_moments:
+            logger.logger.warning("⚠️ Нет моментов для обработки")
+            return []
 
+        if not transcription_data:
+            logger.logger.warning("⚠️ Нет данных транскрибации")
+            return []
+
+        logger.logger.info("✅ Валидация входных данных пройдена")
+
+        generated_shorts = []
+        video_id = os.path.splitext(os.path.basename(video_path))[0]
+        logger.logger.info(f"Извлечен video_id: {video_id}")
+
+        # 3. Получение размеров видео для валидации
+        logger.logger.info("--- ПОЛУЧЕНИЕ РАЗМЕРОВ ВИДЕО ---")
+        try:
+            logger.logger.debug(f"Вызов get_video_dimensions для файла: {video_path}")
+            initial_width, initial_height = get_video_dimensions(video_path)
+            logger.logger.info(f"✅ Размеры видео получены: {initial_width}x{initial_height}")
+            if not initial_width or not initial_height:
+                logger.logger.error("❌ Не удалось получить корректные размеры видео (один из размеров равен 0 или None)")
+                return []
+        except Exception as e:
+            logger.logger.error(f"❌ Ошибка при получении размеров видео: {e}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
+
+        # 4. Выбор топ моментов для обработки
+        logger.logger.info("--- ВЫБОР ТОП МОМЕНТОВ ---")
+        max_moments = 10
+        top_moments = ranked_moments[:max_moments]
+        logger.logger.info(f"Выбрано топ-{len(top_moments)} моментов из {len(ranked_moments)} (максимум {max_moments})")
+
+        # 5. Дополнительная валидация моментов
+        logger.logger.info("--- ДОПОЛНИТЕЛЬНАЯ ВАЛИДАЦИЯ МОМЕНТОВ ---")
+
+        # Извлекаем только FilmMoment объекты для валидации
+        moments_to_validate = [rm.moment for rm in top_moments]
+        video_duration = transcription_data.get('duration', None)
+
+        # Вызываем метод валидации
+        valid_moments_data = self._validate_moment_data(moments_to_validate, video_duration)
+
+        # Создаем список RankedMoment только из валидных моментов
+        valid_moments = []
+        for rm in top_moments:
+            if rm.moment in valid_moments_data:
+                valid_moments.append(rm)
+
+        if not valid_moments:
+            logger.logger.error("❌ Нет валидных моментов для генерации шортов после всех проверок")
+            return []
+
+        top_moments = valid_moments
+        logger.logger.info(f"✅ После валидации: {len(top_moments)} моментов готовы к обработке")
+
+        # 6. Создание контекста обработки
+        logger.logger.info("--- СОЗДАНИЕ КОНТЕКСТА ОБРАБОТКИ ---")
+        processing_context = self._create_processing_context_for_moment(
+            video_path, video_id, transcription_data, initial_width, initial_height
+        )
+        logger.logger.info("✅ Контекст обработки создан")
+
+        # 7. Основной цикл обработки моментов
+        logger.logger.info("--- НАЧАЛО ОБРАБОТКИ МОМЕНТОВ ---")
         for i, rm in enumerate(top_moments):
             try:
                 moment = rm.moment
-                logger.logger.info(f"Генерация шорта {i+1}/{len(top_moments)} из момента {rm.rank} (балл: {rm.total_score:.2f})")
+                logger.logger.info(f"=== ОБРАБОТКА МОМЕНТА {i+1}/{len(top_moments)} ===")
+                logger.logger.info(f"Момент {rm.rank}: таймкод {moment.start_time:.2f}s - {moment.end_time:.2f}s")
+                logger.logger.info(f"Длительность момента: {moment.end_time - moment.start_time:.2f}s")
+                logger.logger.info(f"Тип момента: {moment.moment_type}")
+                logger.logger.info(f"Балл: {rm.total_score:.2f}")
+                logger.logger.info(f"Текст: {moment.text[:200]}...")
+                if len(moment.text) > 200:
+                    logger.logger.debug(f"Полный текст: {moment.text}")
+
+                # Финальная проверка корректности таймкодов
+                if moment.start_time >= moment.end_time:
+                    logger.logger.error(f"❌ Некорректные таймкоды: start={moment.start_time} >= end={moment.end_time}")
+                    continue
+
+                duration = moment.end_time - moment.start_time
+                if duration < 1.0:
+                    logger.logger.warning(f"⚠️ Момент слишком короткий: {duration:.2f}s (минимум 1.0s)")
 
                 # Создаем структуру highlight для совместимости с process_highlight
                 highlight_item = {
@@ -597,26 +712,297 @@ class FilmAnalyzer:
                     '_seq': i + 1,
                     '_total': len(top_moments)
                 }
-
-                # Создаем контекст обработки для совместимости
-                processing_context = self._create_processing_context_for_moment(
-                    video_path, video_id, transcription_data, initial_width, initial_height
-                )
+                logger.logger.debug(f"Создан highlight_item: {highlight_item}")
 
                 # Генерируем шорт
+                logger.logger.info(f"Вызов _process_moment_to_short для момента {rm.rank}")
                 short_path = self._process_moment_to_short(processing_context, highlight_item, i + 1)
 
                 if short_path:
                     generated_shorts.append(short_path)
-                    logger.logger.info(f"Успешно сгенерирован шорт: {short_path}")
+                    logger.logger.info(f"✅ УСПЕШНО сгенерирован шорт: {short_path}")
+
+                    # Проверяем, что файл действительно создан
+                    if os.path.exists(short_path):
+                        file_size = os.path.getsize(short_path) / (1024 * 1024)  # MB
+                        logger.logger.info(f"✅ Файл шорта создан: {file_size:.2f} MB")
+                    else:
+                        logger.logger.warning(f"⚠️ Файл шорта не найден после создания: {short_path}")
                 else:
-                    logger.logger.warning(f"Не удалось сгенерировать шорт для момента {rm.rank}")
+                    logger.logger.error(f"❌ НЕ УДАЛОСЬ сгенерировать шорт для момента {rm.rank}")
 
             except Exception as e:
-                logger.logger.error(f"Ошибка при генерации шорта для момента {rm.rank}: {e}")
+                logger.logger.error(f"❌ ОШИБКА при генерации шорта для момента {rm.rank}: {e}")
+                import traceback
+                logger.logger.error(f"Traceback: {traceback.format_exc()}")
                 continue
 
+        # 8. Завершение генерации шортов
+        logger.logger.info("=== ЗАВЕРШЕНИЕ ГЕНЕРАЦИИ ШОРТОВ ===")
+        logger.logger.info(f"Всего сгенерировано шортов: {len(generated_shorts)}")
+
+        if generated_shorts:
+            logger.logger.info("Список сгенерированных шортов:")
+            for i, short_path in enumerate(generated_shorts, 1):
+                exists = os.path.exists(short_path)
+                size = os.path.getsize(short_path) / (1024 * 1024) if exists else 0
+                logger.logger.info(f"  {i}. {short_path} ({size:.2f} MB, существует: {exists})")
+        else:
+            logger.logger.warning("⚠️ Ни один шорт не был сгенерирован")
+
+        logger.logger.info("✅ Генерация шортов из моментов завершена")
         return generated_shorts
+
+    def _validate_moment_data(self, moments: List[FilmMoment], video_duration: float = None) -> List[FilmMoment]:
+        """Валидация данных моментов с подробным логированием"""
+        logger.logger.info("=== ВАЛИДАЦИЯ ДАННЫХ МОМЕНТОВ ===")
+        logger.logger.info(f"Вход: {len(moments)} моментов, длительность видео: {video_duration}")
+
+        if not moments:
+            logger.logger.warning("⚠️ Список моментов пуст")
+            return []
+
+        valid_moments = []
+        invalid_count = 0
+
+        for i, moment in enumerate(moments):
+            logger.logger.debug(f"Валидация момента {i+1}: {moment.moment_type} {moment.start_time:.2f}s-{moment.end_time:.2f}s")
+
+            is_valid = True
+            issues = []
+
+            # Проверка типа момента
+            if moment.moment_type not in ['COMBO', 'SINGLE']:
+                issues.append(f"неверный тип момента: {moment.moment_type}")
+                is_valid = False
+
+            # Проверка таймкодов
+            if moment.start_time < 0:
+                issues.append(f"отрицательное время начала: {moment.start_time}")
+                is_valid = False
+
+            if moment.end_time <= moment.start_time:
+                issues.append(f"некорректный интервал: {moment.start_time} >= {moment.end_time}")
+                is_valid = False
+
+            # Проверка длительности
+            duration = moment.end_time - moment.start_time
+            if duration < 1.0:
+                issues.append(f"слишком короткий: {duration:.2f}s (минимум 1.0s)")
+                is_valid = False
+            elif duration > 120.0:  # максимум 2 минуты
+                issues.append(f"слишком длинный: {duration:.2f}s (максимум 120.0s)")
+                is_valid = False
+
+            # Проверка границ видео
+            if video_duration and moment.end_time > video_duration:
+                issues.append(f"выходит за границы видео: {moment.end_time:.2f}s > {video_duration:.2f}s")
+                # Корректируем вместо инвалидации
+                moment.end_time = video_duration
+                logger.logger.info(f"  Скорректирован конец момента до {moment.end_time:.2f}s")
+
+            # Проверка текста
+            if not moment.text or not moment.text.strip():
+                issues.append("пустой текст")
+                is_valid = False
+
+            # Проверка сегментов для COMBO
+            if moment.moment_type == 'COMBO':
+                if not moment.segments:
+                    issues.append("COMBO момент без суб-сегментов")
+                    is_valid = False
+                elif len(moment.segments) < 2:
+                    issues.append(f"COMBO момент с недостаточным количеством сегментов: {len(moment.segments)}")
+                    is_valid = False
+
+            if is_valid:
+                valid_moments.append(moment)
+                logger.logger.debug(f"✅ Момент {i+1} прошел валидацию")
+            else:
+                invalid_count += 1
+                logger.logger.warning(f"❌ Момент {i+1} отклонен: {', '.join(issues)}")
+
+        logger.logger.info(f"Результат валидации: {len(valid_moments)} валидных, {invalid_count} отклоненных из {len(moments)}")
+        return valid_moments
+
+    def _extract_video_segment(self, input_path: str, output_path: str, start_time: float, end_time: float, width: int, height: int) -> bool:
+        """Извлечение сегмента видео с подробным логированием"""
+        logger.logger.info("=== ИЗВЛЕЧЕНИЕ СЕГМЕНТА ВИДЕО ===")
+        logger.logger.info(f"Входной файл: {input_path}")
+        logger.logger.info(f"Выходной файл: {output_path}")
+        logger.logger.info(f"Таймкоды: {start_time:.2f}s - {end_time:.2f}s")
+        logger.logger.info(f"Размеры: {width}x{height}")
+
+        # 1. Валидация входных параметров
+        logger.logger.debug("Валидация входных параметров...")
+        if not input_path or not os.path.exists(input_path):
+            logger.logger.error(f"❌ Входной файл не найден: {input_path}")
+            return False
+
+        if not output_path:
+            logger.logger.error("❌ Не указан выходной файл")
+            return False
+
+        if start_time < 0:
+            logger.logger.error(f"❌ Отрицательное время начала: {start_time}")
+            return False
+
+        if end_time <= start_time:
+            logger.logger.error(f"❌ Некорректный интервал: {start_time} >= {end_time}")
+            return False
+
+        duration = end_time - start_time
+        if duration < 0.1:
+            logger.logger.error(f"❌ Слишком короткий сегмент: {duration:.2f}s")
+            return False
+
+        logger.logger.info(f"✅ Валидация параметров пройдена, длительность сегмента: {duration:.2f}s")
+
+        # 2. Проверка входного файла
+        try:
+            input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+            logger.logger.info(f"Размер входного файла: {input_size:.2f} MB")
+        except Exception as e:
+            logger.logger.warning(f"Не удалось получить размер входного файла: {e}")
+
+        # 3. Вызов crop_video
+        logger.logger.info("Вызов crop_video для извлечения сегмента...")
+        try:
+            success = crop_video(input_path, output_path, start_time, end_time, width, height)
+
+            if success:
+                logger.logger.info("✅ crop_video выполнен успешно")
+            else:
+                logger.logger.error("❌ crop_video вернул False")
+                return False
+
+        except Exception as e:
+            logger.logger.error(f"❌ Исключение при вызове crop_video: {e}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+        # 4. Проверка результата
+        logger.logger.info("Проверка созданного файла...")
+        if not os.path.exists(output_path):
+            logger.logger.error(f"❌ Выходной файл не найден: {output_path}")
+            return False
+
+        try:
+            output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+            logger.logger.info(f"✅ Выходной файл создан: {output_path} ({output_size:.2f} MB)")
+
+            # Проверка на пустой файл
+            if output_size < 0.1:  # менее 100KB
+                logger.logger.error(f"❌ Выходной файл слишком маленький: {output_size:.2f} MB")
+                try:
+                    os.remove(output_path)
+                    logger.logger.info(f"Удален пустой файл: {output_path}")
+                except Exception as e:
+                    logger.logger.warning(f"Не удалось удалить пустой файл: {e}")
+                return False
+
+            logger.logger.info("✅ Сегмент видео успешно извлечен и проверен")
+            return True
+
+        except Exception as e:
+            logger.logger.error(f"❌ Ошибка при проверке выходного файла: {e}")
+            return False
+
+    def _add_captions_to_short(self, input_video: str, output_video: str, transcription_segments: List[List], start_time: float, end_time: float, style_cfg=None) -> bool:
+        """Добавление субтитров к видео с подробным логированием"""
+        logger.logger.info("=== ДОБАВЛЕНИЕ СУБТИТРОВ К ВИДЕО ===")
+        logger.logger.info(f"Входное видео: {input_video}")
+        logger.logger.info(f"Выходное видео: {output_video}")
+        logger.logger.info(f"Таймкоды: {start_time:.2f}s - {end_time:.2f}s")
+        logger.logger.info(f"Количество сегментов транскрибации: {len(transcription_segments)}")
+
+        # 1. Валидация входных параметров
+        logger.logger.debug("Валидация входных параметров...")
+        if not input_video or not os.path.exists(input_video):
+            logger.logger.error(f"❌ Входное видео не найдено: {input_video}")
+            return False
+
+        if not output_video:
+            logger.logger.error("❌ Не указан путь выходного видео")
+            return False
+
+        if not transcription_segments:
+            logger.logger.warning("⚠️ Нет сегментов транскрибации для субтитров")
+            # Всё равно пытаемся создать видео без субтитров
+            logger.logger.info("Попытка создать видео без субтитров...")
+
+        logger.logger.info(f"✅ Валидация параметров пройдена")
+
+        # 2. Фильтрация релевантных сегментов
+        if transcription_segments:
+            logger.logger.info("Фильтрация релевантных сегментов...")
+            relevant_segments = []
+            for seg in transcription_segments:
+                if len(seg) >= 3:
+                    seg_start = float(seg[1])
+                    seg_end = float(seg[2])
+                    # Проверяем пересечение с моментом
+                    if seg_end > start_time and seg_start < end_time:
+                        relevant_segments.append(seg)
+
+            logger.logger.info(f"Релевантных сегментов: {len(relevant_segments)} из {len(transcription_segments)}")
+            if relevant_segments:
+                logger.logger.debug(f"Примеры релевантных сегментов: {relevant_segments[:2]}")
+
+            transcription_segments = relevant_segments
+        else:
+            logger.logger.warning("⚠️ Сегменты транскрибации отсутствуют")
+
+        # 3. Вызов burn_captions
+        logger.logger.info("Вызов burn_captions...")
+        try:
+            # Создаем временный файл для аудио (как в оригинальном коде)
+            temp_audio = input_video  # Используем входное видео как источник аудио
+
+            success = burn_captions(
+                input_video, temp_audio, transcription_segments,
+                start_time, end_time, output_video, style_cfg=style_cfg
+            )
+
+            if success:
+                logger.logger.info("✅ burn_captions выполнен успешно")
+            else:
+                logger.logger.error("❌ burn_captions вернул False")
+                return False
+
+        except Exception as e:
+            logger.logger.error(f"❌ Исключение при вызове burn_captions: {e}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+        # 4. Проверка результата
+        logger.logger.info("Проверка созданного видео с субтитрами...")
+        if not os.path.exists(output_video):
+            logger.logger.error(f"❌ Выходное видео не найдено: {output_video}")
+            return False
+
+        try:
+            output_size = os.path.getsize(output_video) / (1024 * 1024)  # MB
+            logger.logger.info(f"✅ Видео с субтитрами создано: {output_video} ({output_size:.2f} MB)")
+
+            # Проверка на пустой файл
+            if output_size < 0.1:  # менее 100KB
+                logger.logger.error(f"❌ Выходное видео слишком маленькое: {output_size:.2f} MB")
+                try:
+                    os.remove(output_video)
+                    logger.logger.info(f"Удален пустой файл: {output_video}")
+                except Exception as e:
+                    logger.logger.warning(f"Не удалось удалить пустой файл: {e}")
+                return False
+
+            logger.logger.info("✅ Субтитры успешно добавлены к видео")
+            return True
+
+        except Exception as e:
+            logger.logger.error(f"❌ Ошибка при проверке выходного видео: {e}")
+            return False
 
     def _create_processing_context_for_moment(self, video_path: str, video_id: str, transcription_data: Dict[str, Any], width: int, height: int):
         """Создание контекста обработки для генерации шорта"""
@@ -639,80 +1025,274 @@ class FilmAnalyzer:
 
     def _process_moment_to_short(self, ctx, highlight_item, seq: int) -> Optional[str]:
         """Обработка момента в шорт (упрощенная версия process_highlight)"""
+        logger.logger.info(f"--- НАЧАЛО ОБРАБОТКИ МОМЕНТА {seq} ---")
+
         try:
+            # 1. Извлечение и валидация таймкодов
+            logger.logger.debug("--- ИЗВЛЕЧЕНИЕ ТАЙМКОДОВ ---")
             start = float(highlight_item["start"])
             stop = float(highlight_item["end"])
+            logger.logger.info(f"Исходные таймкоды: {start:.2f}s - {stop:.2f}s")
 
             # Корректировка длительности
             adjusted_stop = stop
             if adjusted_stop <= start:
                 adjusted_stop = start + 1.0
+                logger.logger.warning(f"⚠️ Скорректирована длительность: {start:.2f}s - {adjusted_stop:.2f}s (было <= start)")
 
-            logger.logger.debug(f"Обработка момента: {start:.2f}s - {adjusted_stop:.2f}s")
+            duration = adjusted_stop - start
+            logger.logger.info(f"Финальные таймкоды: {start:.2f}s - {adjusted_stop:.2f}s")
+            logger.logger.info(f"Длительность сегмента: {duration:.2f}s")
 
-            # Определяем пути файлов
+            # Проверяем границы видео
+            if ctx.word_level_transcription and 'segments' in ctx.word_level_transcription:
+                video_duration = len(ctx.word_level_transcription['segments']) * 0.1  # приблизительно
+                if adjusted_stop > video_duration:
+                    logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {video_duration:.2f}s")
+
+            # 2. Определение путей файлов
+            logger.logger.info("--- ОПРЕДЕЛЕНИЕ ПУТЕЙ ФАЙЛОВ ---")
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
             output_base = f"{base_name}_film_moment_{seq}"
+            logger.logger.debug(f"base_name: {base_name}, output_base: {output_base}")
+
             temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
             cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
             final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir, prefix="film_moment")
+            logger.logger.info(f"✅ Сформирован путь финального файла через build_short_output_name: {final_output}")
 
-            # 1. Извлечение сегмента
-            extract_success = crop_video(ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height)
+            logger.logger.info("Пути файлов:")
+            logger.logger.info(f"  Исходное видео: {ctx.video_path}")
+            logger.logger.info(f"  Временный сегмент: {temp_segment}")
+            logger.logger.info(f"  Вертикальный кроп: {cropped_vertical}")
+            logger.logger.info(f"  Финальный шорт: {final_output}")
+
+            # 3. Проверка и создание директорий
+            logger.logger.info("--- ПРОВЕРКА ДИРЕКТОРИЙ ---")
+            videos_dir = ctx.cfg.processing.videos_dir
+            shorts_dir = ctx.cfg.processing.shorts_dir
+            logger.logger.info(f"Директории: videos_dir={videos_dir}, shorts_dir={shorts_dir}")
+
+            # Проверяем videos_dir
+            if not os.path.exists(videos_dir):
+                logger.logger.warning(f"⚠️ Директория videos_dir не существует: {videos_dir}")
+                try:
+                    os.makedirs(videos_dir, exist_ok=True)
+                    logger.logger.info(f"✅ Создана директория videos_dir: {videos_dir}")
+                except Exception as e:
+                    logger.logger.error(f"❌ Не удалось создать videos_dir: {e}")
+                    return None
+            else:
+                logger.logger.debug(f"✅ Директория videos_dir существует: {videos_dir}")
+
+            # Проверяем shorts_dir
+            if not os.path.exists(shorts_dir):
+                logger.logger.warning(f"⚠️ Директория shorts_dir не существует: {shorts_dir}")
+                try:
+                    os.makedirs(shorts_dir, exist_ok=True)
+                    logger.logger.info(f"✅ Создана директория shorts_dir: {shorts_dir}")
+                except Exception as e:
+                    logger.logger.error(f"❌ Не удалось создать shorts_dir: {e}")
+                    return None
+            else:
+                logger.logger.debug(f"✅ Директория shorts_dir существует: {shorts_dir}")
+
+            # 4. Извлечение сегмента видео
+            extract_success = self._extract_video_segment(
+                ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
+            )
+
             if not extract_success:
-                logger.logger.error(f"Не удалось извлечь сегмент для момента {seq}")
+                logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
                 return None
 
-            # 2. Создание вертикального кропа
+            logger.logger.info("✅ Шаг 1 УСПЕШЕН: Сегмент извлечен и проверен")
+
+            # 5. Создание вертикального кропа
+            logger.logger.info("--- ШАГ 2: СОЗДАНИЕ ВЕРТИКАЛЬНОГО КРОПА ---")
             crop_mode = ctx.cfg.processing.crop_mode
-            if crop_mode == "70_percent_blur":
-                crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
-            elif crop_mode == "average_face":
-                crop_success = crop_to_vertical_average_face(temp_segment, cropped_vertical)
+            logger.logger.info(f"Режим кропа: {crop_mode}")
+            logger.logger.info(f"Входной файл: {temp_segment}")
+            logger.logger.info(f"Выходной файл: {cropped_vertical}")
+
+            # Проверяем существование входного файла для кропа
+            if not os.path.exists(temp_segment):
+                logger.logger.error(f"❌ Входной файл для кропа не найден: {temp_segment}")
+                return None
             else:
-                crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+                input_size = os.path.getsize(temp_segment) / (1024 * 1024)  # MB
+                logger.logger.debug(f"✅ Входной файл существует: {input_size:.2f} MB")
+
+            # Вызываем соответствующую функцию кропа
+            try:
+                if crop_mode == "70_percent_blur":
+                    logger.logger.info("Вызов crop_to_70_percent_with_blur...")
+                    crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+                    logger.logger.info(f"Результат crop_to_70_percent_with_blur: {crop_success}")
+                elif crop_mode == "average_face":
+                    logger.logger.info("Вызов crop_to_vertical_average_face...")
+                    crop_success = crop_to_vertical_average_face(temp_segment, cropped_vertical)
+                    logger.logger.info(f"Результат crop_to_vertical_average_face: {crop_success}")
+                else:
+                    logger.logger.warning(f"⚠️ Неизвестный режим кропа: {crop_mode}, используем 70_percent_blur")
+                    crop_success = crop_to_70_percent_with_blur(temp_segment, cropped_vertical)
+                    logger.logger.info(f"Результат crop_to_70_percent_with_blur (fallback): {crop_success}")
+
+            except Exception as e:
+                logger.logger.error(f"❌ Исключение при кропе: {e}")
+                import traceback
+                logger.logger.error(f"Traceback: {traceback.format_exc()}")
+                crop_success = False
 
             if not crop_success:
-                logger.logger.error(f"Не удалось создать вертикальный кроп для момента {seq}")
+                logger.logger.error(f"❌ Шаг 2 ПРОВАЛЕН: Не удалось создать вертикальный кроп для момента {seq}")
+                # Очистка временных файлов
+                if os.path.exists(temp_segment):
+                    try:
+                        os.remove(temp_segment)
+                        logger.logger.info(f"Удален временный файл: {temp_segment}")
+                    except Exception as e:
+                        logger.logger.warning(f"Не удалось удалить временный файл: {e}")
+                return None
+            else:
+                logger.logger.info("✅ Функция кропа выполнена успешно")
+
+            # Проверяем результат кропа
+            if not os.path.exists(cropped_vertical):
+                logger.logger.error(f"❌ Файл вертикального кропа не найден: {cropped_vertical}")
                 # Очистка
                 if os.path.exists(temp_segment):
-                    os.remove(temp_segment)
+                    try:
+                        os.remove(temp_segment)
+                        logger.logger.info(f"Удален временный файл: {temp_segment}")
+                    except Exception as e:
+                        logger.logger.warning(f"Не удалось удалить временный файл: {e}")
+                return None
+            else:
+                file_size = os.path.getsize(cropped_vertical) / (1024 * 1024)  # MB
+                logger.logger.info(f"✅ Файл кропа создан: {file_size:.2f} MB")
+
+                # Проверяем, что файл не пустой
+                if file_size < 0.1:  # менее 100KB
+                    logger.logger.error(f"❌ Файл кропа слишком маленький: {file_size:.2f} MB")
+                    # Очистка
+                    for temp_file in [temp_segment, cropped_vertical]:
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                                logger.logger.info(f"Удален пустой файл: {temp_file}")
+                            except Exception as e:
+                                logger.logger.warning(f"Не удалось удалить файл: {e}")
+                    return None
+                else:
+                    logger.logger.info("✅ Шаг 2 УСПЕШЕН: Вертикальный кроп создан и проверен")
+
+            # 6. Добавление субтитров
+            logger.logger.info("--- ШАГ 3: ДОБАВЛЕНИЕ СУБТИТРОВ ---")
+
+            # Проверяем существование входного файла для субтитров
+            if not os.path.exists(cropped_vertical):
+                logger.logger.error(f"❌ Входной файл для субтитров не найден: {cropped_vertical}")
+                # Очистка
+                for temp_file in [temp_segment]:
+                    if os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                            logger.logger.info(f"Удален временный файл: {temp_file}")
+                        except Exception as e:
+                            logger.logger.warning(f"Не удалось удалить временный файл: {e}")
                 return None
 
-            # 3. Добавление субтитров
+            # Подготовка данных транскрибации
             transcription_segments = [[
                 str(seg.get("text", "")),
                 float(seg.get("start", 0.0)),
                 float(seg.get("end", 0.0)),
             ] for seg in (ctx.transcription_segments or [])]
 
-            caption_success = burn_captions(cropped_vertical, temp_segment, transcription_segments, start, adjusted_stop, final_output, style_cfg=ctx.cfg.captions)
+            # Вызываем новый метод добавления субтитров
+            caption_success = self._add_captions_to_short(
+                cropped_vertical, final_output, transcription_segments,
+                start, adjusted_stop, style_cfg=ctx.cfg.captions
+            )
+
+            # 7. Обработка результата субтитров и финализация
+            logger.logger.info("--- ОБРАБОТКА РЕЗУЛЬТАТА СУБТИТРОВ ---")
 
             # Очистка временных файлов
-            for temp_file in [temp_segment, cropped_vertical]:
+            temp_files_to_clean = [temp_segment, cropped_vertical]
+            logger.logger.info("Очистка временных файлов...")
+            for temp_file in temp_files_to_clean:
                 if os.path.exists(temp_file):
                     try:
+                        file_size = os.path.getsize(temp_file) / (1024 * 1024)  # MB
                         os.remove(temp_file)
-                    except Exception:
-                        pass
+                        logger.logger.info(f"✅ Удален временный файл: {temp_file} ({file_size:.2f} MB)")
+                    except Exception as e:
+                        logger.logger.warning(f"⚠️ Не удалось удалить временный файл {temp_file}: {e}")
+                else:
+                    logger.logger.debug(f"Временный файл уже не существует: {temp_file}")
 
             if caption_success:
+                logger.logger.info("✅ Субтитры добавлены успешно")
+
+                # Проверяем финальный результат
+                if not os.path.exists(final_output):
+                    logger.logger.error(f"❌ Финальный файл шорта не найден: {final_output}")
+                    return None
+                else:
+                    file_size = os.path.getsize(final_output) / (1024 * 1024)  # MB
+                    logger.logger.info(f"✅ Финальный шорт создан: {final_output} ({file_size:.2f} MB)")
+
+                    # Проверяем, что файл не пустой
+                    if file_size < 0.1:  # менее 100KB
+                        logger.logger.error(f"❌ Финальный файл слишком маленький: {file_size:.2f} MB")
+                        try:
+                            os.remove(final_output)
+                            logger.logger.info(f"Удален пустой финальный файл: {final_output}")
+                        except Exception as e:
+                            logger.logger.warning(f"Не удалось удалить пустой файл: {e}")
+                        return None
+
                 # Сохраняем информацию в БД
-                ctx.db.add_highlight(
-                    ctx.video_id,
-                    start,
-                    adjusted_stop,
-                    final_output,
-                    segment_text=highlight_item.get('segment_text', ''),
-                    caption_with_hashtags=highlight_item.get('caption_with_hashtags', '')
-                )
+                logger.logger.info("Сохранение информации в базу данных...")
+                try:
+                    ctx.db.add_highlight(
+                        ctx.video_id,
+                        start,
+                        adjusted_stop,
+                        final_output,
+                        segment_text=highlight_item.get('segment_text', ''),
+                        caption_with_hashtags=highlight_item.get('caption_with_hashtags', '')
+                    )
+                    logger.logger.info("✅ Информация успешно сохранена в БД")
+                except Exception as e:
+                    logger.logger.warning(f"⚠️ Не удалось сохранить в БД: {e}")
+                    import traceback
+                    logger.logger.warning(f"Traceback: {traceback.format_exc()}")
+
+                logger.logger.info(f"--- МОМЕНТ {seq} ОБРАБОТАН УСПЕШНО ---")
                 return final_output
             else:
-                logger.logger.error(f"Не удалось добавить субтитры для момента {seq}")
+                logger.logger.error(f"❌ Шаг 3 ПРОВАЛЕН: Не удалось добавить субтитры для момента {seq}")
                 return None
 
         except Exception as e:
-            logger.logger.error(f"Ошибка при обработке момента {seq}: {e}")
+            logger.logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке момента {seq}: {e}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+
+            # Экстренная очистка временных файлов при ошибке
+            logger.logger.info("Экстренная очистка временных файлов после ошибки...")
+            temp_files_to_clean = [temp_segment, cropped_vertical, final_output]
+            for temp_file in temp_files_to_clean:
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                        logger.logger.info(f"Удален файл после ошибки: {temp_file}")
+                    except Exception as clean_e:
+                        logger.logger.warning(f"Не удалось удалить файл после ошибки {temp_file}: {clean_e}")
+
             return None
 
     def _create_result(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any], generated_shorts: List[str] = None) -> FilmAnalysisResult:
