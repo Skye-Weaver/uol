@@ -35,6 +35,45 @@ class LLMConfig:
 
 
 @dataclass
+class IntelligentPauseAnalysisConfig:
+    """Конфигурация для интеллектуального анализа пауз"""
+    enabled: bool = True  # Включить ИИ-анализ пауз
+    model: str = "gemini-2.5-flash-lite"  # Модель для простых задач анализа пауз
+    temperature: float = 0.1  # Температура для анализа пауз (низкая для консистентности)
+    max_attempts: int = 2  # Максимум попыток для анализа пауз
+    auto_trim_confidence_threshold: float = 0.8  # Порог уверенности для автоматической обрезки
+    batch_size: int = 10  # Размер батча для пакетного анализа пауз
+    cache_enabled: bool = True  # Кеширование результатов анализа пауз
+    cache_ttl_hours: int = 24  # Время жизни кеша в часах
+
+    # Категории пауз для классификации
+    pause_categories: dict = field(default_factory=lambda: {
+        "structural": ["sentence_end", "paragraph_break", "topic_change"],  # Структурные паузы (не обрезать)
+        "filler": ["um", "uh", "er", "ah", "like", "you_know"],  # Заполнители (обрезать)
+        "emphasis": ["dramatic_pause", "for_effect"],  # Паузы для эффекта (анализировать контекст)
+        "breathing": ["breath", "inhale", "exhale"]  # Дыхательные паузы (обрезать при длинных)
+    })
+
+    # Весовые коэффициенты для определения важности пауз
+    importance_weights: dict = field(default_factory=lambda: {
+        "duration": -0.4,  # Чем длиннее пауза, тем менее важна (отрицательный вес)
+        "position": 0.3,   # Позиция в предложении (начало/середина/конец)
+        "context": 0.4,    # Контекст вокруг паузы
+        "audio_features": 0.2,  # Аудио-характеристики (тишина vs шум)
+        "linguistic": 0.3  # Лингвистический анализ
+    })
+
+    # Оптимизация API
+    api_optimization: dict = field(default_factory=lambda: {
+        "use_batch_processing": True,  # Использовать пакетную обработку
+        "max_concurrent_requests": 3,  # Максимум одновременных запросов
+        "rate_limit_delay": 1.0,  # Задержка между запросами (секунды)
+        "retry_on_failure": True,  # Повторять при неудачах
+        "fallback_to_legacy": True  # Откат на старую логику при ошибках ИИ
+    })
+
+
+@dataclass
 class FilmModeConfig:
     """Конфигурация для режима 'фильм'"""
     enabled: bool = True
@@ -45,6 +84,19 @@ class FilmModeConfig:
     filler_words: list = field(default_factory=lambda: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"])  # слова-заполнители
     min_quality_score: float = 0.5  # минимальный порог качества для включения момента
     generate_shorts: bool = True  # генерировать шорты из найденных моментов
+
+    # Интеллектуальный анализ пауз
+    intelligent_pause_analysis: IntelligentPauseAnalysisConfig = field(default_factory=IntelligentPauseAnalysisConfig)
+
+    # Эталонные ключевые слова для подсчета совпадений (новая система ранжирования)
+    reference_keywords: dict = field(default_factory=lambda: {
+        'emotional_peaks': ["эмоции", "чувства", "переживания", "радость", "гнев", "страх", "удивление", "грусть", "любовь", "ненависть", "восторг", "отчаяние", "надежда", "разочарование", "триумф", "поражение"],
+        'conflict_escalation': ["конфликт", "спор", "ссора", "драка", "ругань", "оскорбление", "критика", "давление", "напряжение", "эскалация", "столкновение", "противостояние", "борьба", "конкуренция"],
+        'punchlines_wit': ["юмор", "шутка", "сарказм", "ирония", "остроумие", "панчлайн", "каламбур", "смех", "комедия", "прикол", "насмешка", "сатира", "пародия", "абсурд"],
+        'quotability_memes': ["цитата", "афоризм", "крылатая фраза", "мем", "вирусный", "тренд", "хайп", "легендарный", "знаменитый", "классика", "запоминающийся", "уникальный"],
+        'stakes_goals': ["ставки", "цель", "риск", "опасность", "выбор", "решение", "судьба", "жизнь", "смерть", "выигрыш", "проигрыш", "успех", "провал", "достижение", "амбиции"],
+        'hooks_cliffhangers': ["вопрос", "загадка", "тайна", "сюрприз", "интрига", "недосказанность", "продолжение", "развязка", "поворот", "неожиданно", "вдруг", "что дальше", "как же так"]
+    })
 
     # Оконный сбор кандидатов (LLM-sweep)
     window_minutes: int = 8   # Уменьшен для большего числа окон
@@ -812,6 +864,84 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     if not isinstance(film_filler_words, list):
         film_filler_words = defaults.film_mode.filler_words
 
+    # Intelligent Pause Analysis
+    intelligent_pause_in = film_in.get("intelligent_pause_analysis", {}) or {}
+    if not isinstance(intelligent_pause_in, dict):
+        intelligent_pause_in = {}
+
+    intelligent_pause_enabled = _as_bool(
+        intelligent_pause_in.get("enabled", defaults.film_mode.intelligent_pause_analysis.enabled),
+        defaults.film_mode.intelligent_pause_analysis.enabled
+    )
+    intelligent_pause_model = _as_str(
+        intelligent_pause_in.get("model", defaults.film_mode.intelligent_pause_analysis.model),
+        defaults.film_mode.intelligent_pause_analysis.model
+    )
+    intelligent_pause_temperature = _clamp(
+        _as_float(intelligent_pause_in.get("temperature", defaults.film_mode.intelligent_pause_analysis.temperature),
+                  defaults.film_mode.intelligent_pause_analysis.temperature),
+        0.0, 2.0
+    )
+    intelligent_pause_max_attempts = max(1, _as_int(
+        intelligent_pause_in.get("max_attempts", defaults.film_mode.intelligent_pause_analysis.max_attempts),
+        defaults.film_mode.intelligent_pause_analysis.max_attempts
+    ))
+    intelligent_pause_auto_trim_threshold = _clamp(
+        _as_float(intelligent_pause_in.get("auto_trim_confidence_threshold",
+                  defaults.film_mode.intelligent_pause_analysis.auto_trim_confidence_threshold),
+                  defaults.film_mode.intelligent_pause_analysis.auto_trim_confidence_threshold),
+        0.0, 1.0
+    )
+    intelligent_pause_batch_size = max(1, _as_int(
+        intelligent_pause_in.get("batch_size", defaults.film_mode.intelligent_pause_analysis.batch_size),
+        defaults.film_mode.intelligent_pause_analysis.batch_size
+    ))
+    intelligent_pause_cache_enabled = _as_bool(
+        intelligent_pause_in.get("cache_enabled", defaults.film_mode.intelligent_pause_analysis.cache_enabled),
+        defaults.film_mode.intelligent_pause_analysis.cache_enabled
+    )
+    intelligent_pause_cache_ttl = max(1, _as_int(
+        intelligent_pause_in.get("cache_ttl_hours", defaults.film_mode.intelligent_pause_analysis.cache_ttl_hours),
+        defaults.film_mode.intelligent_pause_analysis.cache_ttl_hours
+    ))
+
+    # Pause categories
+    intelligent_pause_categories = intelligent_pause_in.get("pause_categories",
+        defaults.film_mode.intelligent_pause_analysis.pause_categories)
+    if not isinstance(intelligent_pause_categories, dict):
+        intelligent_pause_categories = defaults.film_mode.intelligent_pause_analysis.pause_categories
+
+    # Importance weights
+    intelligent_pause_weights = intelligent_pause_in.get("importance_weights",
+        defaults.film_mode.intelligent_pause_analysis.importance_weights)
+    if not isinstance(intelligent_pause_weights, dict):
+        intelligent_pause_weights = defaults.film_mode.intelligent_pause_analysis.importance_weights
+
+    # API optimization
+    intelligent_pause_api_opt = intelligent_pause_in.get("api_optimization",
+        defaults.film_mode.intelligent_pause_analysis.api_optimization)
+    if not isinstance(intelligent_pause_api_opt, dict):
+        intelligent_pause_api_opt = defaults.film_mode.intelligent_pause_analysis.api_optimization
+
+    intelligent_pause_analysis = IntelligentPauseAnalysisConfig(
+        enabled=intelligent_pause_enabled,
+        model=intelligent_pause_model,
+        temperature=intelligent_pause_temperature,
+        max_attempts=intelligent_pause_max_attempts,
+        auto_trim_confidence_threshold=intelligent_pause_auto_trim_threshold,
+        batch_size=intelligent_pause_batch_size,
+        cache_enabled=intelligent_pause_cache_enabled,
+        cache_ttl_hours=intelligent_pause_cache_ttl,
+        pause_categories=intelligent_pause_categories,
+        importance_weights=intelligent_pause_weights,
+        api_optimization=intelligent_pause_api_opt
+    )
+
+    # Reference keywords for new ranking system
+    film_reference_keywords = film_in.get("reference_keywords", defaults.film_mode.reference_keywords)
+    if not isinstance(film_reference_keywords, dict):
+        film_reference_keywords = defaults.film_mode.reference_keywords
+
     # Ranking weights
     film_ranking_weights = film_in.get("ranking_weights", defaults.film_mode.ranking_weights)
     if not isinstance(film_ranking_weights, dict):
@@ -873,6 +1003,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_moments=film_max_moments,
         pause_threshold=film_pause_threshold,
         filler_words=film_filler_words,
+        reference_keywords=film_reference_keywords,
         ranking_weights=film_ranking_weights,
         ranking=film_ranking,
         llm_model=film_llm_model,
@@ -889,6 +1020,9 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         diversity_bucket_minutes=film_diversity_bucket,
         min_combo_segments=film_min_combo_segments,
         max_combo_segments=film_max_combo_segments,
+
+        # Интеллектуальный анализ пауз
+        intelligent_pause_analysis=intelligent_pause_analysis,
     )
 
     return AppConfig(processing=p, llm=l, logging=log, paths=paths, captions=captions, film_mode=film)

@@ -12,6 +12,7 @@ from typing import Optional, List
 import os
 import traceback
 import time
+import math
 from Components.config import get_config, AppConfig
 from Components.Logger import logger, timed_operation
 from Components.Paths import build_short_output_name
@@ -431,6 +432,12 @@ def process_highlight(ctx: ProcessingContext, item) -> Optional[str]:
         # Гарантия: stop > start
         if adjusted_stop <= start:
             adjusted_stop = start + 0.1
+
+        # Округление времени окончания short в положительную сторону для полного слова
+        prev_adjusted_stop = adjusted_stop
+        adjusted_stop = math.ceil(adjusted_stop)
+        if adjusted_stop != prev_adjusted_stop:
+            logger.logger.info(f"[Ceil] Rounded up stop from {prev_adjusted_stop:.2f}s to {adjusted_stop:.2f}s")
 
         logger.logger.info(f"\n--- Processing Highlight {seq}/{total}: Start={start:.2f}s, End={stop:.2f}s (effective end {adjusted_stop:.2f}s) ---")
         if isinstance(item, dict) and "caption_with_hashtags" in item:

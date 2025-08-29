@@ -25,6 +25,7 @@ from Components.Edit import crop_video, burn_captions, crop_bottom_video, animat
 from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
 from Components.Paths import build_short_output_name
 from faster_whisper import WhisperModel
+import math
 
 
 @dataclass
@@ -36,6 +37,7 @@ class FilmMoment:
     text: str
     segments: List[Dict[str, Any]] = field(default_factory=list)  # Для COMBO: суб-сегменты
     context: str = ""  # Описание контекста
+    keywords: List[str] = field(default_factory=list)  # Ключевые слова, выделенные ИИ
 
 
 @dataclass
@@ -390,20 +392,14 @@ class FilmAnalyzer:
             return []
 
     def _extract_film_moments(self, transcription: str) -> List[FilmMoment]:
-        """Извлечение моментов фильма через LLM"""
+        """Извлечение моментов фильма через LLM с ключевыми словами"""
         system_instruction = f"""
         Ты — эксперт по анализу видео контента для создания вирусных shorts. Проанализируй предоставленную транскрибацию и выдели лучшие моменты двух типов:
 
         1. COMBO (10-20 сек): Склейка 2-4 коротких кусков из одной сцены в хронологическом порядке для создания мини-дуги
         2. SINGLE (30-60 сек): Один самодостаточный момент с микро-аркой (завязка → нарастание → развязка)
 
-        Критерии качества для shorts:
-        - Эмоциональные пики и переломы статуса (признания, угрозы, ультиматумы, резкие смены намерения)
-        - Конфликт и эскалация (столкновения, отрицания, оскорбления)
-        - Панчлайны и остроумие (связка сетап → поворот → панч, сарказм, самоирония)
-        - Цитатность/мемность (запоминающиеся фразы, афоризмы, каламбуры)
-        - Ставки и цель (если X, то Y, последний шанс)
-        - Крючки/клиффхэнгеры (вопросы, недосказанность)
+        Для КАЖДОГО момента выдели 3-7 ключевых слов, которые характеризуют его суть и потенциал для вирусности.
 
         Верни ТОЛЬКО JSON-массив объектов с полями:
         - moment_type: "COMBO" или "SINGLE"
@@ -411,6 +407,7 @@ class FilmAnalyzer:
         - end_time: число (секунды)
         - text: текст момента
         - context: краткое описание почему этот момент подходит
+        - keywords: массив строк с ключевыми словами (3-7 слов)
 
         Для COMBO также добавь:
         - segments: массив суб-сегментов с start/end/text
@@ -474,7 +471,8 @@ class FilmAnalyzer:
                         end_time=float(item.get('end_time', 0)),
                         text=item.get('text', ''),
                         context=item.get('context', ''),
-                        segments=item.get('segments', [])
+                        segments=item.get('segments', []),
+                        keywords=item.get('keywords', [])
                     )
                     moments.append(moment)
                     logger.logger.debug(f"Обработан момент {i+1}: {moment.moment_type} {moment.start_time:.1f}-{moment.end_time:.1f}")
@@ -506,7 +504,7 @@ class FilmAnalyzer:
         bucket_sec = bucket_min * 60
         gen_top_k = int(max(1, getattr(self.film_config, "generator_top_k", target_n)))
 
-        # Подсчет и сортировка по score
+        # Подсчет и сортировка по score (с учетом ключевых слов)
         scored: List[RankedMoment] = []
         for moment in moments or []:
             scores = self._calculate_moment_scores(moment)
@@ -514,6 +512,9 @@ class FilmAnalyzer:
                 scores.get(name, 0.0) * self.film_config.ranking_weights.get(name, 0.0)
                 for name in self.film_config.ranking_weights.keys()
             )
+            # Бонус за количество и качество ключевых слов
+            keyword_bonus = len(moment.keywords or []) * 0.1
+            total_score += keyword_bonus
             scored.append(RankedMoment(moment=moment, scores=scores, total_score=total_score, rank=0))
 
         scored.sort(key=lambda x: x.total_score, reverse=True)
@@ -607,49 +608,32 @@ class FilmAnalyzer:
         return selected
 
     def _calculate_moment_scores(self, moment: FilmMoment) -> Dict[str, float]:
-        """Расчет оценок момента по критериям (улучшенная версия для Film Mode v2)"""
+        """Расчет оценок момента по совпадениям ключевых слов (новая система ранжирования)"""
         scores: Dict[str, float] = {}
 
-        text = (moment.text or "").lower()
-        text_length = len(text.split())  # Количество слов
+        # Получаем эталонные ключевые слова из конфигурации
+        ref_keywords = getattr(self.film_config, 'reference_keywords', {})
 
-        # Эмоциональные пики и переломы статуса (расширенный список, повышенные веса)
-        emotional_keywords = ['признание', 'угроза', 'ультиматум', 'увольнение', 'я твой отец', 'ухожу', 'мы всё теряем', 'это был он',
-                             'плач', 'крик', 'злость', 'радость', 'удивление', 'страх', 'обида', 'любовь', 'ненависть',
-                             'отчаяние', 'надежда', 'разочарование', 'триумф', 'поражение', 'предательство', 'спасение']
-        emotional_count = sum(1 for keyword in emotional_keywords if keyword in text)
-        scores['emotional_peaks'] = min(emotional_count * 3.5, 10)  # Увеличен коэффициент
+        # Нормализуем ключевые слова момента (приводим к нижнему регистру)
+        moment_keywords = [kw.lower().strip() for kw in (moment.keywords or []) if kw and kw.strip()]
 
-        # Конфликт и эскалация (расширенный список)
-        conflict_keywords = ['нет', 'никогда', 'почему', 'хватит', 'оскорбление', 'жесткий', 'отрицание',
-                           'спор', 'ссора', 'конфликт', 'драка', 'ругань', 'критика', 'претензия', 'ссылка',
-                           'обвинение', 'требование', 'давление', 'напряжение', 'эскалация']
-        conflict_count = sum(1 for keyword in conflict_keywords if keyword in text)
-        scores['conflict_escalation'] = min(conflict_count * 2.8, 10)  # Увеличен коэффициент
+        # Подсчитываем совпадения для каждой категории
+        for category, reference_words in ref_keywords.items():
+            if category in self.film_config.ranking_weights:
+                # Нормализуем эталонные ключевые слова
+                ref_words_lower = [w.lower().strip() for w in reference_words]
 
-        # Панчлайны и остроумие (расширенный список)
-        wit_keywords = ['сарказм', 'самоирония', 'панчлайн', 'остроумие', 'шутка', 'юмор', 'ирония',
-                       'насмешка', 'каламбур', 'анекдот', 'прикол', 'смех', 'комедия', 'юмористический']
-        wit_count = sum(1 for keyword in wit_keywords if keyword in text)
-        scores['punchlines_wit'] = min(wit_count * 2.5, 10)  # Увеличен коэффициент
+                # Считаем совпадения
+                matches = 0
+                for moment_kw in moment_keywords:
+                    # Проверяем точное совпадение или частичное вхождение
+                    for ref_kw in ref_words_lower:
+                        if ref_kw in moment_kw or moment_kw in ref_kw:
+                            matches += 1
+                            break  # Одно ключевое слово момента может соответствовать только одной категории
 
-        # Цитатность/мемность (расширенный список)
-        meme_keywords = ['запоминающаяся', 'афоризм', 'каламбур', 'слоган', 'крылатая фраза', 'цитата',
-                        'мем', 'вирусный', 'тренд', 'хайп', 'легендарный', 'знаменитый', 'классика']
-        meme_count = sum(1 for keyword in meme_keywords if keyword in text)
-        scores['quotability_memes'] = min(meme_count * 2.2, 10)  # Увеличен коэффициент
-
-        # Ставки и цель (расширенный список)
-        stakes_keywords = ['если', 'то', 'последний шанс', 'мы либо', 'либо', 'ставки', 'цель', 'риск',
-                          'опасность', 'выбор', 'решение', 'судьба', 'жизнь', 'смерть', 'выигрыш', 'проигрыш']
-        stakes_count = sum(1 for keyword in stakes_keywords if keyword in text)
-        scores['stakes_goals'] = min(stakes_count * 1.8, 10)  # Увеличен коэффициент
-
-        # Крючки/клиффхэнгеры (расширенный список)
-        hook_keywords = ['вопрос', 'недосказанность', 'развязка', 'продолжение', 'что дальше', 'загадка',
-                        'тайна', 'сюрприз', 'неожиданно', 'вдруг', 'поворот', 'интрига']
-        hook_count = sum(1 for keyword in hook_keywords if keyword in text)
-        scores['hooks_cliffhangers'] = min(hook_count * 1.6, 10)  # Увеличен коэффициент
+                # Нормализуем оценку (максимум 10 за совпадения)
+                scores[category] = min(matches * 2.0, 10.0)
 
         # Длина текста как бонус (короткие моменты лучше для shorts)
         duration = moment.end_time - moment.start_time
@@ -666,16 +650,17 @@ class FilmAnalyzer:
         else:
             scores['combo_bonus'] = 0.0
 
-        # Базовый скор за наличие текста (чтобы не было 0)
-        if text_length > 0:
-            scores['content_bonus'] = min(text_length * 0.15, 3.0)  # Увеличен коэффициент
+        # Базовый скор за наличие ключевых слов
+        if moment_keywords:
+            scores['content_bonus'] = min(len(moment_keywords) * 0.5, 3.0)
         else:
             scores['content_bonus'] = 0.0
 
-        # Штраф за визуальную зависимость (уменьшен)
+        # Штраф за визуальную зависимость
+        text = (moment.text or "").lower()
         visual_keywords = ['визуально', 'зрительно', 'видно', 'картинка', 'изображение']
         visual_count = sum(1 for keyword in visual_keywords if keyword in text)
-        scores['visual_penalty'] = -visual_count * 0.2  # Уменьшен штраф
+        scores['visual_penalty'] = -visual_count * 0.2
 
         # Расширенные метрики: pace/silence из контекста транскрипции
         try:
@@ -723,7 +708,52 @@ class FilmAnalyzer:
             return ranked_moments
 
     def _detect_boring_segments_in_moment(self, moment: FilmMoment, transcription_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Обнаружение скучных сегментов в моменте"""
+        """Интеллектуальное обнаружение скучных сегментов в моменте с использованием ИИ-анализа пауз"""
+        try:
+            # Импортируем анализатор пауз
+            from Components.PauseAnalysis import analyze_pauses_in_moment
+
+            # Анализируем паузы в рамках момента
+            pause_analyses = analyze_pauses_in_moment(
+                moment.start_time,
+                moment.end_time,
+                transcription_data
+            )
+
+            boring_segments = []
+
+            # Преобразуем результаты анализа пауз в формат boring_segments
+            for pause_analysis in pause_analyses:
+                if pause_analysis.should_trim:
+                    boring_segments.append({
+                        'start': pause_analysis.start_time,
+                        'end': pause_analysis.end_time,
+                        'reason': f'intelligent_{pause_analysis.category}',
+                        'confidence': pause_analysis.confidence,
+                        'importance_score': pause_analysis.importance_score,
+                        'should_trim': pause_analysis.should_trim,
+                        'ai_reasoning': pause_analysis.reasoning,
+                        'duration': pause_analysis.duration
+                    })
+
+            # Если ИИ-анализ не дал результатов или отключен, используем легаси-метод
+            if not boring_segments and not getattr(self.film_config, 'intelligent_pause_analysis', {}).get('enabled', False):
+                logger.logger.info("ИИ-анализ пауз отключен или не дал результатов, используем легаси-метод")
+                boring_segments = self._detect_boring_segments_legacy(moment, transcription_data)
+
+            logger.logger.debug(f"Обнаружено {len(boring_segments)} скучных сегментов в моменте "
+                              f"({moment.start_time:.1f}s-{moment.end_time:.1f}s)")
+
+            return boring_segments
+
+        except Exception as e:
+            logger.logger.error(f"Ошибка при интеллектуальном анализе пауз: {e}. "
+                               "Откатываемся на легаси-метод.")
+            # Fallback на легаси-метод при ошибках
+            return self._detect_boring_segments_legacy(moment, transcription_data)
+
+    def _detect_boring_segments_legacy(self, moment: FilmMoment, transcription_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Старая логика обнаружения скучных сегментов (резервная)"""
         boring_segments = []
         threshold = self.film_config.pause_threshold
 
@@ -771,7 +801,7 @@ class FilmAnalyzer:
         return boring_segments
 
     def _apply_trimming(self, moment: FilmMoment, boring_segments: List[Dict[str, Any]]) -> Optional[FilmMoment]:
-        """Применение обрезки к моменту"""
+        """Интеллектуальное применение обрезки к моменту с учетом ИИ-анализа пауз"""
         if not boring_segments:
             return moment
 
@@ -817,13 +847,23 @@ class FilmAnalyzer:
             return None
 
         # Создаем новый момент с объединенными сегментами
+        # Добавляем информацию об ИИ-анализе пауз в контекст
+        ai_trimmed_count = sum(1 for seg in boring_segments if seg.get('reason', '').startswith('intelligent_'))
+        legacy_trimmed_count = len(boring_segments) - ai_trimmed_count
+
+        context_parts = [moment.context]
+        if ai_trimmed_count > 0:
+            context_parts.append(f"ИИ-обрезка: {ai_trimmed_count} пауз")
+        if legacy_trimmed_count > 0:
+            context_parts.append(f"Стандартная обрезка: {legacy_trimmed_count} пауз")
+
         return FilmMoment(
             moment_type=moment.moment_type,
             start_time=new_segments[0]['start'],
             end_time=new_segments[-1]['end'],
             text=moment.text,
             segments=moment.segments,
-            context=f"{moment.context} (обрезан: {len(boring_segments)} скучных сегментов)"
+            context=f" ({'; '.join(context_parts)})"
         )
 
     def _generate_shorts_from_moments(self, video_path: str, ranked_moments: List[RankedMoment], transcription_data: Dict[str, Any]) -> List[str]:
@@ -1416,6 +1456,12 @@ class FilmAnalyzer:
                 adjusted_stop = vd
                 logger.logger.info(f"✅ Скорректирован конец сегмента до {adjusted_stop:.2f}s")
 
+            # Округление времени окончания short в положительную сторону для полного слова
+            prev_adjusted_stop = adjusted_stop
+            adjusted_stop = math.ceil(adjusted_stop)
+            if adjusted_stop != prev_adjusted_stop:
+                logger.logger.info(f"[Ceil] Rounded up stop from {prev_adjusted_stop:.2f}s to {adjusted_stop:.2f}s")
+
             # 2. Определение путей файлов
             logger.logger.info("--- ОПРЕДЕЛЕНИЕ ПУТЕЙ ФАЙЛОВ ---")
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
@@ -1786,7 +1832,8 @@ class FilmAnalyzer:
                 'end': rm.moment.end_time,
                 'type': rm.moment.moment_type,
                 'score': round(rm.total_score, 2),
-                'text': rm.moment.text[:200] + '...' if len(rm.moment.text) > 200 else rm.moment.text
+                'text': rm.moment.text[:200] + '...' if len(rm.moment.text) > 200 else rm.moment.text,
+                'keywords': rm.moment.keywords or []
             })
 
         # Формирование scores
@@ -1794,7 +1841,8 @@ class FilmAnalyzer:
         for rm in ranked_moments[:top_n]:
             score_dict = {
                 'moment_id': f"{rm.moment.moment_type.lower()}_{rm.rank}",
-                'total': round(rm.total_score, 2)
+                'total': round(rm.total_score, 2),
+                'keywords': rm.moment.keywords or []
             }
             score_dict.update({k: round(v, 2) for k, v in rm.scores.items()})
             scores.append(score_dict)
@@ -1833,6 +1881,7 @@ class FilmAnalyzer:
             'moments_found': len(ranked_moments),
             'shorts_generated': len(generated_shorts),
             'selection_strategy': info.get('selection_strategy', 'quality_threshold'),
+            'ranking_system': 'keyword_matching',  # Новая система ранжирования
             'thresholds': {
                 'min_quality_threshold': float(min_thr),
                 'soft_min_quality': float(soft_min),
@@ -1920,39 +1969,33 @@ class FilmAnalyzer:
         target_per_window = max(k_per_win, self.film_config.target_shorts_count // 4)  # минимум 4 окна
         k_per_win = min(target_per_window, 20)  # но не больше 20 на окно
 
-        # Общая системная инструкция для окна (нагружаем правилами SINGLE/COMBO)
+        # Общая системная инструкция для окна (с выделением ключевых слов)
         def _build_window_system_instruction(w_start: float, w_end: float) -> str:
             return f"""
-Ты — эксперт по анализу фильмов для создания вирусных Shorts. Твоя задача — в пределах окна [{w_start:.2f}s, {w_end:.2f}s] найти лучшие моменты двух типов и вернуть ТОЛЬКО JSON-массив:
+        Ты — эксперт по анализу фильмов для создания вирусных Shorts. Твоя задача — в пределах окна [{w_start:.2f}s, {w_end:.2f}s] найти лучшие моменты двух типов и вернуть ТОЛЬКО JSON-массив:
 
-Типы моментов:
-- COMBO (10–20 сек): 2–4 суб-сегмента одной сцены в хронологическом порядке
-- SINGLE (30–60 сек): самодостаточный момент с мини-аркой (завязка → нарастание → развязка)
+        Типы моментов:
+        - COMBO (10–20 сек): 2–4 суб-сегмента одной сцены в хронологическом порядке
+        - SINGLE (30–60 сек): самодостаточный момент с мини-аркой (завязка → нарастание → развязка)
 
-Критерии качества:
-- Эмоциональные пики, переломы статуса
-- Конфликт/эскалация
-- Панчлайны/остроумие
-- Цитатность/мемность
-- Ставки/цели
-- Крючки/клиффхэнгеры
-- Избегай моментов, где смысл критически зависит от картинки
+        Для КАЖДОГО момента выдели 3-7 ключевых слов, которые характеризуют его суть и потенциал для вирусности.
 
-Формат каждого объекта:
-- moment_type: "COMBO" | "SINGLE"
-- start_time: секунды (абсолютные таймкоды фильма)
-- end_time: секунды
-- text: краткий текст/реплики момента
-- context: почему момент подходит (кратко)
-Для COMBO:
-- segments: массив объектов {{"start":sec,"end":sec,"text":"..."}}
+        Формат каждого объекта:
+        - moment_type: "COMBO" | "SINGLE"
+        - start_time: секунды (абсолютные таймкоды фильма)
+        - end_time: секунды
+        - text: краткий текст/реплики момента
+        - context: почему момент подходит (кратко)
+        - keywords: массив строк с ключевыми словами (3-7 слов)
+        Для COMBO:
+        - segments: массив объектов {{"start":sec,"end":sec,"text":"..."}}
 
-Условия:
-- Верни до {k_per_win} лучших моментов ТОЛЬКО в границах окна.
-- Таймкоды указывай абсолютные, соответствующие фильму.
-- Строго JSON без пояснений.
-- Стремись найти максимум качественных моментов для достижения цели в 30 шортов.
-"""
+        Условия:
+        - Верни до {k_per_win} лучших моментов ТОЛЬКО в границах окна.
+        - Таймкоды указывай абсолютные, соответствующие фильму.
+        - Строго JSON без пояснений.
+        - Стремись найти максимум качественных моментов для достижения цели в 30 шортов.
+        """
 
         # Идем по окнам
         total_windows = 0
@@ -2020,6 +2063,7 @@ class FilmAnalyzer:
                         txt = str(item.get('text', '') or '')
                         ctx = str(item.get('context', '') or '')
                         segs = item.get('segments', [])
+                        keywords = item.get('keywords', [])
                         # Валидация по типу
                         if mtype == 'COMBO':
                             if not isinstance(segs, list) or len(segs) < getattr(self.film_config, "min_combo_segments", 2):
@@ -2046,7 +2090,8 @@ class FilmAnalyzer:
                             end_time=en,
                             text=txt,
                             segments=norm_segments,
-                            context=ctx
+                            context=ctx,
+                            keywords=keywords
                         )
                         moments.append(fm)
                     except Exception:
@@ -2086,12 +2131,15 @@ class FilmAnalyzer:
             return []
 
         thr = float(getattr(self.film_config, "dedupe_iou_threshold", 0.5) or 0.5)
-        # Предварительная оценка total_score для сортировки
+        # Предварительная оценка total_score для сортировки (с учетом ключевых слов)
         scored_list: List[RankedMoment] = []
         for c in candidates:
             try:
                 sc = self._calculate_moment_scores(c)
                 total = sum(sc.get(k, 0.0) * self.film_config.ranking_weights.get(k, 0.0) for k in sc.keys())
+                # Бонус за количество ключевых слов
+                keyword_bonus = len(c.keywords or []) * 0.1
+                total += keyword_bonus
                 scored_list.append(RankedMoment(moment=c, scores=sc, total_score=total, rank=0))
             except Exception:
                 scored_list.append(RankedMoment(moment=c, scores={}, total_score=0.0, rank=0))
@@ -2151,19 +2199,35 @@ class FilmAnalyzer:
             # Нормируем: 0 -> 0, 4 слов/сек -> 10, cap
             pace = max(0.0, min(10.0, (pace_wps / 4.0) * 10.0))
 
-        # Silence penalty: используем уже реализованный детектор скучных сегментов в режиме признака
+        # Silence penalty: используем интеллектуальный детектор скучных сегментов
         try:
             boring = self._detect_boring_segments_in_moment(moment, transcription_data) or []
             boring_total = 0.0
+            ai_trimmed_duration = 0.0
+
             for b in boring:
                 try:
                     b0 = float(b.get('start', st)); b1 = float(b.get('end', st))
-                    boring_total += max(0.0, b1 - b0)
+                    duration = max(0.0, b1 - b0)
+                    boring_total += duration
+
+                    # Отслеживаем длительность ИИ-обрезанных пауз
+                    if b.get('reason', '').startswith('intelligent_'):
+                        ai_trimmed_duration += duration
                 except Exception:
                     continue
+
             frac = max(0.0, min(1.0, boring_total / dur))
             silence_penalty = min(10.0, frac * 10.0)
-        except Exception:
+
+            # Логируем информацию об ИИ-анализе пауз для скоринга
+            if boring:
+                ai_fraction = ai_trimmed_duration / boring_total if boring_total > 0 else 0
+                logger.logger.debug(f"Silence analysis for moment {st:.1f}s-{en:.1f}s: "
+                                  f"total_boring={boring_total:.2f}s ({frac:.1%}), "
+                                  f"ai_trimmed={ai_trimmed_duration:.2f}s ({ai_fraction:.1%})")
+        except Exception as e:
+            logger.logger.debug(f"Error in silence penalty calculation: {e}")
             silence_penalty = 0.0
 
         return (pace, silence_penalty)
@@ -2179,7 +2243,7 @@ class FilmAnalyzer:
             scores=[],
             preview_text="Не удалось проанализировать видео",
             risks=["Ошибка обработки видео"],
-            metadata={'error': True},
+            metadata={'error': True, 'ranking_system': 'keyword_matching'},
             generated_shorts=[]
         )
 

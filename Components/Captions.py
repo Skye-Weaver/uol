@@ -216,9 +216,9 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         f"OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         f"ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         f"MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,Poppins,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
+        f"Style: Default,Montserrat-Bold,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
         f"-1,0,0,0,100,100,{spacing_val},0,1,{outline},{shadow_val},{alignment},{margin_l},{margin_r},{margin_v},1\n"
-        f"Style: Fallback,Arial,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
+        f"Style: Fallback,Montserrat-Bold,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
         f"-1,0,0,0,100,100,{spacing_val},0,1,{outline},{shadow_val},{alignment},{margin_l},{margin_r},{margin_v},1\n"
         f"\n"
         f"[Events]\n"
@@ -268,7 +268,11 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
 # Function to burn captions using FFmpeg
 def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_time, end_time, output_path, style_cfg=None):
     """Burns captions onto the vertical video using audio from the source segment."""
-    temp_ass_path = "temp_subtitles.ass"  # Simple name in current directory
+    # Create temp ASS file in the same directory as output to avoid path issues
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_ass_filename = f"temp_subtitles_{os.path.basename(output_path).replace('.', '_')}.ass"
+    temp_ass_path = os.path.join(output_dir, temp_ass_filename)
+
     # Пытаемся получить реальные размеры видео (для PlayRes при наличии style_cfg)
     vw, vh = None, None
     try:
@@ -308,19 +312,34 @@ def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_
             print(f"Successfully muxed audio into: {output_path}")
             return True # Return true as the operation (adding audio) succeeded
 
-        # Write the ASS content to the current directory
+        # Write the ASS content to the output directory
         with open(temp_ass_path, 'w', encoding='utf-8') as f:
             f.write(ass_content)
 
         print(f"Generated subtitle file: {temp_ass_path}")
+
+        # Verify ASS file was created and has content
+        if not os.path.exists(temp_ass_path) or os.path.getsize(temp_ass_path) == 0:
+            print(f"Error: ASS file was not created properly: {temp_ass_path}")
+            return False
+
+        # Use relative path from output directory for better compatibility
+        try:
+            # Try relative path first (more reliable)
+            ass_relative_path = os.path.relpath(temp_ass_path, output_dir)
+            # Escape single quotes in path for FFmpeg
+            ass_path_escaped = ass_relative_path.replace("'", "\\'")
+        except Exception:
+            # Fallback to absolute path with proper escaping
+            ass_path_escaped = temp_ass_path.replace("'", "\\'").replace("\\", "\\\\")
 
         # FFmpeg command using two inputs and mapping streams
         ffmpeg_command = [
             'ffmpeg',
             '-i', vertical_video_path,  # Input 0: Vertically cropped video (silent)
             '-i', audio_source_path,   # Input 1: Original segment (with audio)
-            # Use absolute path for subtitles file to avoid potential issues with ffmpeg's working directory
-            '-filter_complex', f"[0:v]ass='{os.path.abspath(temp_ass_path)}'[video_out]",
+            # Use properly escaped path for subtitles file
+            '-filter_complex', f"[0:v]ass='{ass_path_escaped}'[video_out]",
             '-map', '[video_out]',     # Map the filtered video stream
             '-map', '1:a:0',           # Map the audio stream from input 1
             '-c:v', 'libx264',
@@ -347,6 +366,9 @@ def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_
         print(f"Error running FFmpeg: {e}")
         print(f"FFmpeg stdout: {e.stdout}")
         print(f"FFmpeg stderr: {e.stderr}")
+        # Check if error is related to ASS processing
+        if "ass=" in str(e.stderr) or "subtitle" in str(e.stderr).lower():
+            print("Warning: ASS subtitle processing failed. This might be due to font issues or ASS format problems.")
         return False
     except Exception as e:
         print(f"An error occurred during caption burning: {e}")
@@ -935,20 +957,20 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     text_bbox = tmp_draw.textbbox((0, 0), words_to_display, font=font)
                     text_h = (text_bbox[3] - text_bbox[1]) if text_bbox else font_size
 
-                    # Позиционирование
+                    # Позиционирование (стабилизированная Y-координата)
                     if position_mode == "center":
-                        # Центрируем по вертикали, затем смещаем ниже центра
+                        # Центрируем по вертикали, затем смещаем ниже центра (фиксированная позиция)
                         try:
                             offset_px = int(height * (center_offset_pct / 100.0))
                         except Exception:
                             offset_px = int(height * 0.12)  # 12% fallback
-                        start_y = (height - text_h) // 2 + offset_px
+                        start_y = (height // 2) + offset_px  # Фиксированная позиция по центру
                     else:  # safe_bottom
                         try:
                             margin_y = _compute_bottom_margin_px(height, bottom_offset_pct or 22)
                         except Exception:
                             margin_y = 120
-                        start_y = height - margin_y - text_h # Используем text_h вместо font_ascent для большей точности
+                        start_y = height - margin_y  # Фиксированная позиция от низа
 
                     # --- Горизонтальное позиционирование и clamping ---
                     
@@ -971,7 +993,15 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
                     # Применяем boundary_padding_px для clamping
                     padding = boundary_padding_px or 10
                     start_x = max(padding, min(start_x, width - total_text_w - padding))
-                    start_y = max(padding, min(start_y, height - text_h - padding))
+                    # Для вертикального clamping учитываем высоту текста от фиксированной позиции
+                    if position_mode == "center":
+                        # Для center режима текст центрируется вокруг start_y
+                        min_y = padding + text_h // 2
+                        max_y = height - padding - text_h // 2
+                        start_y = max(min_y, min(start_y, max_y))
+                    else:  # safe_bottom
+                        # Для safe_bottom текст идет вниз от start_y
+                        start_y = max(padding, min(start_y, height - text_h - padding))
 
                     if not anim_cfg:
                         import re as _re_kc
