@@ -57,6 +57,15 @@ class FilmModeConfig:
         'visual_penalty': -0.10       # Штраф за визуальную зависимость
     })
 
+    # Пороговые настройки ранжирования и fallback
+    ranking: dict = field(default_factory=lambda: {
+        'min_quality_threshold': 0.5,
+        'soft_min_quality': 0.35,
+        'allow_fallback': True,
+        'fallback_top_n': 2,
+        'max_best_moments': 10,
+    })
+
     # Настройки LLM для анализа фильма
     llm_model: str = "gemini-2.5-flash"
     llm_temperature: float = 0.3
@@ -794,7 +803,40 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     film_llm_model = _as_str(film_in.get("llm", {}).get("model", defaults.film_mode.llm_model), defaults.film_mode.llm_model)
     film_llm_temperature = _clamp(_as_float(film_in.get("llm", {}).get("temperature", defaults.film_mode.llm_temperature), defaults.film_mode.llm_temperature), 0.0, 2.0)
     film_llm_max_attempts = max(1, _as_int(film_in.get("llm", {}).get("max_attempts", defaults.film_mode.llm_max_attempts), defaults.film_mode.llm_max_attempts))
-
+ 
+    # Ranking and fallback settings
+    film_ranking_in = film_in.get("ranking", {}) or {}
+    if not isinstance(film_ranking_in, dict):
+        film_ranking_in = {}
+    ranking_defaults = defaults.film_mode.ranking
+    min_q = _clamp(
+        _as_float(film_ranking_in.get("min_quality_threshold", ranking_defaults.get("min_quality_threshold")), ranking_defaults.get("min_quality_threshold")),
+        0.0, 1.0
+    )
+    soft_min_q = _clamp(
+        _as_float(film_ranking_in.get("soft_min_quality", ranking_defaults.get("soft_min_quality")), ranking_defaults.get("soft_min_quality")),
+        0.0, 1.0
+    )
+    allow_fb = _as_bool(
+        film_ranking_in.get("allow_fallback", ranking_defaults.get("allow_fallback")),
+        ranking_defaults.get("allow_fallback")
+    )
+    fb_top_n = max(
+        1,
+        _as_int(film_ranking_in.get("fallback_top_n", ranking_defaults.get("fallback_top_n")), ranking_defaults.get("fallback_top_n"))
+    )
+    max_best = max(
+        1,
+        _as_int(film_ranking_in.get("max_best_moments", ranking_defaults.get("max_best_moments")), ranking_defaults.get("max_best_moments"))
+    )
+    film_ranking = {
+        "min_quality_threshold": min_q,
+        "soft_min_quality": soft_min_q,
+        "allow_fallback": allow_fb,
+        "fallback_top_n": fb_top_n,
+        "max_best_moments": max_best,
+    }
+ 
     film = FilmModeConfig(
         enabled=film_enabled,
         combo_duration=film_combo_duration,
@@ -803,6 +845,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         pause_threshold=film_pause_threshold,
         filler_words=film_filler_words,
         ranking_weights=film_ranking_weights,
+        ranking=film_ranking,
         llm_model=film_llm_model,
         llm_temperature=film_llm_temperature,
         llm_max_attempts=film_llm_max_attempts,

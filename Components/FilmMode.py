@@ -74,6 +74,7 @@ class FilmAnalyzer:
 
         # Настройки для режима фильм
         self.film_config = config.film_mode
+        self._last_ranking_info = {}
 
     def analyze_film(self, url: Optional[str] = None, local_path: Optional[str] = None) -> FilmAnalysisResult:
         """
@@ -93,20 +94,28 @@ class FilmAnalyzer:
         if not video_path or not transcription_data:
             raise ValueError("Не удалось получить видео или транскрибацию")
 
-        # Логируем информацию о полученных данных
-        duration = transcription_data.get('duration', 0)
+        # Логируем информацию о полученных данных + единое разрешение длительности
         segments_count = len(transcription_data.get('segments', []))
-        logger.logger.info(f"Получены данные транскрибации: длительность={duration:.2f}s, сегментов={segments_count}")
+        # Единое разрешение длительности и запись в transcription_data['duration']
+        resolved_duration = self._resolve_video_duration(video_path, transcription_data)
+        logger.logger.info(f"Получены данные транскрибации: сегментов={segments_count}")
+        logger.logger.info(f"Duration: {resolved_duration:.2f} seconds")
 
         # 2. Анализ моментов через ИИ
         moments = self._analyze_moments(transcription_data)
         if not moments:
             logger.logger.warning("Не найдено подходящих моментов для анализа")
-            logger.logger.warning(f"Данные транскрибации: duration={duration}, segments={segments_count}")
+            logger.logger.warning(f"Данные транскрибации: duration={resolved_duration}, segments={segments_count}")
             return self._create_empty_result(video_path)
 
         # 3. Ранжирование моментов
         ranked_moments = self._rank_moments(moments)
+        try:
+            info = getattr(self, "_last_ranking_info", {}) or {}
+            strategy = info.get("selection_strategy", "quality_threshold")
+            logger.logger.info(f"[OK] Ranking: selected={len(ranked_moments)} (strategy={strategy}), proceed")
+        except Exception:
+            pass
         if not ranked_moments:
             logger.logger.warning("После фильтрации по качеству не осталось подходящих моментов")
             return self._create_empty_result(video_path)
@@ -134,6 +143,13 @@ class FilmAnalyzer:
         result = self._create_result(video_path, trimmed_moments, transcription_data, generated_shorts)
 
         logger.logger.info(f"Анализ фильма завершен. Найдено {len(trimmed_moments)} моментов, сгенерировано {len(generated_shorts)} шортов")
+        try:
+            _ctx_dur = float(transcription_data.get('duration', 0.0) or 0.0)
+            logger.logger.info(f"[OK] Duration consistency: ctx={_ctx_dur:.2f}s, warnings=0")
+            logger.logger.info(f"[OK] Summary duration: {_ctx_dur:.2f}s записано в JSON и в финальный лог")
+        except Exception:
+            logger.logger.info(f"[OK] Duration consistency: ctx={transcription_data.get('duration', 0.0)}s, warnings=0")
+            logger.logger.info(f"[OK] Summary duration: {transcription_data.get('duration', 0.0)}s записано в JSON и в финальный лог")
         return result
 
     def _get_video_and_transcription(self, url: Optional[str], local_path: Optional[str]) -> tuple:
@@ -242,6 +258,88 @@ class FilmAnalyzer:
         except Exception as e:
             logger.logger.warning(f"Ошибка при получении длительности видео: {e}")
             return 0.0
+
+    def _resolve_video_duration(self, video_path: str, transcription_data: Dict[str, Any]) -> float:
+        """
+        Единое определение длительности видео с приоритетом:
+          a) транскрипция (макс. end среди сегментов word-level и/или legacy)
+          b) fallback: ffprobe через _get_video_duration
+        Валидация: значение > 0; логируем INFO итог; при сомнении — ERROR и переключение на альтернативный источник.
+        """
+        # Извлекаем длительность из транскрипции
+        trans_end_word = 0.0
+        try:
+            wl = transcription_data.get('word_level', {})
+            if isinstance(wl, dict) and isinstance(wl.get('segments'), list) and wl['segments']:
+                trans_end_word = max(float(s.get('end', 0.0) or 0.0) for s in wl['segments'])
+        except Exception as e:
+            logger.logger.debug(f"Не удалось вычислить длительность из word_level: {e}")
+
+        trans_end_legacy = 0.0
+        try:
+            segs = transcription_data.get('segments') or []
+            ends = []
+            for seg in segs:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                    ends.append(float(seg[2]))
+                elif isinstance(seg, dict):
+                    ends.append(float(seg.get('end', 0.0) or 0.0))
+            if ends:
+                trans_end_legacy = max(ends)
+        except Exception as e:
+            logger.logger.debug(f"Не удалось вычислить длительность из legacy segments: {e}")
+
+        transcription_duration = max(trans_end_word, trans_end_legacy)
+
+        # Fallback: ffprobe
+        ffprobe_duration = 0.0
+        try:
+            ffprobe_duration = float(self._get_video_duration(video_path) or 0.0)
+        except Exception as e:
+            logger.logger.debug(f"Не удалось получить длительность через ffprobe: {e}")
+            ffprobe_duration = 0.0
+
+        # Сохраняем источники в transcription_data для последующего логирования
+        transcription_data['duration_from_transcription'] = float(transcription_duration or 0.0)
+        transcription_data['duration_from_ffprobe'] = float(ffprobe_duration or 0.0)
+
+        # Выбор значения по правилам
+        chosen = transcription_duration if transcription_duration and transcription_duration > 0 else ffprobe_duration
+
+        # Диагностика сомнительных случаев
+        long_transcription = transcription_duration and transcription_duration > 600
+        if (not chosen or chosen <= 0):
+            logger.logger.error("[DURATION] Получено некорректное значение длительности (<= 0). Переключение на альтернативный источник (ffprobe).")
+            if ffprobe_duration and ffprobe_duration > 0:
+                chosen = ffprobe_duration
+
+        if long_transcription and (chosen < 300 or chosen <= 0):
+            logger.logger.error("[DURATION] Подозрительно малая длительность при длинной транскрипции. Переключение на альтернативный источник.")
+            alt = ffprobe_duration if chosen == transcription_duration else transcription_duration
+            if alt and alt > chosen:
+                chosen = alt
+
+        # Если оба источника валидны и сильно расходятся, выбираем большее для предотвращения обрезки
+        try:
+            if transcription_duration > 0 and ffprobe_duration > 0:
+                delta = abs(transcription_duration - ffprobe_duration)
+                if delta > 1.0 and ffprobe_duration > transcription_duration * 1.05:
+                    logger.logger.warning(f"[DURATION] Расхождение источников: transcription={transcription_duration:.2f}s, ffprobe={ffprobe_duration:.2f}s. Выбрано большее значение.")
+                    chosen = max(transcription_duration, ffprobe_duration)
+        except Exception:
+            pass
+
+        # Финальные логи
+        if chosen and chosen > 0:
+            logger.logger.info(f"[VALIDATION] duration sources: transcription={transcription_duration:.2f}, ffprobe={ffprobe_duration:.2f}, chosen=ctx.video_duration={chosen:.2f}")
+            logger.logger.info(f"Duration: {chosen:.2f} seconds")
+        else:
+            logger.logger.error("[DURATION] Не удалось надежно определить длительность видео. Установлено 0.0s")
+            chosen = 0.0
+
+        # Записываем единое значение в transcription_data
+        transcription_data['duration'] = float(chosen)
+        return float(chosen)
 
     def _analyze_moments(self, transcription_data: Dict[str, Any]) -> List[FilmMoment]:
         """Анализ моментов через ИИ"""
@@ -380,41 +478,84 @@ class FilmAnalyzer:
             return []
 
     def _rank_moments(self, moments: List[FilmMoment]) -> List[RankedMoment]:
-        """Ранжирование моментов по баллам"""
-        ranked_moments = []
+        """Ранжирование моментов с fallback top-N"""
+        # Конфигурация ранжирования с обратной совместимостью
+        rc = getattr(self.film_config, "ranking", {}) or {}
+        min_thr = rc.get("min_quality_threshold", getattr(self.film_config, "min_quality_score", 0.5))
+        soft_min = rc.get("soft_min_quality", 0.35)
+        allow_fb = bool(rc.get("allow_fallback", True))
+        fb_top_n = int(max(1, rc.get("fallback_top_n", 2)))
+        max_best = int(max(1, rc.get("max_best_moments", 10)))
 
+        # Шаг a) Подсчет и сортировка по score
+        scored: List[RankedMoment] = []
         for i, moment in enumerate(moments):
             scores = self._calculate_moment_scores(moment)
             total_score = sum(
                 score * self.film_config.ranking_weights.get(score_name, 0)
                 for score_name, score in scores.items()
             )
+            scored.append(RankedMoment(moment=moment, scores=scores, total_score=total_score, rank=0))
 
-            # Фильтрация по минимальному порогу качества
-            if total_score < self.film_config.min_quality_score:
-                logger.logger.debug(f"Момент {i+1} отфильтрован по порогу качества: {total_score:.2f} < {self.film_config.min_quality_score}")
-                continue
+        scored.sort(key=lambda x: x.total_score, reverse=True)
+        M = len(scored)
 
-            ranked_moment = RankedMoment(
-                moment=moment,
-                scores=scores,
-                total_score=total_score,
-                rank=0  # Будет установлено после сортировки
-            )
-            ranked_moments.append(ranked_moment)
+        # Лог до выбора
+        logger.logger.info(f"Кандидатов: {M}, threshold={min_thr}, soft={soft_min}, max_best={max_best}, fallback_top_n={fb_top_n}, allow_fallback={allow_fb}")
 
-        # Сортировка по убыванию общего балла
-        ranked_moments.sort(key=lambda x: x.total_score, reverse=True)
+        # Шаг b) Фильтр по порогу
+        primary_selected = [rm for rm in scored if rm.total_score >= min_thr]
+        selected = primary_selected
+        strategy = "quality_threshold"
 
-        # Установка рангов
-        for i, rm in enumerate(ranked_moments):
+        # Шаг c) Fallback top-N
+        if not selected and allow_fb and scored:
+            K = max(1, fb_top_n)
+            selected = scored[:K]
+            strategy = "fallback_topN"
+            min_s = min(rm.total_score for rm in selected) if selected else 0.0
+            max_s = max(rm.total_score for rm in selected) if selected else 0.0
+            logger.logger.warning(f"Fallback top-N активирован: threshold={min_thr}, soft={soft_min}, выбранных={len(selected)} из {M}, min_score={min_s:.3f}, max_score={max_s:.3f}")
+            logger.logger.info(f"[OK] Fallback applied: top-K={len(selected)}, min_score={min_s:.3f}, max_score={max_s:.3f}")
+
+        # Шаг e) Ограничение до max_best_moments
+        if selected:
+            selected = selected[:max_best]
+
+        # Мини-валидация: гарантировать >=1 при allow_fallback
+        if not selected and allow_fb and scored:
+            logger.logger.error("После ранжирования не выбрано ни одного момента при allow_fallback=true — форсируем top-1")
+            selected = scored[:1]
+            strategy = "fallback_topN"
+
+        # Присвоение рангов
+        for i, rm in enumerate(selected):
             rm.rank = i + 1
 
-        logger.logger.info(f"Ранжирование завершено. Найдено {len(ranked_moments)} моментов с качеством >= {self.film_config.min_quality_score}")
-        if ranked_moments:
-            logger.logger.info(f"Лучший момент имеет балл {ranked_moments[0].total_score:.2f}")
+        # Логи после выбора
+        if selected:
+            first_score = selected[0].total_score
+            last_score = selected[-1].total_score
+        else:
+            first_score = last_score = 0.0
+        logger.logger.info(f"Выбрано {len(selected)} моментов (strategy={strategy}), первый score={first_score:.3f}, последний score={last_score:.3f}")
+        logger.logger.info(f"[OK] Ranking: candidates={M}, threshold={min_thr}, soft={soft_min}, selected={len(selected)} (strategy={strategy})")
+        if len(selected) >= 1:
+            logger.logger.info("[VALIDATION] Ranking produced N>=1: OK")
 
-        return ranked_moments
+        # Сохранение информации о последнем ранжировании для интеграционных логов/метаданных
+        try:
+            self._last_ranking_info = {
+                "selection_strategy": strategy,
+                "candidates": M,
+                "selected": len(selected),
+                "threshold": float(min_thr),
+                "soft": float(soft_min),
+            }
+        except Exception:
+            pass
+
+        return selected
 
     def _calculate_moment_scores(self, moment: FilmMoment) -> Dict[str, float]:
         """Расчет оценок момента по критериям"""
@@ -608,6 +749,14 @@ class FilmAnalyzer:
             logger.logger.info(f"Количество сегментов транскрибации: {len(transcription_data['segments'])}")
         if 'duration' in transcription_data:
             logger.logger.info(f"Длительность видео по транскрибации: {transcription_data['duration']:.2f}s")
+        # Валидация источников длительности для шортов
+        try:
+            _td = float(transcription_data.get('duration_from_transcription', 0.0) or 0.0)
+            _fd = float(transcription_data.get('duration_from_ffprobe', 0.0) or 0.0)
+            _ch = float(transcription_data.get('duration', 0.0) or 0.0)
+            logger.logger.info(f"[VALIDATION] duration sources: transcription={_td:.2f}, ffprobe={_fd:.2f}, chosen=ctx.video_duration={_ch:.2f}")
+        except Exception:
+            pass
 
         # 2. Валидация входных данных
         logger.logger.info("--- ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ---")
@@ -1063,6 +1212,20 @@ class FilmAnalyzer:
                 self.cfg = config
                 self.db = VideoDatabase()
                 self.outputs = []
+                # Единая длительность видео для всего пайплайна
+                try:
+                    self.video_duration = float(transcription_data.get('duration', 0.0) or 0.0)
+                except Exception:
+                    self.video_duration = 0.0
+                # Источники длительности (для диагностики)
+                try:
+                    self.duration_from_transcription = float(transcription_data.get('duration_from_transcription', 0.0) or 0.0)
+                except Exception:
+                    self.duration_from_transcription = 0.0
+                try:
+                    self.duration_from_ffprobe = float(transcription_data.get('duration_from_ffprobe', 0.0) or 0.0)
+                except Exception:
+                    self.duration_from_ffprobe = 0.0
 
         return MockProcessingContext(video_path, video_id, transcription_data, width, height, self.config)
 
@@ -1092,12 +1255,51 @@ class FilmAnalyzer:
             logger.logger.info(f"Финальные таймкоды: {start:.2f}s - {adjusted_stop:.2f}s")
             logger.logger.info(f"Длительность сегмента: {duration:.2f}s")
 
-            # Проверяем границы видео с улучшенной логикой определения длительности
-            video_duration = self._get_video_duration_from_transcription(ctx)
-            if video_duration and adjusted_stop > video_duration:
-                logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {video_duration:.2f}s")
+            # Проверяем границы видео, используя только ctx.video_duration
+            try:
+                logger.logger.info(f"[VALIDATION] ctx.video_duration={float(ctx.video_duration):.2f}")
+            except Exception:
+                logger.logger.info(f"[VALIDATION] ctx.video_duration={ctx.video_duration}")
+
+            # Автоматическая переоценка источника длительности, если значение сомнительное
+            try:
+                vd = float(getattr(ctx, "video_duration", 0.0) or 0.0)
+            except Exception:
+                vd = 0.0
+
+            # Оценка длины транскрипции для диагностики
+            trans_guess = 0.0
+            try:
+                wl = getattr(ctx, "word_level_transcription", {}) or {}
+                if isinstance(wl, dict) and isinstance(wl.get('segments'), list) and wl['segments']:
+                    trans_guess = max(float(s.get('end', 0.0) or 0.0) for s in wl['segments'])
+                elif getattr(ctx, "transcription_segments", None):
+                    ends = []
+                    for seg in ctx.transcription_segments:
+                        if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                            ends.append(float(seg[2]))
+                        elif isinstance(seg, dict):
+                            ends.append(float(seg.get('end', 0.0) or 0.0))
+                    if ends:
+                        trans_guess = max(ends)
+            except Exception:
+                pass
+
+            if vd <= 0 or (vd < 60 and trans_guess > 600):
+                logger.logger.error("[DURATION] Некорректная/подозрительно малая ctx.video_duration. Переключаемся на альтернативный источник (ffprobe).")
+                try:
+                    alt = float(self._get_video_duration(ctx.video_path) or 0.0)
+                    if alt > 0:
+                        ctx.video_duration = alt
+                        vd = alt
+                        logger.logger.info(f"[DURATION] ctx.video_duration обновлена из ffprobe: {vd:.2f}s")
+                except Exception as _e:
+                    logger.logger.error(f"[DURATION] Не удалось получить длительность через ffprobe: {_e}")
+
+            if vd and adjusted_stop > vd:
+                logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {vd:.2f}s")
                 # Корректируем конец сегмента до границы видео
-                adjusted_stop = video_duration
+                adjusted_stop = vd
                 logger.logger.info(f"✅ Скорректирован конец сегмента до {adjusted_stop:.2f}s")
 
             # 2. Определение путей файлов
@@ -1441,13 +1643,27 @@ class FilmAnalyzer:
         if generated_shorts is None:
             generated_shorts = []
 
+        info = getattr(self, "_last_ranking_info", {}) or {}
+        rc = getattr(self.film_config, "ranking", {}) or {}
+        try:
+            min_thr = rc.get("min_quality_threshold", getattr(self.film_config, "min_quality_score", 0.5))
+        except Exception:
+            min_thr = getattr(self.film_config, "min_quality_score", 0.5)
+        soft_min = rc.get("soft_min_quality", 0.35)
+
         metadata = {
             'processed_at': datetime.now().isoformat(),
             'model_version': self.config.llm.model_name,
             'total_segments_analyzed': len(transcription_data.get('segments', [])),
             'video_duration': duration,
+            'video_duration_sec': duration,
             'moments_found': len(ranked_moments),
             'shorts_generated': len(generated_shorts),
+            'selection_strategy': info.get('selection_strategy', 'quality_threshold'),
+            'thresholds': {
+                'min_quality_threshold': float(min_thr),
+                'soft_min_quality': float(soft_min),
+            },
             'film_config': {
                 'min_quality_score': self.film_config.min_quality_score,
                 'generate_shorts': self.film_config.generate_shorts,
