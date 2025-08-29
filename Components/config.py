@@ -40,16 +40,16 @@ class FilmModeConfig:
     enabled: bool = True
     combo_duration: list = field(default_factory=lambda: [10, 20])  # секунды для COMBO моментов
     single_duration: list = field(default_factory=lambda: [30, 60])  # секунды для SINGLE моментов
-    max_moments: int = 15  # монолитный режим: максимум моментов для анализа (для коротких видео)
+    max_moments: int = 50  # монолитный режим: максимум моментов для анализа (увеличено для Film Mode v2)
     pause_threshold: float = 0.7  # порог для определения длинных пауз (секунды)
     filler_words: list = field(default_factory=lambda: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"])  # слова-заполнители
     min_quality_score: float = 0.5  # минимальный порог качества для включения момента
     generate_shorts: bool = True  # генерировать шорты из найденных моментов
 
     # Оконный сбор кандидатов (LLM-sweep)
-    window_minutes: int = 12
-    window_overlap_minutes: int = 3
-    max_moments_per_window: int = 6
+    window_minutes: int = 8   # Уменьшен для большего числа окон
+    window_overlap_minutes: int = 2  # Уменьшен для лучшего покрытия
+    max_moments_per_window: int = 10  # Увеличено для большего числа моментов на окно
 
     # Цели и лимиты генерации
     target_shorts_count: int = 30
@@ -77,11 +77,11 @@ class FilmModeConfig:
 
     # Пороговые настройки ранжирования и fallback
     ranking: dict = field(default_factory=lambda: {
-        'min_quality_threshold': 0.5,
-        'soft_min_quality': 0.35,
+        'min_quality_threshold': 0.3,  # Уменьшен порог для включения большего числа моментов
+        'soft_min_quality': 0.2,       # Уменьшен мягкий порог
         'allow_fallback': True,
-        'fallback_top_n': 2,
-        'max_best_moments': 30,
+        'fallback_top_n': 12,          # Увеличено для гарантии 12+ моментов
+        'max_best_moments': 50,        # Увеличено для поддержки большего числа моментов
     })
 
     # Настройки LLM для анализа фильма

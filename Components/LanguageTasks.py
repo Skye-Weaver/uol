@@ -199,6 +199,109 @@ def call_llm_with_retry(
     if last_err is not None:
         raise last_err
 
+
+def call_llm_with_film_mode_retry(
+    system_instruction: Optional[str],
+    content: List | str,
+    generation_config,
+    model: Optional[str] = None,
+    max_api_attempts: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 60.0,
+):
+    """
+    Улучшенная версия call_llm_with_retry для Film Mode с поддержкой 503 UNAVAILABLE ошибок.
+
+    Особенности:
+    - Увеличено количество попыток до 5
+    - Экспоненциальная задержка с jitter для 503 ошибок
+    - Специальная обработка ResourceExhausted и 503 ошибок
+    - Более детальное логирование для отладки
+    """
+    model_to_use = model or globals().get("model")
+
+    # Нормализуем contents
+    if isinstance(content, list):
+        contents = content
+    else:
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=str(content))])]
+
+    last_err: Optional[Exception] = None
+
+    for api_try in range(1, max_api_attempts + 1):
+        try:
+            print(f"[FILM_MODE_RETRY] Попытка {api_try}/{max_api_attempts} для модели {model_to_use}")
+
+            # system_instruction ожидается внутри generation_config
+            response = client.models.generate_content(
+                model=model_to_use,
+                contents=contents,
+                config=generation_config,
+            )
+
+            print(f"[FILM_MODE_RETRY] Успешный ответ на попытке {api_try}")
+            return response
+
+        except Exception as e:
+            last_err = e
+            error_text = str(e).lower()
+            error_type = type(e).__name__
+
+            print(f"[FILM_MODE_RETRY] Ошибка на попытке {api_try}: {error_type} - {str(e)[:200]}...")
+
+            # Обработка ResourceExhausted (429 Too Many Requests)
+            if _is_resource_exhausted_error(e):
+                delay = parse_retry_delay_seconds(e)
+                if delay is None:
+                    delay = min(base_delay * (2 ** (api_try - 1)), max_delay)
+                    print(f"[FILM_MODE_RETRY] Используем экспоненциальную задержку: {delay} сек")
+
+                if api_try < max_api_attempts:
+                    print(f"[FILM_MODE_RETRY] ResourceExhausted: пауза {delay} сек перед попыткой {api_try+1}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print("[FILM_MODE_RETRY] Превышено максимальное количество попыток для ResourceExhausted")
+                    raise
+
+            # Обработка 503 UNAVAILABLE ошибок
+            elif "503" in error_text or "unavailable" in error_text or "service unavailable" in error_text:
+                delay = min(base_delay * (2 ** (api_try - 1)), max_delay)
+                # Добавляем jitter для предотвращения одновременных повторных попыток
+                import random
+                jitter = random.uniform(0.1, 1.0)
+                delay += jitter
+
+                if api_try < max_api_attempts:
+                    print(f"[FILM_MODE_RETRY] 503 UNAVAILABLE: пауза {delay:.1f} сек перед попыткой {api_try+1}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print("[FILM_MODE_RETRY] Превышено максимальное количество попыток для 503 UNAVAILABLE")
+                    raise
+
+            # Обработка других ошибок (500, 502, etc.)
+            elif any(code in error_text for code in ["500", "502", "504", "internal", "bad gateway", "gateway timeout"]):
+                delay = min(base_delay * (2 ** (api_try - 1)), max_delay)
+
+                if api_try < max_api_attempts:
+                    print(f"[FILM_MODE_RETRY] Серверная ошибка: пауза {delay:.1f} сек перед попыткой {api_try+1}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print("[FILM_MODE_RETRY] Превышено максимальное количество попыток для серверной ошибки")
+                    raise
+
+            # Для остальных ошибок (400, 401, etc.) - не повторяем
+            else:
+                print(f"[FILM_MODE_RETRY] Необрабатываемая ошибка {error_type}, прекращаем попытки")
+                raise
+
+    # Если дошли сюда - значит все попытки исчерпаны
+    if last_err is not None:
+        print(f"[FILM_MODE_RETRY] Все {max_api_attempts} попыток исчерпаны, последняя ошибка: {type(last_err).__name__}")
+        raise last_err
+
 # Вспомогательная функция: безопасная сборка конфигурации генерации с поддержкой Thinking (если доступно в SDK)
 def make_generation_config(system_instruction_text: str, temperature: float = 0.2) -> types.GenerateContentConfig:
     """

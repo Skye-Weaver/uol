@@ -36,14 +36,14 @@ film_mode:
   generate_shorts: true  # ВКЛЮЧЕНА генерация шортов
   combo_duration: [10, 20]  # секунды для COMBO моментов
   single_duration: [30, 60]  # секунды для SINGLE моментов
-  max_moments: 15  # максимальное количество моментов для анализа (монолитный режим)
+  max_moments: 30  # максимальное количество моментов для анализа (монолитный режим)
   pause_threshold: 0.7  # порог для определения длинных пауз (секунды)
   filler_words: ["э-э", "м-м", "ну", "эээ", "гм", "кхм"]  # слова-заполнители для обрезки
 
   # Film Mode v2: Оконный LLM-конвейер для длинных фильмов
   window_minutes: 12  # размер окна в минутах
   window_overlap_minutes: 3  # перекрытие окон в минутах
-  max_moments_per_window: 6  # максимум моментов на окно
+  max_moments_per_window: 12  # максимум моментов на окно
 
   # Цели генерации и лимиты
   target_shorts_count: 30  # целевое количество финальных шортов
@@ -70,10 +70,10 @@ film_mode:
 
   # Настройки ранжирования и fallback
   ranking:
-    min_quality_threshold: 0.5
-    soft_min_quality: 0.35
+    min_quality_threshold: 0.3
+    soft_min_quality: 0.2
     allow_fallback: true
-    fallback_top_n: 2
+    fallback_top_n: 15
     max_best_moments: 30
 
   # Настройки LLM для анализа фильма

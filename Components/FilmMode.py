@@ -15,6 +15,7 @@ from Components.LanguageTasks import (
     build_transcription_prompt,
     GetHighlights,
     call_llm_with_retry,
+    call_llm_with_film_mode_retry,
     make_generation_config
 )
 from Components.Database import VideoDatabase
@@ -356,8 +357,8 @@ class FilmAnalyzer:
             duration = 0.0
 
         try:
-            # Для длительных фильмов — оконный LLM-sweep
-            if duration >= 45 * 60:
+            # АКТИВИРУЕМ ОКОННЫЙ РЕЖИМ ДЛЯ ВСЕХ ФИЛЬМОВ > 10 МИНУТ (было 45 минут)
+            if duration >= 10 * 60:  # 10 минут вместо 45
                 logger.logger.info(f"[WINDOW] Активирован оконный режим извлечения кандидатов (duration={duration:.2f}s)")
                 moments = self._extract_film_moments_windowed(transcription_data)
                 logger.logger.info(f"[WINDOW] Найдено {len(moments)} кандидатов после дедупликации")
@@ -414,7 +415,7 @@ class FilmAnalyzer:
         Для COMBO также добавь:
         - segments: массив суб-сегментов с start/end/text
 
-        Найди до {self.film_config.max_moments} лучших моментов.
+        Найди до {max(self.film_config.max_moments, self.film_config.target_shorts_count)} лучших моментов.
         """
 
         try:
@@ -425,12 +426,13 @@ class FilmAnalyzer:
             generation_config = make_generation_config(system_instruction, temperature=0.3)
             logger.logger.info("✅ Конфигурация генерации создана")
 
-            logger.logger.info("Отправка запроса к LLM через call_llm_with_retry...")
-            response = call_llm_with_retry(
+            logger.logger.info("Отправка запроса к LLM через call_llm_with_film_mode_retry...")
+            response = call_llm_with_film_mode_retry(
                 system_instruction=None,
                 content=transcription,
                 generation_config=generation_config,
                 model=self.film_config.llm_model,
+                max_api_attempts=5,
             )
 
             if not response or not response.text:
@@ -497,7 +499,7 @@ class FilmAnalyzer:
         min_thr_cfg = float(rc.get("min_quality_threshold", getattr(self.film_config, "min_quality_score", 0.5)))
         soft_min = float(rc.get("soft_min_quality", 0.35))
         allow_fb = bool(rc.get("allow_fallback", True))
-        fb_top_n = int(max(1, rc.get("fallback_top_n", 2)))
+        fb_top_n = int(max(1, rc.get("fallback_top_n", 12)))
         max_best_cfg = int(max(1, rc.get("max_best_moments", 30)))
         target_n = int(max(1, getattr(self.film_config, "target_shorts_count", max_best_cfg)))
         bucket_min = int(max(1, getattr(self.film_config, "diversity_bucket_minutes", 5)))
@@ -605,38 +607,75 @@ class FilmAnalyzer:
         return selected
 
     def _calculate_moment_scores(self, moment: FilmMoment) -> Dict[str, float]:
-        """Расчет оценок момента по критериям"""
+        """Расчет оценок момента по критериям (улучшенная версия для Film Mode v2)"""
         scores: Dict[str, float] = {}
 
         text = (moment.text or "").lower()
+        text_length = len(text.split())  # Количество слов
 
-        # Эмоциональные пики и переломы статуса
-        emotional_keywords = ['признание', 'угроза', 'ультиматум', 'увольнение', 'я твой отец', 'ухожу', 'мы всё теряем', 'это был он']
-        scores['emotional_peaks'] = sum(1 for keyword in emotional_keywords if keyword in text) * 2.0
+        # Эмоциональные пики и переломы статуса (расширенный список, повышенные веса)
+        emotional_keywords = ['признание', 'угроза', 'ультиматум', 'увольнение', 'я твой отец', 'ухожу', 'мы всё теряем', 'это был он',
+                             'плач', 'крик', 'злость', 'радость', 'удивление', 'страх', 'обида', 'любовь', 'ненависть',
+                             'отчаяние', 'надежда', 'разочарование', 'триумф', 'поражение', 'предательство', 'спасение']
+        emotional_count = sum(1 for keyword in emotional_keywords if keyword in text)
+        scores['emotional_peaks'] = min(emotional_count * 3.5, 10)  # Увеличен коэффициент
 
-        # Конфликт и эскалация
-        conflict_keywords = ['нет', 'никогда', 'почему', 'хватит', 'оскорбление', 'жесткий', 'отрицание']
-        scores['conflict_escalation'] = sum(1 for keyword in conflict_keywords if keyword in text) * 1.8
+        # Конфликт и эскалация (расширенный список)
+        conflict_keywords = ['нет', 'никогда', 'почему', 'хватит', 'оскорбление', 'жесткий', 'отрицание',
+                           'спор', 'ссора', 'конфликт', 'драка', 'ругань', 'критика', 'претензия', 'ссылка',
+                           'обвинение', 'требование', 'давление', 'напряжение', 'эскалация']
+        conflict_count = sum(1 for keyword in conflict_keywords if keyword in text)
+        scores['conflict_escalation'] = min(conflict_count * 2.8, 10)  # Увеличен коэффициент
 
-        # Панчлайны и остроумие
-        wit_keywords = ['сарказм', 'самоирония', 'панчлайн', 'остроумие', 'шутка', 'юмор']
-        scores['punchlines_wit'] = sum(1 for keyword in wit_keywords if keyword in text) * 1.6
+        # Панчлайны и остроумие (расширенный список)
+        wit_keywords = ['сарказм', 'самоирония', 'панчлайн', 'остроумие', 'шутка', 'юмор', 'ирония',
+                       'насмешка', 'каламбур', 'анекдот', 'прикол', 'смех', 'комедия', 'юмористический']
+        wit_count = sum(1 for keyword in wit_keywords if keyword in text)
+        scores['punchlines_wit'] = min(wit_count * 2.5, 10)  # Увеличен коэффициент
 
-        # Цитатность/мемность
-        meme_keywords = ['запоминающаяся', 'афоризм', 'каламбур', 'слоган', 'крылатая фраза']
-        scores['quotability_memes'] = sum(1 for keyword in meme_keywords if keyword in text) * 1.4
+        # Цитатность/мемность (расширенный список)
+        meme_keywords = ['запоминающаяся', 'афоризм', 'каламбур', 'слоган', 'крылатая фраза', 'цитата',
+                        'мем', 'вирусный', 'тренд', 'хайп', 'легендарный', 'знаменитый', 'классика']
+        meme_count = sum(1 for keyword in meme_keywords if keyword in text)
+        scores['quotability_memes'] = min(meme_count * 2.2, 10)  # Увеличен коэффициент
 
-        # Ставки и цель
-        stakes_keywords = ['если', 'то', 'последний шанс', 'мы либо', 'либо', 'ставки', 'цель']
-        scores['stakes_goals'] = sum(1 for keyword in stakes_keywords if keyword in text) * 1.2
+        # Ставки и цель (расширенный список)
+        stakes_keywords = ['если', 'то', 'последний шанс', 'мы либо', 'либо', 'ставки', 'цель', 'риск',
+                          'опасность', 'выбор', 'решение', 'судьба', 'жизнь', 'смерть', 'выигрыш', 'проигрыш']
+        stakes_count = sum(1 for keyword in stakes_keywords if keyword in text)
+        scores['stakes_goals'] = min(stakes_count * 1.8, 10)  # Увеличен коэффициент
 
-        # Крючки/клиффхэнгеры
-        hook_keywords = ['вопрос', 'недосказанность', 'развязка', 'продолжение', 'что дальше']
-        scores['hooks_cliffhangers'] = sum(1 for keyword in hook_keywords if keyword in text) * 1.0
+        # Крючки/клиффхэнгеры (расширенный список)
+        hook_keywords = ['вопрос', 'недосказанность', 'развязка', 'продолжение', 'что дальше', 'загадка',
+                        'тайна', 'сюрприз', 'неожиданно', 'вдруг', 'поворот', 'интрига']
+        hook_count = sum(1 for keyword in hook_keywords if keyword in text)
+        scores['hooks_cliffhangers'] = min(hook_count * 1.6, 10)  # Увеличен коэффициент
 
-        # Штраф за визуальную зависимость (отрицательный)
+        # Длина текста как бонус (короткие моменты лучше для shorts)
+        duration = moment.end_time - moment.start_time
+        if 10 <= duration <= 60:  # Идеальная длительность для shorts
+            scores['duration_bonus'] = 4.0
+        elif 5 <= duration <= 120:  # Приемлемая длительность
+            scores['duration_bonus'] = 2.0
+        else:
+            scores['duration_bonus'] = 0.0
+
+        # Бонус за разнообразие типов моментов
+        if moment.moment_type == 'COMBO':
+            scores['combo_bonus'] = 3.0  # COMBO моменты более ценны
+        else:
+            scores['combo_bonus'] = 0.0
+
+        # Базовый скор за наличие текста (чтобы не было 0)
+        if text_length > 0:
+            scores['content_bonus'] = min(text_length * 0.15, 3.0)  # Увеличен коэффициент
+        else:
+            scores['content_bonus'] = 0.0
+
+        # Штраф за визуальную зависимость (уменьшен)
         visual_keywords = ['визуально', 'зрительно', 'видно', 'картинка', 'изображение']
-        scores['visual_penalty'] = -sum(1 for keyword in visual_keywords if keyword in text) * 0.5
+        visual_count = sum(1 for keyword in visual_keywords if keyword in text)
+        scores['visual_penalty'] = -visual_count * 0.2  # Уменьшен штраф
 
         # Расширенные метрики: pace/silence из контекста транскрипции
         try:
@@ -645,14 +684,13 @@ class FilmAnalyzer:
             scores['pace_score'] = max(0.0, min(10.0, float(pace)))
             scores['silence_penalty'] = max(0.0, min(10.0, float(sil)))
         except Exception:
-            # по умолчанию 0, если что-то пошло не так
             scores.setdefault('pace_score', 0.0)
             scores.setdefault('silence_penalty', 0.0)
 
-        # Нормализация оценок к шкале 0-10
+        # Финальная нормализация к шкале 0-10
         for key in list(scores.keys()):
             try:
-                scores[key] = min(max(float(scores[key]), 0.0), 10.0)
+                scores[key] = min(max(float(scores[key]), -2), 10)  # Разрешаем небольшие отрицательные значения
             except Exception:
                 scores[key] = 0.0
 
@@ -1877,7 +1915,10 @@ class FilmAnalyzer:
 
         win_min = getattr(self.film_config, "window_minutes", 12)
         ov_min = getattr(self.film_config, "window_overlap_minutes", 3)
-        k_per_win = int(max(1, getattr(self.film_config, "max_moments_per_window", 6)))
+        k_per_win = int(max(1, getattr(self.film_config, "max_moments_per_window", 12)))
+        # Увеличиваем лимит на окно для достижения целевых 30 шортов
+        target_per_window = max(k_per_win, self.film_config.target_shorts_count // 4)  # минимум 4 окна
+        k_per_win = min(target_per_window, 20)  # но не больше 20 на окно
 
         # Общая системная инструкция для окна (нагружаем правилами SINGLE/COMBO)
         def _build_window_system_instruction(w_start: float, w_end: float) -> str:
@@ -1910,6 +1951,7 @@ class FilmAnalyzer:
 - Верни до {k_per_win} лучших моментов ТОЛЬКО в границах окна.
 - Таймкоды указывай абсолютные, соответствующие фильму.
 - Строго JSON без пояснений.
+- Стремись найти максимум качественных моментов для достижения цели в 30 шортов.
 """
 
         # Идем по окнам
@@ -1935,11 +1977,12 @@ class FilmAnalyzer:
                 system_instruction = _build_window_system_instruction(w_start, w_end)
                 generation_config = make_generation_config(system_instruction, temperature=self.film_config.llm_temperature)
 
-                response = call_llm_with_retry(
+                response = call_llm_with_film_mode_retry(
                     system_instruction=None,
                     content=trans_text,
                     generation_config=generation_config,
                     model=self.film_config.llm_model,
+                    max_api_attempts=5,
                 )
                 if not response or not getattr(response, "text", None):
                     logger.logger.warning(f"[WINDOW] пустой ответ LLM на окно {w_start:.2f}-{w_end:.2f}")
