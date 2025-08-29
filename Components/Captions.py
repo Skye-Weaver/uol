@@ -8,7 +8,101 @@ import unicodedata
 from PIL import Image, ImageDraw, ImageFont # Pillow imports for custom font
 from Components.Paths import fonts_path
 from Components.config import get_config
+from Components.Logger import logger
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    import urllib.request
+import tempfile
+import shutil
 
+# Кэш для пути к шрифту Montserrat-Bold
+_FONT_CACHE = None
+
+def find_or_install_font():
+    """
+    Универсальный поиск и установка шрифта Montserrat-Bold.ttf для Google Colab.
+
+    Поиск осуществляется в следующих директориях:
+    - Локальная директория fonts проекта
+    - Системные директории Google Colab (/usr/share/fonts/, /usr/local/share/fonts/, ~/.fonts/)
+
+    Если шрифт не найден, выполняется автоматическое скачивание из Google Fonts
+    и установка в подходящую системную директорию.
+
+    Returns:
+        str: Путь к найденному или установленному шрифту Montserrat-Bold.ttf
+    """
+    global _FONT_CACHE
+
+    # Возвращаем кэшированный результат, если он есть
+    if _FONT_CACHE and os.path.exists(_FONT_CACHE):
+        logger.logger.debug(f"[CAPTIONS] Используется кэшированный шрифт: {_FONT_CACHE}")
+        return _FONT_CACHE
+
+    font_name = "Montserrat-Bold.ttf"
+    font_url = "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Bold.ttf"
+
+    # Директории для поиска (в порядке приоритета)
+    search_dirs = [
+        fonts_path(font_name),  # Локальная директория проекта
+        "/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf",  # Системная директория
+        "/usr/local/share/fonts/truetype/montserrat/Montserrat-Bold.ttf",
+        "/usr/share/fonts/Montserrat-Bold.ttf",  # Общие системные директории
+        "/usr/local/share/fonts/Montserrat-Bold.ttf",
+        os.path.expanduser("~/.fonts/Montserrat-Bold.ttf"),  # Пользовательская директория
+    ]
+
+    # 1. Поиск существующего шрифта
+    for font_path in search_dirs:
+        if os.path.exists(font_path):
+            logger.logger.info(f"[CAPTIONS] Найден шрифт Montserrat-Bold: {font_path}")
+            _FONT_CACHE = font_path
+            return font_path
+
+    logger.logger.info("[CAPTIONS] Шрифт Montserrat-Bold не найден в системных директориях. Выполняю установку...")
+
+    # 2. Попытка автоматической установки
+    try:
+        # Создаем директорию для шрифтов, если её нет
+        user_fonts_dir = os.path.expanduser("~/.fonts")
+        os.makedirs(user_fonts_dir, exist_ok=True)
+
+        font_install_path = os.path.join(user_fonts_dir, font_name)
+
+        # Скачиваем шрифт
+        logger.logger.info(f"[CAPTIONS] Скачиваю шрифт из: {font_url}")
+        if REQUESTS_AVAILABLE:
+            response = requests.get(font_url, timeout=30)
+            response.raise_for_status()
+            font_data = response.content
+        else:
+            # Fallback to urllib
+            with urllib.request.urlopen(font_url, timeout=30) as response:
+                font_data = response.read()
+
+        # Сохраняем шрифт
+        with open(font_install_path, 'wb') as f:
+            f.write(font_data)
+
+        logger.logger.info(f"[CAPTIONS] Шрифт успешно установлен: {font_install_path}")
+
+        # Обновляем кэш системных шрифтов (для Linux систем)
+        try:
+            subprocess.run(['fc-cache', '-f', '-v'], check=True, capture_output=True)
+            logger.logger.debug("[CAPTIONS] Кэш системных шрифтов обновлен")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.logger.warning("[CAPTIONS] Предупреждение: не удалось обновить кэш системных шрифтов (fc-cache)")
+
+        _FONT_CACHE = font_install_path
+        return font_install_path
+
+    except Exception as e:
+        logger.logger.error(f"[CAPTIONS] Ошибка при установке шрифта: {e}")
+        logger.logger.warning("[CAPTIONS] Будет использован шрифт по умолчанию")
+        return None
 # Epsilon for time comparisons (inclusive start, exclusive end)
 EPS_TIME = 1e-6
 # pure helper for unit tests and reuse
@@ -84,8 +178,31 @@ def sanitize_display_text(s: str) -> str:
     cleaned = "".join(ch for ch in tmp2 if not unicodedata.category(ch).startswith("P"))
     return cleaned
 
+# Function to escape special characters for ASS format
+def escape_ass_text(text: str) -> str:
+    """
+    Escape special characters in ASS subtitle text.
+    ASS requires escaping of \, {, } characters.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+
 # Function to generate ASS content (more compatible with ffmpeg filter)
 def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, video_w=None, video_h=None):
+    """
+    Генерирует ASS-контент с использованием найденного шрифта Montserrat-Bold.
+    """
+    logger.logger.debug("[CAPTIONS] Начало генерации ASS-контента субтитров")
+
+    # Получаем путь к шрифту Montserrat-Bold
+    font_path = find_or_install_font()
+    font_family = "Montserrat-Bold"  # Имя семейства шрифта для ASS
+
+    if font_path:
+        logger.logger.debug(f"[CAPTIONS] ASS генерация использует шрифт: {font_path}")
+    else:
+        logger.logger.warning("[CAPTIONS] Предупреждение: шрифт Montserrat-Bold не найден, ASS может использовать системный шрифт по умолчанию")
     """
     Генерирует ASS-контент. Обратная совместимость сохранена:
     - При style_cfg is None — используются прежние константы (PlayRes 384x720, Fontsize=36, цвета/отступы как раньше).
@@ -216,9 +333,9 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         f"OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         f"ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         f"MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,Montserrat-Bold,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
+        f"Style: Default,{font_family},{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
         f"-1,0,0,0,100,100,{spacing_val},0,1,{outline},{shadow_val},{alignment},{margin_l},{margin_r},{margin_v},1\n"
-        f"Style: Fallback,Montserrat-Bold,{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
+        f"Style: Fallback,{font_family},{font_size},{primary_colour},&H000000FF,{outline_colour},{back_colour},"
         f"-1,0,0,0,100,100,{spacing_val},0,1,{outline},{shadow_val},{alignment},{margin_l},{margin_r},{margin_v},1\n"
         f"\n"
         f"[Events]\n"
@@ -233,6 +350,7 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
         _strip_punct = True
         _align_to_audio = True
 
+    processed_segments = 0
     for segment in transcriptions:
         text, seg_start, seg_end = segment
         if str(text).strip() == '[*]':
@@ -260,14 +378,19 @@ def generate_ass_content(transcriptions, start_time, end_time, style_cfg=None, v
             line_text = sanitized.strip().upper()
             ass_content += (
                 f"Dialogue: 0,{format_time_ass(relative_start)},{format_time_ass(relative_end)},"
-                f"Default,,0,0,0,,{line_text}\\N"
+                f"Default,,0,0,0,,{escape_ass_text(line_text)}\\N"
             )
+            processed_segments += 1
 
+    logger.logger.debug(f"[CAPTIONS] Обработано {processed_segments} сегментов для ASS-контента")
+    logger.logger.debug(f"[CAPTIONS] Завершена генерация ASS-контента, размер: {len(ass_content)} символов")
     return ass_content
 
 # Function to burn captions using FFmpeg
 def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_time, end_time, output_path, style_cfg=None):
     """Burns captions onto the vertical video using audio from the source segment."""
+    logger.logger.info(f"[CAPTIONS] Начало наложения субтитров на видео: {os.path.basename(output_path)}")
+
     # Create temp ASS file in the same directory as output to avoid path issues
     output_dir = os.path.dirname(os.path.abspath(output_path))
     temp_ass_filename = f"temp_subtitles_{os.path.basename(output_path).replace('.', '_')}.ass"
@@ -280,17 +403,23 @@ def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_
         if cap.isOpened():
             vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            logger.logger.debug(f"[CAPTIONS] Размеры входного видео: {vw}x{vh}")
         if cap:
             cap.release()
-    except Exception:
+    except Exception as e:
         vw, vh = None, None
+        logger.logger.warning(f"[CAPTIONS] Не удалось получить размеры видео {vertical_video_path}: {e}")
 
     try:
         # Create an ASS subtitle file (more compatible than SRT for styling)
+        logger.logger.info("[CAPTIONS] Генерация ASS-контента субтитров")
         ass_content = generate_ass_content(transcriptions, start_time, end_time, style_cfg=style_cfg, video_w=vw, video_h=vh)
 
-        if not ass_content.count("Dialogue:"):
-            print("No relevant transcriptions found for the highlight duration. Using video without captions.")
+        dialogue_count = ass_content.count("Dialogue:")
+        logger.logger.debug(f"[CAPTIONS] Сгенерировано {dialogue_count} диалогов в ASS-контенте")
+
+        if not dialogue_count:
+            logger.logger.warning("[CAPTIONS] Не найдено релевантных транскрипций для выделенного фрагмента. Создание видео без субтитров.")
             # Need to add audio even if no captions are burned
             ffmpeg_command_no_subs = [
                 'ffmpeg',
@@ -305,33 +434,41 @@ def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_
                 '-y',
                 output_path
             ]
-            print("Running FFmpeg command (no subtitles, adding audio):")
-            cmd_string = ' '.join([str(arg) for arg in ffmpeg_command_no_subs])
-            print(f"Command: {cmd_string}")
+            logger.logger.info("[CAPTIONS] Запуск FFmpeg команды (без субтитров, добавление аудио)")
+            logger.logger.debug(f"[CAPTIONS] Команда FFmpeg: {' '.join(ffmpeg_command_no_subs)}")
             process = subprocess.run(ffmpeg_command_no_subs, check=True, capture_output=True, text=True)
-            print(f"Successfully muxed audio into: {output_path}")
+            logger.logger.info(f"[CAPTIONS] Успешно объединено аудио в: {output_path}")
             return True # Return true as the operation (adding audio) succeeded
 
-        # Write the ASS content to the output directory
-        with open(temp_ass_path, 'w', encoding='utf-8') as f:
+        # Write the ASS content to the output directory with UTF-8-BOM for FFmpeg compatibility
+        with open(temp_ass_path, 'w', encoding='utf-8-sig') as f:
             f.write(ass_content)
 
-        print(f"Generated subtitle file: {temp_ass_path}")
+        logger.logger.info(f"[CAPTIONS] Сгенерирован файл субтитров: {temp_ass_path}")
 
         # Verify ASS file was created and has content
-        if not os.path.exists(temp_ass_path) or os.path.getsize(temp_ass_path) == 0:
-            print(f"Error: ASS file was not created properly: {temp_ass_path}")
+        if not os.path.exists(temp_ass_path):
+            logger.logger.error(f"[CAPTIONS] Ошибка: файл ASS не существует: {temp_ass_path}")
             return False
-
-        # Use relative path from output directory for better compatibility
+        file_size = os.path.getsize(temp_ass_path)
+        if file_size == 0:
+            logger.logger.error(f"[CAPTIONS] Ошибка: файл ASS пустой: {temp_ass_path}")
+            return False
+        logger.logger.debug(f"[CAPTIONS] Файл ASS создан успешно: {temp_ass_path} (размер: {file_size} байт, кодировка: UTF-8-BOM)")
+        # Log first few lines of ASS content for debugging
         try:
-            # Try relative path first (more reliable)
-            ass_relative_path = os.path.relpath(temp_ass_path, output_dir)
-            # Escape single quotes in path for FFmpeg
-            ass_path_escaped = ass_relative_path.replace("'", "\\'")
-        except Exception:
-            # Fallback to absolute path with proper escaping
-            ass_path_escaped = temp_ass_path.replace("'", "\\'").replace("\\", "\\\\")
+            with open(temp_ass_path, 'r', encoding='utf-8-sig') as f:
+                lines = f.readlines()[:10]  # First 10 lines
+                logger.logger.debug("[CAPTIONS] Предварительный просмотр содержимого ASS файла:")
+                for i, line in enumerate(lines, 1):
+                    logger.logger.debug(f"[CAPTIONS]   {i}: {line.strip()}")
+                if len(lines) == 10:
+                    logger.logger.debug("[CAPTIONS]   ... (обрезано)")
+        except Exception as e:
+            logger.logger.warning(f"[CAPTIONS] Предупреждение: не удалось прочитать ASS файл для логирования: {e}")
+
+        # Use absolute path for better compatibility with FFmpeg
+        ass_path_escaped = temp_ass_path.replace("'", "\\'")
 
         # FFmpeg command using two inputs and mapping streams
         ffmpeg_command = [
@@ -353,34 +490,67 @@ def burn_captions(vertical_video_path, audio_source_path, transcriptions, start_
         ]
 
         # Print the command for debugging
-        print("Running FFmpeg command (burning subtitles and adding audio):")
+        logger.logger.info("[CAPTIONS] Запуск FFmpeg команды (наложение субтитров и добавление аудио)")
+        logger.logger.debug(f"[CAPTIONS] Путь к ASS файлу для FFmpeg: {ass_path_escaped}")
         cmd_string = ' '.join([str(arg) for arg in ffmpeg_command])
-        print(f"Command: {cmd_string}")
+        logger.logger.debug(f"[CAPTIONS] Команда FFmpeg: {cmd_string}")
 
         # Run FFmpeg with the new command
-        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-        print(f"Successfully burned captions and added audio into: {output_path}")
-        return True
+        try:
+            process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+            logger.logger.info(f"[CAPTIONS] Успешно наложены субтитры и добавлено аудио в: {output_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            # Check if error is related to ASS processing
+            stderr_str = str(e.stderr).lower()
+            if "ass=" in stderr_str or "subtitle" in stderr_str or "fopen" in stderr_str:
+                logger.logger.warning("[CAPTIONS] Предупреждение: обработка ASS субтитров не удалась. Попытка фолбэка без субтитров.")
+                logger.logger.debug(f"[CAPTIONS] FFmpeg stderr: {e.stderr}")
+                # Fallback: create video without subtitles
+                fallback_command = [
+                    'ffmpeg',
+                    '-i', vertical_video_path,
+                    '-i', audio_source_path,
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                    '-c:v', 'copy',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-shortest',
+                    '-y',
+                    output_path
+                ]
+                try:
+                    subprocess.run(fallback_command, check=True, capture_output=True, text=True)
+                    logger.logger.info(f"[CAPTIONS] Успешно создано видео без субтитров: {output_path}")
+                    return True
+                except subprocess.CalledProcessError as fallback_e:
+                    logger.logger.error(f"[CAPTIONS] Фолбэк также не удался: {fallback_e}")
+                    logger.logger.debug(f"[CAPTIONS] Fallback stderr: {fallback_e.stderr}")
+                    return False
+            else:
+                # Re-raise if not ASS-related
+                raise
 
     except subprocess.CalledProcessError as e:
-        print(f"Error running FFmpeg: {e}")
-        print(f"FFmpeg stdout: {e.stdout}")
-        print(f"FFmpeg stderr: {e.stderr}")
+        logger.logger.error(f"[CAPTIONS] Ошибка запуска FFmpeg: {e}")
+        logger.logger.debug(f"[CAPTIONS] FFmpeg stdout: {e.stdout}")
+        logger.logger.debug(f"[CAPTIONS] FFmpeg stderr: {e.stderr}")
         # Check if error is related to ASS processing
         if "ass=" in str(e.stderr) or "subtitle" in str(e.stderr).lower():
-            print("Warning: ASS subtitle processing failed. This might be due to font issues or ASS format problems.")
+            logger.logger.warning("[CAPTIONS] Предупреждение: обработка ASS субтитров не удалась. Возможные проблемы с шрифтами или форматом ASS.")
         return False
     except Exception as e:
-        print(f"An error occurred during caption burning: {e}")
+        logger.logger.error(f"[CAPTIONS] Произошла ошибка при наложении субтитров: {e}")
         return False
     finally:
         # Always clean up the subtitle file
         if os.path.exists(temp_ass_path):
             try:
                 os.remove(temp_ass_path)
-                print(f"Removed temporary subtitle file: {temp_ass_path}")
+                logger.logger.debug(f"[CAPTIONS] Удален временный файл субтитров: {temp_ass_path}")
             except Exception as e:
-                print(f"Warning: Could not remove temporary subtitle file: {e}")
+                logger.logger.warning(f"[CAPTIONS] Предупреждение: не удалось удалить временный файл субтитров: {e}")
 
 
 # --- Word-Level Animation Helpers ---
@@ -426,6 +596,8 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
     """Creates a video with word-by-word highlighted captions based on segments.
     - tone/keywords heuristic via optional highlight_meta for accent coloring
     """
+    logger.logger.info(f"[CAPTIONS] Начало анимации субтитров для: {os.path.basename(output_path)}")
+
     temp_animated_video = output_path + "_temp_anim.mp4"
     success = False
     cap = None
@@ -490,17 +662,18 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
             except Exception:
                 pass
 
-        font_path = fonts_path("Montserrat-Bold.ttf")
+        # Используем универсальную функцию поиска шрифта
+        font_path = find_or_install_font()
         font = None
         try:
-            if os.path.exists(font_path):
+            if font_path and os.path.exists(font_path):
                 font = ImageFont.truetype(font_path, font_size)
-                print(f"Successfully loaded font: {font_path}")
+                logger.logger.debug(f"[CAPTIONS] Успешно загружен шрифт: {font_path}")
             else:
-                print(f"Font file not found at {font_path}. Using PIL default font.")
+                logger.logger.warning("[CAPTIONS] Файл шрифта не найден. Используется шрифт PIL по умолчанию.")
                 font = ImageFont.load_default()
         except Exception as e:
-            print(f"Warning: could not load TTF font at {font_path}: {e}. Using PIL default font.")
+            logger.logger.warning(f"[CAPTIONS] Предупреждение: не удалось загрузить TTF шрифт: {e}. Используется шрифт PIL по умолчанию.")
             font = ImageFont.load_default()
 
         # --- Pre-filter segments ---
@@ -513,21 +686,23 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
         transcription_result_filtered = transcription_result.copy() # Avoid modifying original dict directly if reused
         transcription_result_filtered['segments'] = filtered_segments
 
-        print("Starting animated caption generation (Static Window/Highlight Style)...")
+        logger.logger.info("[CAPTIONS] Запуск генерации анимированных субтитров (статическое окно/подсветка)")
+        logger.logger.debug(f"[CAPTIONS] Отфильтровано сегментов: {len(filtered_segments)} из {len(original_segments)}")
+
         cap = cv2.VideoCapture(vertical_video_path)
         if not cap.isOpened():
-            print(f"Error: Cannot open video file {vertical_video_path}")
+            logger.logger.error(f"[CAPTIONS] Ошибка: невозможно открыть видеофайл {vertical_video_path}")
             return False
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0: # Handle zero or negative fps
-             print(f"Error: Invalid video FPS ({fps}), cannot calculate time.")
-             cap.release() # Release resource
-             return False
+              logger.logger.error(f"[CAPTIONS] Ошибка: некорректный FPS видео ({fps}), невозможно рассчитать время")
+              cap.release() # Release resource
+              return False
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"Input video properties: {width}x{height} @ {fps:.2f}fps")
+        logger.logger.debug(f"[CAPTIONS] Свойства входного видео: {width}x{height} @ {fps:.2f}fps, кадров: {total_frames}")
 
         # --- Text Styling (Pillow) ---
         # Base color
@@ -842,9 +1017,10 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(temp_animated_video, fourcc, fps, (width, height))
         if not out.isOpened():
-            print(f"Error: Could not open video writer for {temp_animated_video}")
+            logger.logger.error(f"[CAPTIONS] Ошибка: невозможно открыть VideoWriter для {temp_animated_video}")
             cap.release() # Release resource
             return False
+        logger.logger.debug(f"[CAPTIONS] Создан VideoWriter для временного файла: {temp_animated_video}")
 
         # Read strip_punctuation flag from config (default True for backward compatibility)
         try:
@@ -855,6 +1031,7 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
         frame_count = 0
         drawn_any_text = False
+        logger.logger.debug("[CAPTIONS] Начало обработки кадров видео")
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -1241,16 +1418,16 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
             out.write(frame)
             frame_count += 1
             if frame_count % 100 == 0:
-                 print(f"Processed {frame_count}/{total_frames} frames for animation...")
+                  logger.logger.debug(f"[CAPTIONS] Обработано {frame_count}/{total_frames} кадров для анимации...")
 
-        print("Finished processing frames for animation.")
+        logger.logger.debug(f"[CAPTIONS] Завершена обработка кадров: {frame_count} кадров обработано")
 
     except Exception as e:
-        print(f"Error during caption animation loop: {e}")
-        traceback.print_exc() # Print detailed traceback
+        logger.logger.error(f"[CAPTIONS] Ошибка во время цикла анимации субтитров: {e}")
+        logger.logger.debug(f"[CAPTIONS] Подробный traceback: {traceback.format_exc()}")
         success = False
     finally:
-        print("Releasing video resources...")
+        logger.logger.debug("[CAPTIONS] Освобождение видеоресурсов...")
         if cap and cap.isOpened():
             cap.release()
         if out and out.isOpened():
@@ -1258,59 +1435,59 @@ def animate_captions(vertical_video_path, audio_source_path, transcription_resul
 
         # Proceed with muxing only if frames were processed, some text was drawn, and temp file exists
         if drawn_any_text and frame_count > 0 and os.path.exists(temp_animated_video):
-             try:
-                 print("Muxing audio into animated video...")
-                 ffmpeg_mux_command = [
-                     'ffmpeg',
-                     '-i', temp_animated_video,
-                     '-i', audio_source_path,
-                     '-map', '0:v:0',
-                     '-map', '1:a:0',
-                     '-c:v', 'copy',
-                     '-c:a', 'aac',
-                     '-b:a', '128k',
-                     '-shortest',
-                     '-y',
-                     output_path
-                 ]
-                 cmd_string = ' '.join([str(arg) for arg in ffmpeg_mux_command])
-                 print(f"Mux Command: {cmd_string}")
-                 process = subprocess.run(ffmpeg_mux_command, check=True, capture_output=True, text=True, timeout=300)
-                 print(f"Successfully created animated caption video: {output_path}")
-                 success = True
-             except subprocess.TimeoutExpired:
-                 print("Error: FFmpeg muxing timed out.")
-                 success = False
-             except subprocess.CalledProcessError as mux_e:
-                  print(f"Error during audio muxing (FFmpeg): {mux_e}")
-                  print(f"FFmpeg stdout: {mux_e.stdout}")
-                  print(f"FFmpeg stderr: {mux_e.stderr}")
+              try:
+                  logger.logger.info("[CAPTIONS] Объединение аудио с анимированным видео...")
+                  ffmpeg_mux_command = [
+                      'ffmpeg',
+                      '-i', temp_animated_video,
+                      '-i', audio_source_path,
+                      '-map', '0:v:0',
+                      '-map', '1:a:0',
+                      '-c:v', 'copy',
+                      '-c:a', 'aac',
+                      '-b:a', '128k',
+                      '-shortest',
+                      '-y',
+                      output_path
+                  ]
+                  cmd_string = ' '.join([str(arg) for arg in ffmpeg_mux_command])
+                  logger.logger.debug(f"[CAPTIONS] Команда mux: {cmd_string}")
+                  process = subprocess.run(ffmpeg_mux_command, check=True, capture_output=True, text=True, timeout=300)
+                  logger.logger.info(f"[CAPTIONS] Успешно создано видео с анимированными субтитрами: {output_path}")
+                  success = True
+              except subprocess.TimeoutExpired:
+                  logger.logger.error("[CAPTIONS] Ошибка: таймаут FFmpeg muxing.")
                   success = False
-             except Exception as mux_e:
-                  print(f"An unexpected error occurred during audio muxing: {mux_e}")
-                  success = False
-             finally:
-                 # Ensure cleanup even if muxing fails
-                 if os.path.exists(temp_animated_video):
-                     try:
-                         os.remove(temp_animated_video)
-                         print(f"Removed temporary animated video: {temp_animated_video}")
-                     except Exception as e_clean:
-                         print(f"Warning: Could not remove temp animated file: {e_clean}")
+              except subprocess.CalledProcessError as mux_e:
+                   logger.logger.error(f"[CAPTIONS] Ошибка при объединении аудио (FFmpeg): {mux_e}")
+                   logger.logger.debug(f"[CAPTIONS] FFmpeg stdout: {mux_e.stdout}")
+                   logger.logger.debug(f"[CAPTIONS] FFmpeg stderr: {mux_e.stderr}")
+                   success = False
+              except Exception as mux_e:
+                   logger.logger.error(f"[CAPTIONS] Непредвиденная ошибка при объединении аудио: {mux_e}")
+                   success = False
+              finally:
+                  # Ensure cleanup even if muxing fails
+                  if os.path.exists(temp_animated_video):
+                      try:
+                          os.remove(temp_animated_video)
+                          logger.logger.debug(f"[CAPTIONS] Удален временный анимированный видео файл: {temp_animated_video}")
+                      except Exception as e_clean:
+                          logger.logger.warning(f"[CAPTIONS] Предупреждение: не удалось удалить временный анимированный файл: {e_clean}")
         elif frame_count > 0 and os.path.exists(temp_animated_video):
-             print("No text was drawn on any frame; skipping audio muxing for animated captions.")
-             success = False
-             # Cleanup temp animated video file
-             try:
-                 os.remove(temp_animated_video)
-                 print(f"Removed temporary animated video: {temp_animated_video}")
-             except Exception as e_clean:
-                 print(f"Warning: Could not remove temp animated file: {e_clean}")
+              logger.logger.warning("[CAPTIONS] Текст не был отрисован ни на одном кадре; пропуск объединения аудио для анимированных субтитров.")
+              success = False
+              # Cleanup temp animated video file
+              try:
+                  os.remove(temp_animated_video)
+                  logger.logger.debug(f"[CAPTIONS] Удален временный анимированный видео файл: {temp_animated_video}")
+              except Exception as e_clean:
+                  logger.logger.warning(f"[CAPTIONS] Предупреждение: не удалось удалить временный анимированный файл: {e_clean}")
         elif not os.path.exists(temp_animated_video) and frame_count > 0:
-             print(f"Error: Temp animated video file {temp_animated_video} not found, cannot mux audio.")
-             success = False
+              logger.logger.error(f"[CAPTIONS] Ошибка: временный анимированный видео файл {temp_animated_video} не найден, невозможно объединить аудио.")
+              success = False
         else: # frame_count == 0 or initial error before loop
-             print("Skipping audio muxing due to processing error or no frames processed.")
-             success = False # Ensure success is false if animation failed early
+              logger.logger.warning("[CAPTIONS] Пропуск объединения аудио из-за ошибки обработки или отсутствия кадров.")
+              success = False # Ensure success is false if animation failed early
 
     return success
