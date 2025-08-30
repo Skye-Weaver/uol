@@ -24,7 +24,7 @@ from Components.Transcription import prepare_words_for_segment
 from Components.Database import VideoDatabase
 from Components.config import get_config, AppConfig
 from Components.Logger import logger
-from Components.Edit import crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions, concatenate_videos
+from Components.Edit import crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
 from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
 from Components.Paths import build_short_output_name
 from faster_whisper import WhisperModel
@@ -388,7 +388,7 @@ class FilmAnalyzer:
 
             logger.logger.info("Анализ моментов через LLM (монолитный вызов)...")
             moments = self._extract_film_moments(transcription_text)
-            logger.logger.info(f"Найдено {len(moments)} потенциальных моментов")
+            logger.logger.info(f"Найдено {len(mомents)} потенциальных моментов")
             return moments
         except Exception as e:
             logger.logger.error(f"Ошибка при анализе моментов: {e}")
@@ -1000,8 +1000,6 @@ class FilmAnalyzer:
                     'end': moment.end_time,
                     'caption_with_hashtags': f"Film Moment {rm.rank}: {moment.text[:100]}...",
                     'segment_text': moment.text,
-                    'moment_type': moment.moment_type,
-                    'segments': moment.segments,
                     '_seq': i + 1,
                     '_total': len(top_moments)
                 }
@@ -1389,13 +1387,12 @@ class FilmAnalyzer:
         return MockProcessingContext(video_path, video_id, transcription_data, width, height, self.config)
 
     def _process_moment_to_short(self, ctx, highlight_item, seq: int) -> Optional[str]:
-        """Обработка момента в шорт (ИСПРАВЛЕНО для поддержки COMBO моментов)"""
+        """Обработка момента в шорт (ИСПРАВЛЕНО для поддержки анимированных субтитров)"""
         logger.logger.info(f"--- НАЧАЛО ОБРАБОТКИ МОМЕНТА {seq} ---")
 
         final_output = None
         temp_segment = None
         cropped_vertical = None
-        temp_sub_segments = []  # Для хранения временных суб-сегментов COMBO
 
         try:
             # 1. Извлечение и валидация таймкодов
@@ -1412,7 +1409,7 @@ class FilmAnalyzer:
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
             # Используем централизованную функцию для имен
             final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
-
+            
             output_base = f"{base_name}_film_moment_{seq}"
             temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
             cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
@@ -1425,61 +1422,14 @@ class FilmAnalyzer:
             logger.logger.info(f"  Вертикальный кроп: {cropped_vertical}")
             logger.logger.info(f"  Финальный шорт: {final_output}")
 
-            # Получить информацию о моменте для определения типа
-            moment_type = highlight_item.get('moment_type', 'SINGLE')
-            segments = highlight_item.get('segments', [])
-
             # --- ШАГ 1: Извлечение сегмента видео ---
-            if moment_type == 'COMBO' and segments:
-                logger.logger.info(f"Обработка COMBO момента с {len(segments)} суб-сегментами")
-                # Извлечь каждый суб-сегмент
-                sub_segment_files = []
-                for i, seg in enumerate(segments):
-                    try:
-                        seg_start = float(seg.get('start', 0))
-                        seg_end = float(seg.get('end', 0))
-                        if seg_end <= seg_start:
-                            logger.logger.warning(f"Пропускаем некорректный суб-сегмент {i}: {seg_start}-{seg_end}")
-                            continue
-
-                        sub_temp_file = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_sub_{i}.mp4")
-                        temp_sub_segments.append(sub_temp_file)
-
-                        extract_success = self._extract_video_segment(
-                            ctx.video_path, sub_temp_file, seg_start, seg_end, ctx.initial_width, ctx.initial_height
-                        )
-                        if extract_success:
-                            sub_segment_files.append(sub_temp_file)
-                            logger.logger.debug(f"Извлечен суб-сегмент {i}: {seg_start:.2f}s-{seg_end:.2f}s")
-                        else:
-                            logger.logger.warning(f"Не удалось извлечь суб-сегмент {i}")
-
-                    except Exception as e:
-                        logger.logger.warning(f"Ошибка при обработке суб-сегмента {i}: {e}")
-                        continue
-
-                if not sub_segment_files:
-                    logger.logger.error(f"❌ Не удалось извлечь ни один суб-сегмент для COMBO момента {seq}")
-                    return None
-
-                # Соединить суб-сегменты
-                concat_success = concatenate_videos(sub_segment_files, temp_segment)
-                if not concat_success:
-                    logger.logger.error(f"❌ Не удалось соединить суб-сегменты для момента {seq}")
-                    self._cleanup_temp_files(temp_sub_segments, f" после неудачной конкатенации {seq}")
-                    return None
-
-                logger.logger.info(f"✅ Успешно соединено {len(sub_segment_files)} суб-сегментов")
-
-            else:
-                # Обычное извлечение для SINGLE
-                extract_success = self._extract_video_segment(
-                    ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
-                )
-                if not extract_success:
-                    logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
-                    self._cleanup_temp_files([temp_segment], f" после неудачного извлечения сегмента {seq}")
-                    return None
+            extract_success = self._extract_video_segment(
+                ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
+            )
+            if not extract_success:
+                logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
+                self._cleanup_temp_files([temp_segment], f" после неудачного извлечения сегмента {seq}")
+                return None
 
             # --- ШАГ 2: Создание вертикального кропа ---
             crop_mode = ctx.cfg.processing.crop_mode
@@ -1563,9 +1513,7 @@ class FilmAnalyzer:
             return None
         finally:
             # Очистка временных файлов
-            cleanup_files = [temp_segment, cropped_vertical]
-            cleanup_files.extend(temp_sub_segments)  # Добавить суб-сегменты для COMBO
-            self._cleanup_temp_files(cleanup_files, f" после обработки момента {seq}")
+            self._cleanup_temp_files([temp_segment, cropped_vertical], f" после обработки момента {seq}")
 
     def _safe_file_operation(self, operation_name: str, operation_func, *args, **kwargs) -> Optional[Any]:
         """Безопасное выполнение файловой операции с graceful degradation"""
