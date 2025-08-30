@@ -29,6 +29,7 @@ from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_a
 from Components.Paths import build_short_output_name
 from faster_whisper import WhisperModel
 import math
+import subprocess
 
 
 @dataclass
@@ -98,9 +99,14 @@ class FilmAnalyzer:
         logger.logger.info("Начало анализа фильма в режиме 'фильм'")
 
         # 1. Получение видео и транскрибация
-        video_path, transcription_data = self._get_video_and_transcription(url, local_path)
-        if not video_path or not transcription_data:
-            raise ValueError("Не удалось получить видео или транскрибацию")
+        try:
+            video_path, transcription_data = self._get_video_and_transcription(url, local_path)
+            if not video_path or not transcription_data:
+                logger.logger.error("Не удалось получить видео или транскрибацию")
+                return self._create_empty_result("")
+        except Exception as e:
+            logger.logger.error(f"Ошибка при получении видео и транскрибации: {e}")
+            return self._create_empty_result("")
 
         # Логируем информацию о полученных данных + единое разрешение длительности
         segments_count = len(transcription_data.get('segments', []))
@@ -994,20 +1000,9 @@ class FilmAnalyzer:
                 if duration < 1.0:
                     logger.logger.warning(f"⚠️ Момент слишком короткий: {duration:.2f}s (минимум 1.0s)")
 
-                # Создаем структуру highlight для совместимости с process_highlight
-                highlight_item = {
-                    'start': moment.start_time,
-                    'end': moment.end_time,
-                    'caption_with_hashtags': f"Film Moment {rm.rank}: {moment.text[:100]}...",
-                    'segment_text': moment.text,
-                    '_seq': i + 1,
-                    '_total': len(top_moments)
-                }
-                logger.logger.debug(f"Создан highlight_item: {highlight_item}")
-
                 # Генерируем шорт
                 logger.logger.info(f"Вызов _process_moment_to_short для момента {rm.rank}")
-                short_path = self._process_moment_to_short(processing_context, highlight_item, i + 1)
+                short_path = self._process_moment_to_short(processing_context, moment, i + 1)
 
                 if short_path:
                     generated_shorts.append(short_path)
@@ -1105,6 +1100,21 @@ class FilmAnalyzer:
                 elif len(moment.segments) < 2:
                     issues.append(f"COMBO момент с недостаточным количеством сегментов: {len(moment.segments)}")
                     is_valid = False
+                else:
+                    # Валидация суб-сегментов
+                    for i, seg in enumerate(moment.segments):
+                        if not isinstance(seg, dict):
+                            issues.append(f"Суб-сегмент {i} не является словарем")
+                            is_valid = False
+                            continue
+                        seg_start = seg.get('start')
+                        seg_end = seg.get('end')
+                        if seg_start is None or seg_end is None:
+                            issues.append(f"Суб-сегмент {i} без start/end")
+                            is_valid = False
+                        elif seg_end <= seg_start:
+                            issues.append(f"Суб-сегмент {i} имеет некорректный интервал: {seg_start} >= {seg_end}")
+                            is_valid = False
 
             if is_valid:
                 valid_moments.append(moment)
@@ -1386,24 +1396,67 @@ class FilmAnalyzer:
 
         return MockProcessingContext(video_path, video_id, transcription_data, width, height, self.config)
 
-    def _process_moment_to_short(self, ctx, highlight_item, seq: int) -> Optional[str]:
-        """Обработка момента в шорт (ИСПРАВЛЕНО для поддержки анимированных субтитров)"""
+    def _process_moment_to_short(self, ctx, moment: FilmMoment, seq: int) -> Optional[str]:
+        """Обработка момента в шорт с поддержкой склеивания суб-сегментов для COMBO"""
         logger.logger.info(f"--- НАЧАЛО ОБРАБОТКИ МОМЕНТА {seq} ---")
 
         final_output = None
-        temp_segment = None
-        cropped_vertical = None
+        temp_segments = []
+        cropped_verticals = []
 
         try:
-            # 1. Извлечение и валидация таймкодов
-            start = float(highlight_item["start"])
-            stop = float(highlight_item["end"])
-            adjusted_stop = math.ceil(stop)
-            logger.logger.info(f"Таймкоды: {start:.2f}s - {adjusted_stop:.2f}s (округлено с {stop:.2f}s)")
+            # 1. Определение типа момента и таймкодов
+            if moment.moment_type == 'COMBO' and moment.segments:
+                # Для COMBO обрабатываем суб-сегменты
+                logger.logger.info(f"Обработка COMBO момента с {len(moment.segments)} суб-сегментами")
+                segment_outputs = []
 
-            if adjusted_stop <= start:
-                logger.logger.error(f"❌ Некорректные таймкоды: start={start} >= end={adjusted_stop}")
-                return None
+                for sub_idx, sub_seg in enumerate(moment.segments):
+                    try:
+                        sub_start = float(sub_seg.get('start', 0))
+                        sub_end = float(sub_seg.get('end', 0))
+                        sub_text = sub_seg.get('text', '')
+
+                        if sub_end <= sub_start:
+                            logger.logger.warning(f"Пропуск некорректного суб-сегмента {sub_idx}: {sub_start} >= {sub_end}")
+                            continue
+
+                        # Обработка суб-сегмента
+                        sub_output = self._process_single_segment(ctx, sub_start, sub_end, sub_text, seq, sub_idx)
+                        if sub_output:
+                            segment_outputs.append(sub_output)
+                        else:
+                            logger.logger.warning(f"Не удалось обработать суб-сегмент {sub_idx}")
+
+                    except Exception as e:
+                        logger.logger.warning(f"Ошибка при обработке суб-сегмента {sub_idx}: {e}")
+                        continue
+
+                if not segment_outputs:
+                    logger.logger.error(f"❌ Не удалось обработать ни один суб-сегмент для COMBO момента {seq}")
+                    return None
+
+                # Склеивание суб-сегментов
+                final_output = self._concatenate_segments(segment_outputs, seq, ctx)
+                if not final_output:
+                    logger.logger.error(f"❌ Не удалось склеить суб-сегменты для момента {seq}")
+                    return None
+
+            else:
+                # Для SINGLE обрабатываем как один сегмент
+                start = float(moment.start_time)
+                stop = float(moment.end_time)
+                adjusted_stop = math.ceil(stop)
+                logger.logger.info(f"Таймкоды SINGLE: {start:.2f}s - {adjusted_stop:.2f}s (округлено с {stop:.2f}s)")
+
+                if adjusted_stop <= start:
+                    logger.logger.error(f"❌ Некорректные таймкоды: start={start} >= end={adjusted_stop}")
+                    return None
+
+                final_output = self._process_single_segment(ctx, start, adjusted_stop, moment.text, seq, 0)
+                if not final_output:
+                    logger.logger.error(f"❌ Не удалось обработать SINGLE момент {seq}")
+                    return None
 
             # 2. Определение путей файлов
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
@@ -1506,6 +1559,19 @@ class FilmAnalyzer:
                 logger.logger.error(f"❌ Не удалось добавить субтитры для момента {seq}")
                 return None
 
+            # Финализация
+            if final_output:
+                logger.logger.info(f"✅ Успешно обработан момент {seq}. Финальный файл: {final_output}")
+                ctx.db.add_highlight(
+                    ctx.video_id, moment.start_time, moment.end_time, final_output,
+                    segment_text=moment.text,
+                    caption_with_hashtags=f"Film Moment {seq}: {moment.text[:100]}..."
+                )
+                return final_output
+            else:
+                logger.logger.error(f"❌ Не удалось обработать момент {seq}")
+                return None
+
         except Exception as e:
             logger.logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке момента {seq}: {e}")
             import traceback
@@ -1513,7 +1579,121 @@ class FilmAnalyzer:
             return None
         finally:
             # Очистка временных файлов
-            self._cleanup_temp_files([temp_segment, cropped_vertical], f" после обработки момента {seq}")
+            self._cleanup_temp_files(temp_segments + cropped_verticals, f" после обработки момента {seq}")
+
+    def _process_single_segment(self, ctx, start: float, end: float, text: str, seq: int, sub_idx: int = 0) -> Optional[str]:
+        """Обработка одного сегмента видео (извлечение, кроп, субтитры)"""
+        temp_segment = None
+        cropped_vertical = None
+
+        try:
+            # 2. Определение путей файлов
+            base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
+            output_base = f"{base_name}_film_moment_{seq}"
+            if sub_idx > 0:
+                output_base += f"_sub{sub_idx}"
+
+            temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
+            cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
+            final_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_final.mp4")
+
+            os.makedirs(ctx.cfg.processing.videos_dir, exist_ok=True)
+
+            # 3. Извлечение сегмента видео
+            extract_success = self._extract_video_segment(
+                ctx.video_path, temp_segment, start, end, ctx.initial_width, ctx.initial_height
+            )
+            if not extract_success:
+                logger.logger.error(f"❌ Не удалось извлечь сегмент {start:.2f}s-{end:.2f}s")
+                return None
+
+            # 4. Создание вертикального кропа
+            crop_mode = ctx.cfg.processing.crop_mode
+            crop_function = crop_to_70_percent_with_blur if crop_mode == "70_percent_blur" else crop_to_vertical_average_face
+
+            vert_crop_path = self._safe_file_operation(
+                f"создание вертикального кропа для сегмента {start:.2f}s-{end:.2f}s",
+                crop_function,
+                temp_segment, cropped_vertical
+            )
+            if not vert_crop_path:
+                logger.logger.error(f"❌ Не удалось создать вертикальный кроп для сегмента {start:.2f}s-{end:.2f}s")
+                return None
+
+            # 5. Добавление субтитров
+            captioning_success = self._add_captions_to_short(
+                cropped_vertical, final_segment,
+                ctx.transcription_segments, start, end
+            )
+
+            if captioning_success:
+                logger.logger.debug(f"✅ Успешно обработан сегмент {start:.2f}s-{end:.2f}s: {final_segment}")
+                return final_segment
+            else:
+                logger.logger.error(f"❌ Не удалось добавить субтитры к сегменту {start:.2f}s-{end:.2f}s")
+                return None
+
+        except Exception as e:
+            logger.logger.error(f"❌ Ошибка при обработке сегмента {start:.2f}s-{end:.2f}s: {e}")
+            return None
+        finally:
+            # Очистка временных файлов для этого сегмента
+            self._cleanup_temp_files([temp_segment, cropped_vertical], f" после обработки сегмента {sub_idx}")
+
+    def _concatenate_segments(self, segment_paths: List[str], seq: int, ctx) -> Optional[str]:
+        """Склеивание нескольких видео сегментов в один файл"""
+        if not segment_paths:
+            return None
+
+        if len(segment_paths) == 1:
+            # Если только один сегмент, просто возвращаем его
+            return segment_paths[0]
+
+        try:
+            # Создаем финальный путь
+            base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
+            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
+            os.makedirs(ctx.cfg.processing.shorts_dir, exist_ok=True)
+
+            # Создаем список файлов для конкатенации
+            concat_list_path = os.path.join(ctx.cfg.processing.videos_dir, f"concat_list_{seq}.txt")
+
+            with open(concat_list_path, 'w', encoding='utf-8') as f:
+                for path in segment_paths:
+                    # Для ffmpeg concat нужно экранировать пути
+                    escaped_path = path.replace("'", "\\'")
+                    f.write(f"file '{escaped_path}'\n")
+
+            # Выполняем конкатенацию через ffmpeg
+            import subprocess
+            cmd = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_path,
+                "-c", "copy",
+                "-y",
+                final_output
+            ]
+
+            logger.logger.info(f"Склеивание {len(segment_paths)} сегментов в {final_output}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                logger.logger.info(f"✅ Успешно склеено {len(segment_paths)} сегментов")
+                # Очистка списка конкатенации
+                try:
+                    os.remove(concat_list_path)
+                except:
+                    pass
+                return final_output
+            else:
+                logger.logger.error(f"❌ Ошибка при склеивании сегментов: {result.stderr}")
+                return None
+
+        except Exception as e:
+            logger.logger.error(f"❌ Исключение при склеивании сегментов: {e}")
+            return None
 
     def _safe_file_operation(self, operation_name: str, operation_func, *args, **kwargs) -> Optional[Any]:
         """Безопасное выполнение файловой операции с graceful degradation"""

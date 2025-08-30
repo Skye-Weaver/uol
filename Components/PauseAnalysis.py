@@ -6,6 +6,7 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 import json
+import re
 import hashlib
 import os
 from datetime import datetime, timedelta
@@ -55,6 +56,8 @@ class IntelligentPauseAnalyzer:
     """
 
     def __init__(self, config: IntelligentPauseAnalysisConfig):
+        if not isinstance(config, IntelligentPauseAnalysisConfig):
+            raise TypeError(f"Expected IntelligentPauseAnalysisConfig, got {type(config)}")
         self.config = config
         self.cache = {}  # Простой in-memory кеш
         self._load_cache_from_disk()
@@ -541,6 +544,10 @@ def create_intelligent_pause_analyzer() -> IntelligentPauseAnalyzer:
     Создает экземпляр IntelligentPauseAnalyzer с настройками из конфигурации.
     """
     config = get_config()
+    if not hasattr(config, 'film_mode') or config.film_mode is None:
+        raise ValueError("Конфигурация film_mode отсутствует")
+    if not hasattr(config.film_mode, 'intelligent_pause_analysis') or config.film_mode.intelligent_pause_analysis is None:
+        raise ValueError("Конфигурация intelligent_pause_analysis отсутствует")
     return IntelligentPauseAnalyzer(config.film_mode.intelligent_pause_analysis)
 
 
