@@ -212,7 +212,7 @@ def create_shorts_video(
     - Никакого pad=color=black
     - Сведение: [bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p
     - Совместимость контейнера: -pix_fmt yuv420p, -map 0:a? -c:a copy
-    - OUT_W:OUT_H = 213:274
+    - OUT_W:OUT_H = 720:1280
     - Обратная совместимость параметров crop_width_percentage, left_crop_percent, right_crop_percent
     """
     try:
@@ -223,7 +223,7 @@ def create_shorts_video(
             return False
 
         # 2) Целевые размеры кадра и внутренняя логика кропа
-        OUT_W, OUT_H = 213, 274  # Требуемые целевые размеры кадра
+        OUT_W, OUT_H = 720, 1280  # Требуемые целевые размеры кадра
         # Вычисляем ширину и смещение кропа
         if left_crop_percent is not None and right_crop_percent is not None:
             crop_width = int(original_width * (1.0 - left_crop_percent - right_crop_percent))
@@ -237,12 +237,12 @@ def create_shorts_video(
 
         # 3) Построение filter_complex:
         #    - Фон: из того же 0:v, растянуть до OUT_W:OUT_H, размыть, выровнять SAR
-        #    - Контент: кроп по логике выше, затем масштаб по высоте до OUT_H с сохранением AR, выровнять SAR
+        #    - Контент: кроп по логике выше, затем масштаб до fit в OUT_W:OUT_H с сохранением AR, выровнять SAR
         #    - Оверлей: центрировать, shortest=1, финально привести к yuv420p
         filter_complex = (
             f"[0:v]split=2[fg_src][bg_src];"
             f"[bg_src]scale={OUT_W}:{OUT_H}:flags=bicubic,boxblur=20:1,setsar=1[bg];"
-            f"[fg_src]crop={crop_width}:{crop_height}:{crop_x}:0,scale=-2:{OUT_H},setsar=1[fg];"
+            f"[fg_src]crop={crop_width}:{crop_height}:{crop_x}:0,scale='min({OUT_W}/iw,{OUT_H}/ih)*iw':'min({OUT_W}/iw,{OUT_H}/ih)*ih',setsar=1[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p[vout]"
         )
 
@@ -284,6 +284,69 @@ def create_shorts_video(
     except Exception as e:
         print(f"An unexpected error occurred during shorts creation: {e}")
         logger.logger.error(f"Unexpected error in create_shorts_video: {e}")
+def concatenate_videos(input_files, output_file):
+    """
+    Concatenates multiple video files into one using FFmpeg.
+
+    Args:
+        input_files: List of input video file paths
+        output_file: Output video file path
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        if not input_files:
+            print("Error: No input files provided for concatenation.")
+            return False
+
+        if len(input_files) == 1:
+            # If only one file, just copy it
+            import shutil
+            shutil.copy2(input_files[0], output_file)
+            print(f"Single file copied to: {output_file}")
+            return True
+
+        # Create a temporary file list for FFmpeg concat
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for input_file in input_files:
+                f.write(f"file '{input_file}'\n")
+            list_file = f.name
+
+        try:
+            ffmpeg_command = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', list_file,
+                '-c', 'copy',  # Copy streams without re-encoding
+                '-y',
+                output_file
+            ]
+
+            print("Running FFmpeg command for video concatenation:")
+            cmd_string = ' '.join([str(arg) for arg in ffmpeg_command])
+            print(f"Command: {cmd_string}")
+
+            process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+            print(f"Successfully concatenated videos to: {output_file}")
+            return True
+
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(list_file)
+            except:
+                pass
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg during concatenation: {e}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"An error occurred during video concatenation: {e}")
+        return False
         return False
 
 # Example usage:

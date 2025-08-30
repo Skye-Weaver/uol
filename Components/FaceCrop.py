@@ -213,9 +213,8 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
     print(f"Input: {original_width}x{original_height} @ {fps:.2f}fps")
 
     # Calculate target 9:16 width
-    vertical_height = original_height
-    vertical_width = int(vertical_height * 9 / 16)
-    if vertical_width % 2 != 0: vertical_width -= 1
+    vertical_height = 1280
+    vertical_width = 720
 
     if original_width < vertical_width or vertical_width <= 0:
         print("Error: Original width too small for vertical crop.")
@@ -347,9 +346,9 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
 
     print(f"Original dimensions: {original_width}x{original_height}")
 
-    # Calculate final 9:16 dimensions based on original height
-    final_height = original_height
-    final_width = int(final_height * 9 / 16)
+    # Calculate final 9:16 dimensions
+    final_height = 1280
+    final_width = 720
 
     # Ensure final dimensions are even (required by some codecs)
     if final_width % 2 != 0:
@@ -357,9 +356,9 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
 
     print(f"Final 9:16 dimensions: {final_width}x{final_height}")
 
-    # Calculate 70% width crop for content (maintain 213:274 aspect ratio)
+    # Calculate 70% width crop for content (maintain 9:16 aspect ratio)
     content_width = int(original_width * 0.7)
-    content_aspect_ratio = 213 / 274  # ≈ 0.777
+    content_aspect_ratio = 9 / 16  # ≈ 0.5625
     content_height = min(int(content_width / content_aspect_ratio), original_height)
 
     # Ensure content dimensions are even
@@ -368,7 +367,7 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     if content_height % 2 != 0:
         content_height -= 1
 
-    print(f"Content crop dimensions (70% width, 213:274 aspect): {content_width}x{content_height}")
+    print(f"Content crop dimensions (70% width, 9:16 aspect): {content_width}x{content_height}")
 
     # Calculate scaling for content to fit in final frame while maintaining aspect ratio
     scale_factor = min(final_width / content_width, final_height / content_height)

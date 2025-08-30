@@ -72,6 +72,15 @@ class IntelligentPauseAnalysisConfig:
         "fallback_to_legacy": True  # Откат на старую логику при ошибках ИИ
     })
 
+    def get(self, key: str, default=None):
+        """
+        Метод для совместимости с кодом, который использует объект как словарь.
+        Возвращает значение атрибута по имени или значение по умолчанию.
+        """
+        if hasattr(self, key):
+            return getattr(self, key)
+        return default
+
 
 @dataclass
 class FilmModeConfig:
