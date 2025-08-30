@@ -20,7 +20,7 @@ from Components.LanguageTasks import (
     compute_tone_and_keywords,
     compute_emojis_for_segment
 )
-from Components.main import prepare_words_for_segment
+from Components.Transcription import prepare_words_for_segment
 from Components.Database import VideoDatabase
 from Components.config import get_config, AppConfig
 from Components.Logger import logger
