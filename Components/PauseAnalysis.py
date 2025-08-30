@@ -174,7 +174,8 @@ class IntelligentPauseAnalyzer:
                 # Проверяем лимиты API
                 if self._should_apply_rate_limit():
                     import time
-                    delay = self.config.api_optimization.get('rate_limit_delay', 1.0)
+                    api_opt = self.config.api_optimization if isinstance(self.config.api_optimization, dict) else {}
+                    delay = api_opt.get('rate_limit_delay', 1.0)
                     logger.logger.debug(f"Применяем задержку API: {delay}с")
                     time.sleep(delay)
 
@@ -535,7 +536,8 @@ class IntelligentPauseAnalyzer:
         Определяет, нужно ли применять ограничение частоты запросов.
         """
         # Простая логика: применяем задержку после каждого батча
-        return self.config.api_optimization.get('use_batch_processing', True)
+        api_opt = self.config.api_optimization if isinstance(self.config.api_optimization, dict) else {}
+        return api_opt.get('use_batch_processing', True)
 
 
 # Вспомогательные функции

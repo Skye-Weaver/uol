@@ -371,33 +371,63 @@ class FilmAnalyzer:
             # АКТИВИРУЕМ ОКОННЫЙ РЕЖИМ ДЛЯ ВСЕХ ФИЛЬМОВ > 10 МИНУТ (было 45 минут)
             if duration >= 10 * 60:  # 10 минут вместо 45
                 logger.logger.info(f"[WINDOW] Активирован оконный режим извлечения кандидатов (duration={duration:.2f}s)")
-                moments = self._extract_film_moments_windowed(transcription_data)
-                logger.logger.info(f"[WINDOW] Найдено {len(moments)} кандидатов после дедупликации")
-                return moments
+                try:
+                    moments = self._extract_film_moments_windowed(transcription_data)
+                    if moments is None:
+                        logger.logger.warning("[WINDOW] Не удалось извлечь моменты в оконном режиме")
+                        return []
+                    logger.logger.info(f"[WINDOW] Найдено {len(moments)} кандидатов после дедупликации")
+                    return moments
+                except Exception as e:
+                    logger.logger.error(f"Ошибка в оконном режиме анализа моментов: {e}")
+                    return []
 
             # Короткие видео: прежняя монолитная логика
             segments_legacy = transcription_data.get('segments', [])
+            if not segments_legacy:
+                logger.logger.warning("Отсутствуют сегменты транскрибации для анализа")
+                return []
+
             segments_dict = []
             for seg in segments_legacy:
-                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
-                    segments_dict.append({
-                        'text': str(seg[0]),
-                        'start': float(seg[1]),
-                        'end': float(seg[2])
-                    })
-                elif isinstance(seg, dict):
-                    segments_dict.append(seg)
+                try:
+                    if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                        segments_dict.append({
+                            'text': str(seg[0]),
+                            'start': float(seg[1]),
+                            'end': float(seg[2])
+                        })
+                    elif isinstance(seg, dict):
+                        segments_dict.append(seg)
+                except Exception as e:
+                    logger.logger.debug(f"Ошибка при обработке сегмента: {e}, пропускаем")
+                    continue
+
+            if not segments_dict:
+                logger.logger.warning("Не удалось преобразовать сегменты транскрибации")
+                return []
 
             logger.logger.info("Формирование текста транскрибации через build_transcription_prompt...")
-            transcription_text = build_transcription_prompt(segments_dict)
-            logger.logger.info(f"✅ Текст транскрибации сформирован: {len(transcription_text)} символов")
+            try:
+                transcription_text = build_transcription_prompt(segments_dict)
+                logger.logger.info(f"✅ Текст транскрибации сформирован: {len(transcription_text)} символов")
+            except Exception as e:
+                logger.logger.error(f"Ошибка при формировании текста транскрибации: {e}")
+                return []
 
             logger.logger.info("Анализ моментов через LLM (монолитный вызов)...")
-            moments = self._extract_film_moments(transcription_text)
-            logger.logger.info(f"Найдено {len(mомents)} потенциальных моментов")
-            return moments
+            try:
+                moments = self._extract_film_moments(transcription_text)
+                if moments is None:
+                    logger.logger.warning("Не удалось извлечь моменты из транскрибации")
+                    return []
+                logger.logger.info(f"Найдено {len(moments)} потенциальных моментов")
+                return moments
+            except Exception as e:
+                logger.logger.error(f"Ошибка при извлечении моментов через LLM: {e}")
+                return []
         except Exception as e:
-            logger.logger.error(f"Ошибка при анализе моментов: {e}")
+            logger.logger.error(f"Критическая ошибка при анализе моментов: {e}")
             return []
 
     def _extract_film_moments(self, transcription: str) -> List[FilmMoment]:

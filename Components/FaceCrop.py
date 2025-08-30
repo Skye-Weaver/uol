@@ -347,9 +347,9 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
 
     print(f"Original dimensions: {original_width}x{original_height}")
 
-    # Calculate final 9:16 dimensions based on original height
-    final_height = original_height
-    final_width = int(final_height * 9 / 16)
+    # Calculate final dimensions: fixed 213x274 for content
+    final_width = 213
+    final_height = 274
 
     # Ensure final dimensions are even (required by some codecs)
     if final_width % 2 != 0:
@@ -375,11 +375,15 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     scaled_content_width = int(content_width * scale_factor)
     scaled_content_height = int(content_height * scale_factor)
 
-    # Ensure scaled dimensions are even
+    # Ensure scaled dimensions are even to prevent banding/artifacts
     if scaled_content_width % 2 != 0:
         scaled_content_width -= 1
     if scaled_content_height % 2 != 0:
         scaled_content_height -= 1
+
+    # Ensure minimum dimensions to avoid scaling issues
+    scaled_content_width = max(scaled_content_width, 2)
+    scaled_content_height = max(scaled_content_height, 2)
 
     print(f"Scaled content dimensions: {scaled_content_width}x{scaled_content_height}")
 
