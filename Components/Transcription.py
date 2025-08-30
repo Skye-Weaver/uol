@@ -7,6 +7,7 @@ from Components.Logger import logger, timed_operation
 import json
 from pathlib import Path
 from Components.config import get_config
+from Components.Paths import resolve_path
 
 
 # Старые функции транскрипции (`transcribeAudio`, `transcribe_word_level_full`)
@@ -133,7 +134,7 @@ def transcribe_unified(audio_path, model):
         # Экспорт артефактов транскрипции на диск
         try:
             cfg = get_config()
-            out_dir = getattr(cfg.processing, "transcriptions_dir", "transcriptions")
+            out_dir = resolve_path(cfg.processing.transcriptions_dir)
             base_name = Path(audio_path).stem
             export_transcription_artifacts(base_name, word_level_transcription, out_dir)
         except Exception as ex:

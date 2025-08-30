@@ -16,8 +16,11 @@ from Components.LanguageTasks import (
     GetHighlights,
     call_llm_with_retry,
     call_llm_with_film_mode_retry,
-    make_generation_config
+    make_generation_config,
+    compute_tone_and_keywords,
+    compute_emojis_for_segment
 )
+from Components.main import prepare_words_for_segment
 from Components.Database import VideoDatabase
 from Components.config import get_config, AppConfig
 from Components.Logger import logger
@@ -1384,411 +1387,133 @@ class FilmAnalyzer:
         return MockProcessingContext(video_path, video_id, transcription_data, width, height, self.config)
 
     def _process_moment_to_short(self, ctx, highlight_item, seq: int) -> Optional[str]:
-        """Обработка момента в шорт (упрощенная версия process_highlight)"""
+        """Обработка момента в шорт (ИСПРАВЛЕНО для поддержки анимированных субтитров)"""
         logger.logger.info(f"--- НАЧАЛО ОБРАБОТКИ МОМЕНТА {seq} ---")
 
-        # Инициализация переменных перед try-блоком
         final_output = None
         temp_segment = None
         cropped_vertical = None
 
         try:
             # 1. Извлечение и валидация таймкодов
-            logger.logger.debug("--- ИЗВЛЕЧЕНИЕ ТАЙМКОДОВ ---")
             start = float(highlight_item["start"])
             stop = float(highlight_item["end"])
-            logger.logger.info(f"Исходные таймкоды: {start:.2f}s - {stop:.2f}s")
+            adjusted_stop = math.ceil(stop)
+            logger.logger.info(f"Таймкоды: {start:.2f}s - {adjusted_stop:.2f}s (округлено с {stop:.2f}s)")
 
-            # Корректировка длительности
-            adjusted_stop = stop
             if adjusted_stop <= start:
-                adjusted_stop = start + 1.0
-                logger.logger.warning(f"⚠️ Скорректирована длительность: {start:.2f}s - {adjusted_stop:.2f}s (было <= start)")
-
-            duration = adjusted_stop - start
-            logger.logger.info(f"Финальные таймкоды: {start:.2f}s - {adjusted_stop:.2f}s")
-            logger.logger.info(f"Длительность сегмента: {duration:.2f}s")
-
-            # Проверяем границы видео, используя только ctx.video_duration
-            try:
-                logger.logger.info(f"[VALIDATION] ctx.video_duration={float(ctx.video_duration):.2f}")
-            except Exception:
-                logger.logger.info(f"[VALIDATION] ctx.video_duration={ctx.video_duration}")
-
-            # Автоматическая переоценка источника длительности, если значение сомнительное
-            try:
-                vd = float(getattr(ctx, "video_duration", 0.0) or 0.0)
-            except Exception:
-                vd = 0.0
-
-            # Оценка длины транскрипции для диагностики
-            trans_guess = 0.0
-            try:
-                wl = getattr(ctx, "word_level_transcription", {}) or {}
-                if isinstance(wl, dict) and isinstance(wl.get('segments'), list) and wl['segments']:
-                    trans_guess = max(float(s.get('end', 0.0) or 0.0) for s in wl['segments'])
-                elif getattr(ctx, "transcription_segments", None):
-                    ends = []
-                    for seg in ctx.transcription_segments:
-                        if isinstance(seg, (list, tuple)) and len(seg) >= 3:
-                            ends.append(float(seg[2]))
-                        elif isinstance(seg, dict):
-                            ends.append(float(seg.get('end', 0.0) or 0.0))
-                    if ends:
-                        trans_guess = max(ends)
-            except Exception:
-                pass
-
-            if vd <= 0 or (vd < 60 and trans_guess > 600):
-                logger.logger.error("[DURATION] Некорректная/подозрительно малая ctx.video_duration. Переключаемся на альтернативный источник (ffprobe).")
-                try:
-                    alt = float(self._get_video_duration(ctx.video_path) or 0.0)
-                    if alt > 0:
-                        ctx.video_duration = alt
-                        vd = alt
-                        logger.logger.info(f"[DURATION] ctx.video_duration обновлена из ffprobe: {vd:.2f}s")
-                except Exception as _e:
-                    logger.logger.error(f"[DURATION] Не удалось получить длительность через ffprobe: {_e}")
-
-            if vd and adjusted_stop > vd:
-                logger.logger.warning(f"⚠️ Конец сегмента {adjusted_stop:.2f}s выходит за длительность видео {vd:.2f}s")
-                # Корректируем конец сегмента до границы видео
-                adjusted_stop = vd
-                logger.logger.info(f"✅ Скорректирован конец сегмента до {adjusted_stop:.2f}s")
-
-            # Округление времени окончания short в положительную сторону для полного слова
-            prev_adjusted_stop = adjusted_stop
-            adjusted_stop = math.ceil(adjusted_stop)
-            if adjusted_stop != prev_adjusted_stop:
-                logger.logger.info(f"[Ceil] Rounded up stop from {prev_adjusted_stop:.2f}s to {adjusted_stop:.2f}s")
+                logger.logger.error(f"❌ Некорректные таймкоды: start={start} >= end={adjusted_stop}")
+                return None
 
             # 2. Определение путей файлов
-            logger.logger.info("--- ОПРЕДЕЛЕНИЕ ПУТЕЙ ФАЙЛОВ ---")
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
+            # Используем централизованную функцию для имен
+            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
+            
             output_base = f"{base_name}_film_moment_{seq}"
-            logger.logger.debug(f"base_name: {base_name}, output_base: {output_base}")
-
             temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
             cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
-            # Исправленный вызов build_short_output_name без параметра prefix
-            final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
-            logger.logger.info(f"✅ Сформирован путь финального файла через build_short_output_name: {final_output}")
+
+            os.makedirs(ctx.cfg.processing.videos_dir, exist_ok=True)
+            os.makedirs(ctx.cfg.processing.shorts_dir, exist_ok=True)
 
             logger.logger.info("Пути файлов:")
-            logger.logger.info(f"  Исходное видео: {ctx.video_path}")
             logger.logger.info(f"  Временный сегмент: {temp_segment}")
             logger.logger.info(f"  Вертикальный кроп: {cropped_vertical}")
             logger.logger.info(f"  Финальный шорт: {final_output}")
 
-            # 3. Проверка и создание директорий
-            logger.logger.info("--- ПРОВЕРКА ДИРЕКТОРИЙ ---")
-            videos_dir = ctx.cfg.processing.videos_dir
-            shorts_dir = ctx.cfg.processing.shorts_dir
-            logger.logger.info(f"Директории: videos_dir={videos_dir}, shorts_dir={shorts_dir}")
-
-            # Проверяем videos_dir
-            if not os.path.exists(videos_dir):
-                logger.logger.warning(f"⚠️ Директория videos_dir не существует: {videos_dir}")
-                try:
-                    os.makedirs(videos_dir, exist_ok=True)
-                    logger.logger.info(f"✅ Создана директория videos_dir: {videos_dir}")
-                except Exception as e:
-                    logger.logger.error(f"❌ Не удалось создать videos_dir: {e}")
-                    return None
-            else:
-                logger.logger.debug(f"✅ Директория videos_dir существует: {videos_dir}")
-
-            # Проверяем shorts_dir
-            if not os.path.exists(shorts_dir):
-                logger.logger.warning(f"⚠️ Директория shorts_dir не существует: {shorts_dir}")
-                try:
-                    os.makedirs(shorts_dir, exist_ok=True)
-                    logger.logger.info(f"✅ Создана директория shorts_dir: {shorts_dir}")
-                except Exception as e:
-                    logger.logger.error(f"❌ Не удалось создать shorts_dir: {e}")
-                    return None
-            else:
-                logger.logger.debug(f"✅ Директория shorts_dir существует: {shorts_dir}")
-
-            # 4. Извлечение сегмента видео
-            extract_success = self._safe_file_operation(
-                f"извлечение сегмента видео для момента {seq}",
-                self._extract_video_segment,
+            # --- ШАГ 1: Извлечение сегмента видео ---
+            extract_success = self._extract_video_segment(
                 ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
             )
-
             if not extract_success:
                 logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
-                # Очистка и возврат None
                 self._cleanup_temp_files([temp_segment], f" после неудачного извлечения сегмента {seq}")
                 return None
 
-            logger.logger.info("✅ Шаг 1 УСПЕШЕН: Сегмент извлечен и проверен")
-
-            # 5. Создание вертикального кропа
-            logger.logger.info("--- ШАГ 2: СОЗДАНИЕ ВЕРТИКАЛЬНОГО КРОПА ---")
+            # --- ШАГ 2: Создание вертикального кропа ---
             crop_mode = ctx.cfg.processing.crop_mode
-            logger.logger.info(f"Режим кропа: {crop_mode}")
-            logger.logger.info(f"Входной файл: {temp_segment}")
-            logger.logger.info(f"Выходной файл: {cropped_vertical}")
-
-            # Проверяем существование входного файла для кропа
-            if not os.path.exists(temp_segment):
-                logger.logger.error(f"❌ Входной файл для кропа не найден: {temp_segment}")
-                return None
-            else:
-                input_size = os.path.getsize(temp_segment) / (1024 * 1024)  # MB
-                logger.logger.debug(f"✅ Входной файл существует: {input_size:.2f} MB")
-
-            # Вызываем соответствующую функцию кропа с безопасной обработкой
-            crop_success = False
-            try:
-                if crop_mode == "70_percent_blur":
-                    logger.logger.info("Вызов crop_to_70_percent_with_blur...")
-                    crop_success = self._safe_file_operation(
-                        f"crop_to_70_percent_with_blur для момента {seq}",
-                        crop_to_70_percent_with_blur,
-                        temp_segment, cropped_vertical
-                    )
-                    logger.logger.info(f"Результат crop_to_70_percent_with_blur: {crop_success}")
-                elif crop_mode == "average_face":
-                    logger.logger.info("Вызов crop_to_vertical_average_face...")
-                    crop_success = self._safe_file_operation(
-                        f"crop_to_vertical_average_face для момента {seq}",
-                        crop_to_vertical_average_face,
-                        temp_segment, cropped_vertical
-                    )
-                    logger.logger.info(f"Результат crop_to_vertical_average_face: {crop_success}")
-                else:
-                    logger.logger.warning(f"⚠️ Неизвестный режим кропа: {crop_mode}, используем 70_percent_blur")
-                    crop_success = self._safe_file_operation(
-                        f"crop_to_70_percent_with_blur (fallback) для момента {seq}",
-                        crop_to_70_percent_with_blur,
-                        temp_segment, cropped_vertical
-                    )
-                    logger.logger.info(f"Результат crop_to_70_percent_with_blur (fallback): {crop_success}")
-
-            except Exception as e:
-                logger.logger.error(f"❌ Исключение при кропе: {e}")
-                import traceback
-                logger.logger.error(f"Traceback: {traceback.format_exc()}")
-                crop_success = False
-
-            if not crop_success:
-                logger.logger.error(f"❌ Шаг 2 ПРОВАЛЕН: Не удалось создать вертикальный кроп для момента {seq}")
-                # Очистка временных файлов
-                if os.path.exists(temp_segment):
-                    try:
-                        os.remove(temp_segment)
-                        logger.logger.info(f"Удален временный файл: {temp_segment}")
-                    except Exception as e:
-                        logger.logger.warning(f"Не удалось удалить временный файл: {e}")
-                return None
-            else:
-                logger.logger.info("✅ Функция кропа выполнена успешно")
-
-            # Проверяем результат кропа
-            if not os.path.exists(cropped_vertical):
-                logger.logger.error(f"❌ Файл вертикального кропа не найден: {cropped_vertical}")
-                # Очистка
-                if os.path.exists(temp_segment):
-                    try:
-                        os.remove(temp_segment)
-                        logger.logger.info(f"Удален временный файл: {temp_segment}")
-                    except Exception as e:
-                        logger.logger.warning(f"Не удалось удалить временный файл: {e}")
-                return None
-            else:
-                file_size = os.path.getsize(cropped_vertical) / (1024 * 1024)  # MB
-                logger.logger.info(f"✅ Файл кропа создан: {file_size:.2f} MB")
-
-                # Проверяем, что файл не пустой
-                if file_size < 0.1:  # менее 100KB
-                    logger.logger.error(f"❌ Файл кропа слишком маленький: {file_size:.2f} MB")
-                    # Очистка
-                    for temp_file in [temp_segment, cropped_vertical]:
-                        if os.path.exists(temp_file):
-                            try:
-                                os.remove(temp_file)
-                                logger.logger.info(f"Удален пустой файл: {temp_file}")
-                            except Exception as e:
-                                logger.logger.warning(f"Не удалось удалить файл: {e}")
-                    return None
-                else:
-                    logger.logger.info("✅ Шаг 2 УСПЕШЕН: Вертикальный кроп создан и проверен")
-
-            # 6. Добавление субтитров
-            logger.logger.info("--- ШАГ 3: ДОБАВЛЕНИЕ СУБТИТРОВ ---")
-
-            # Проверяем существование входного файла для субтитров
-            if not os.path.exists(cropped_vertical):
-                logger.logger.error(f"❌ Входной файл для субтитров не найден: {cropped_vertical}")
-                # Очистка
-                for temp_file in [temp_segment]:
-                    if os.path.exists(temp_file):
-                        try:
-                            os.remove(temp_file)
-                            logger.logger.info(f"Удален временный файл: {temp_file}")
-                        except Exception as e:
-                            logger.logger.warning(f"Не удалось удалить временный файл: {e}")
-                return None
-
-            # Подготовка данных транскрибации: нормализация к формату [text, start, end]
-            source_segments = (ctx.transcription_segments or [])
-            if (not source_segments) and isinstance(getattr(ctx, "word_level_transcription", None), dict):
-                wl = ctx.word_level_transcription
-                wls = wl.get("segments") or []
-                if isinstance(wls, list) and wls:
-                    source_segments = wls
-
-            transcription_segments = []
-            norm_ok = 0
-            norm_skipped = 0
-            for seg in source_segments:
-                try:
-                    if isinstance(seg, dict):
-                        text = str(seg.get("text", "") or "")
-                        st = float(seg.get("start", 0.0) or 0.0)
-                        en = float(seg.get("end", 0.0) or 0.0)
-                        if en > st:
-                            transcription_segments.append([text, st, en])
-                            norm_ok += 1
-                        else:
-                            norm_skipped += 1
-                    elif isinstance(seg, (list, tuple)):
-                        # Case A: legacy [text, start, end]
-                        if len(seg) >= 3 and (isinstance(seg[0], (str, bytes))):
-                            text = str(seg[0])
-                            st = float(seg[1] or 0.0)
-                            en = float(seg[2] or 0.0)
-                            if en > st:
-                                transcription_segments.append([text, st, en])
-                                norm_ok += 1
-                            else:
-                                norm_skipped += 1
-                        # Case B: список словарей-подсегментов [{'text', 'start', 'end'}, ...]
-                        elif seg and all(isinstance(s, dict) for s in seg):
-                            texts, starts, ends = [], [], []
-                            for s in seg:
-                                try:
-                                    texts.append(str(s.get("text", "") or ""))
-                                    starts.append(float(s.get("start", 0.0) or 0.0))
-                                    ends.append(float(s.get("end", 0.0) or 0.0))
-                                except Exception:
-                                    continue
-                            if starts and ends:
-                                st = min(starts)
-                                en = max(ends)
-                                if en > st:
-                                    text = " ".join(t for t in texts if t)
-                                    transcription_segments.append([text, st, en])
-                                    norm_ok += 1
-                                else:
-                                    norm_skipped += 1
-                            else:
-                                norm_skipped += 1
-                        else:
-                            norm_skipped += 1
-                    else:
-                        norm_skipped += 1
-                except Exception:
-                    norm_skipped += 1
-                    continue
-
-            logger.logger.info(f"Нормализация сегментов для субтитров: вход={len(source_segments)}, ok={norm_ok}, skipped={norm_skipped}")
-
-            # Вызываем новый метод добавления субтитров с graceful degradation
-            caption_success = self._safe_file_operation(
-                f"добавление субтитров для момента {seq}",
-                self._add_captions_to_short,
-                cropped_vertical, final_output, transcription_segments,
-                start, adjusted_stop, style_cfg=ctx.cfg.captions
+            crop_function = crop_to_70_percent_with_blur if crop_mode == "70_percent_blur" else crop_to_vertical_average_face
+            
+            vert_crop_path = self._safe_file_operation(
+                f"создание вертикального кропа для момента {seq}",
+                crop_function,
+                temp_segment, cropped_vertical
             )
+            if not vert_crop_path:
+                logger.logger.error(f"❌ Не удалось создать вертикальный кроп для момента {seq}")
+                self._cleanup_temp_files([temp_segment], f" после неудачного кропа {seq}")
+                return None
+            
+            # --- ШАГ 3: ДОБАВЛЕНИЕ СУБТИТРОВ (ИСПРАВЛЕНО) ---
+            captioning_success = False
+            use_animated = ctx.cfg.processing.use_animated_captions
 
-            # 7. Обработка результата субтитров и финализация
-            logger.logger.info("--- ОБРАБОТКА РЕЗУЛЬТАТА СУБТИТРОВ ---")
+            logger.logger.info(f"Режим субтитров: {'Анимированные' if use_animated else 'Статичные (ASS)'}")
 
-            # Graceful degradation: если субтитры не удалось добавить, пробуем скопировать видео без субтитров
-            if not caption_success:
-                logger.logger.warning(f"⚠️ Не удалось добавить субтитры, пробуем сохранить видео без субтитров")
-                try:
-                    import shutil
-                    shutil.copy2(cropped_vertical, final_output)
-                    logger.logger.info(f"✅ Видео сохранено без субтитров: {final_output}")
-                    caption_success = True  # Отмечаем как успешное завершение
-                except Exception as e:
-                    logger.logger.error(f"❌ Не удалось сохранить видео без субтитров: {e}")
-                    # Очистка и возврат None
-                    self._cleanup_temp_files([temp_segment, cropped_vertical, final_output],
-                                           f" после неудачи с субтитрами для момента {seq}")
-                    return None
+            if use_animated:
+                # Логика для анимированных субтитров
+                # Подготовка данных на уровне слов для сегмента
+                transcription_result = prepare_words_for_segment(
+                    ctx.word_level_transcription, start, adjusted_stop
+                )
 
-            # Очистка временных файлов
-            temp_files_to_clean = [temp_segment, cropped_vertical]
-            self._cleanup_temp_files(temp_files_to_clean, f" после обработки момента {seq}")
+                if transcription_result and transcription_result.get("segments"):
+                    # Получение метаданных для выделения (тон, ключевые слова, эмодзи)
+                    segment_text = highlight_item.get('segment_text', '')
+                    meta = compute_tone_and_keywords(segment_text) if segment_text else {}
+                    
+                    cfg_emoji = getattr(ctx.cfg.captions, "emoji", None)
+                    if cfg_emoji and getattr(cfg_emoji, "enabled", False) and segment_text:
+                        tone_val = meta.get("tone", "neutral")
+                        max_per = int(getattr(cfg_emoji, "max_per_short", 0) or 0)
+                        emojis = compute_emojis_for_segment(segment_text, tone_val, max_per)
+                        meta["emojis"] = emojis
 
-            if caption_success:
-                logger.logger.info("✅ Субтитры добавлены успешно (или видео сохранено без субтитров)")
-
-                # Проверяем финальный результат
-                if not os.path.exists(final_output):
-                    logger.logger.error(f"❌ Финальный файл шорта не найден: {final_output}")
-                    return None
-                else:
-                    file_size = os.path.getsize(final_output) / (1024 * 1024)  # MB
-                    logger.logger.info(f"✅ Финальный шорт создан: {final_output} ({file_size:.2f} MB)")
-
-                    # Проверяем, что файл не пустой
-                    if file_size < 0.1:  # менее 100KB
-                        logger.logger.error(f"❌ Финальный файл слишком маленький: {file_size:.2f} MB")
-                        try:
-                            os.remove(final_output)
-                            logger.logger.info(f"Удален пустой финальный файл: {final_output}")
-                        except Exception as e:
-                            logger.logger.warning(f"Не удалось удалить пустой файл: {e}")
-                        return None
-
-                # Сохраняем информацию в БД (с graceful degradation)
-                logger.logger.info("Сохранение информации в базу данных...")
-                try:
-                    ctx.db.add_highlight(
-                        ctx.video_id,
-                        start,
-                        adjusted_stop,
+                    captioning_success = animate_captions(
+                        cropped_vertical,
+                        temp_segment,  # Источник аудио
+                        transcription_result,
                         final_output,
-                        segment_text=highlight_item.get('segment_text', ''),
-                        caption_with_hashtags=highlight_item.get('caption_with_hashtags', '')
+                        style_cfg=ctx.cfg.captions,
+                        highlight_meta=meta
                     )
-                    logger.logger.info("✅ Информация успешно сохранена в БД")
-                except Exception as e:
-                    logger.logger.warning(f"⚠️ Не удалось сохранить в БД: {e}")
-                    logger.logger.warning("Продолжаем без сохранения в БД")
-                    import traceback
-                    logger.logger.warning(f"Traceback: {traceback.format_exc()}")
+                else:
+                    logger.logger.warning("Нет данных на уровне слов для анимации, пропуск.")
 
-                logger.logger.info(f"--- МОМЕНТ {seq} ОБРАБОТАН УСПЕШНО ---")
+            else:
+                # Логика для статичных субтитров (ASS)
+                captioning_success = burn_captions(
+                    cropped_vertical,
+                    temp_segment, # Источник аудио
+                    ctx.transcription_segments,
+                    start,
+                    adjusted_stop,
+                    final_output,
+                    style_cfg=ctx.cfg.captions
+                )
+            
+            # --- ФИНАЛИЗАЦИЯ ---
+            if captioning_success:
+                logger.logger.info(f"✅ Успешно обработан момент {seq}. Финальный файл: {final_output}")
+                ctx.db.add_highlight(
+                    ctx.video_id, start, adjusted_stop, final_output,
+                    segment_text=highlight_item.get('segment_text', ''),
+                    caption_with_hashtags=highlight_item.get('caption_with_hashtags', '')
+                )
                 return final_output
             else:
-                logger.logger.error(f"❌ Шаг 3 ПРОВАЛЕН: Не удалось обработать момент {seq}")
+                logger.logger.error(f"❌ Не удалось добавить субтитры для момента {seq}")
                 return None
 
         except Exception as e:
             logger.logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке момента {seq}: {e}")
             import traceback
             logger.logger.error(f"Traceback: {traceback.format_exc()}")
-
-            # Экстренная очистка временных файлов при ошибке
-            logger.logger.info("Экстренная очистка временных файлов после ошибки...")
-            temp_files_to_clean = [temp_segment, cropped_vertical, final_output]
-            for temp_file in temp_files_to_clean:
-                if temp_file and os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                        logger.logger.info(f"Удален файл после ошибки: {temp_file}")
-                    except Exception as clean_e:
-                        logger.logger.warning(f"Не удалось удалить файл после ошибки {temp_file}: {clean_e}")
-
             return None
+        finally:
+            # Очистка временных файлов
+            self._cleanup_temp_files([temp_segment, cropped_vertical], f" после обработки момента {seq}")
 
     def _safe_file_operation(self, operation_name: str, operation_func, *args, **kwargs) -> Optional[Any]:
         """Безопасное выполнение файловой операции с graceful degradation"""
