@@ -190,7 +190,10 @@ def crop_to_vertical(input_video_path, output_video_path):
 # --- New Function: Average Face Centered Crop ---
 
 def crop_to_vertical_average_face(input_video_path, output_video_path, sample_interval_seconds=0.5):
-    """Crops video to 9:16 based on the average horizontal face position sampled periodically."""
+    """
+    Обрезает видео до соотношения 9:16, основываясь на среднем горизонтальном положении лица.
+    Положение лица определяется периодическим сэмплированием кадров.
+    """
     print("Starting average face centered vertical crop...")
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
@@ -320,9 +323,9 @@ def crop_to_vertical_average_face(input_video_path, output_video_path, sample_in
 
 def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     """
-    Crops video to 70% of original width with 213:274 aspect ratio for content,
-    then creates a 9:16 final frame with blurred background and centered content.
-    Uses dynamic sizing based on original video height.
+    Обрезает видео до 70% от исходной ширины с соотношением сторон 213:274 для контента,
+    затем создает конечный кадр 9:16 с размытым фоном и центрированным контентом.
+    Использует динамическое изменение размера в зависимости от исходной высоты видео.
     """
     print("Starting 70% width crop with blur background (9:16 final aspect ratio)...")
 
@@ -359,7 +362,7 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
 
     # Calculate 70% width crop for content (maintain 213:274 aspect ratio)
     content_width = int(original_width * 0.7)
-    content_aspect_ratio = 213 / 274  # ≈ 0.777
+    content_aspect_ratio = 9 / 16  # ≈ 0.5625
     content_height = min(int(content_width / content_aspect_ratio), original_height)
 
     # Ensure content dimensions are even
@@ -375,11 +378,14 @@ def crop_to_70_percent_with_blur(input_video_path, output_video_path):
     scaled_content_width = int(content_width * scale_factor)
     scaled_content_height = int(content_height * scale_factor)
 
-    # Ensure scaled dimensions are even
-    if scaled_content_width % 2 != 0:
-        scaled_content_width -= 1
-    if scaled_content_height % 2 != 0:
-        scaled_content_height -= 1
+    # Ensure scaled dimensions are even to avoid banding
+    scaled_content_width = (scaled_content_width // 2) * 2
+    scaled_content_height = (scaled_content_height // 2) * 2
+
+    # Debug logs
+    print(f"Scale factor: {scale_factor:.4f}")
+    print(f"Scaled content aspect: {scaled_content_width / scaled_content_height:.4f}")
+    print(f"Final aspect: {final_width / final_height:.4f}")
 
     print(f"Scaled content dimensions: {scaled_content_width}x{scaled_content_height}")
 

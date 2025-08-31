@@ -1,6 +1,9 @@
 """
 Интеллектуальный анализатор пауз для обрезки видео.
+
 Использует ИИ для классификации пауз и определения их важности.
+Анализатор способен различать структурные паузы, заполнители речи,
+паузы для создания эффекта и дыхательные паузы.
 """
 
 from dataclasses import dataclass, field
@@ -8,6 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import json
 import hashlib
 import os
+import re
 from datetime import datetime, timedelta
 
 from Components.LanguageTasks import call_llm_with_retry, make_generation_config
@@ -57,7 +61,103 @@ class IntelligentPauseAnalyzer:
     def __init__(self, config: IntelligentPauseAnalysisConfig):
         self.config = config
         self.cache = {}  # Простой in-memory кеш
+
+        # Валидация конфигурации
+        self._validate_config()
         self._load_cache_from_disk()
+
+        # Обеспечить, что api_optimization является dict
+        self.api_optimization = self.config.api_optimization if isinstance(self.config.api_optimization, dict) else {}
+
+    def _validate_config(self) -> None:
+        """Валидация конфигурации IntelligentPauseAnalysisConfig"""
+        try:
+            # Проверка основных полей
+            if not isinstance(self.config.enabled, bool):
+                logger.logger.warning(f"Поле enabled должно быть bool, получено {type(self.config.enabled)}")
+                self.config.enabled = False
+
+            if not isinstance(self.config.model, str) or not self.config.model.strip():
+                logger.logger.warning(f"Поле model должно быть непустой строкой, получено {self.config.model}")
+                self.config.model = "gemini-2.5-flash-lite"
+
+            if not isinstance(self.config.temperature, (int, float)) or not (0.0 <= self.config.temperature <= 2.0):
+                logger.logger.warning(f"Поле temperature должно быть в диапазоне [0.0, 2.0], получено {self.config.temperature}")
+                self.config.temperature = 0.1
+
+            if not isinstance(self.config.max_attempts, int) or self.config.max_attempts < 1:
+                logger.logger.warning(f"Поле max_attempts должно быть >= 1, получено {self.config.max_attempts}")
+                self.config.max_attempts = 2
+
+            if not isinstance(self.config.batch_size, int) or self.config.batch_size < 1:
+                logger.logger.warning(f"Поле batch_size должно быть >= 1, получено {self.config.batch_size}")
+                self.config.batch_size = 10
+
+            if not isinstance(self.config.cache_enabled, bool):
+                logger.logger.warning(f"Поле cache_enabled должно быть bool, получено {type(self.config.cache_enabled)}")
+                self.config.cache_enabled = True
+
+            if not isinstance(self.config.cache_ttl_hours, int) or self.config.cache_ttl_hours < 1:
+                logger.logger.warning(f"Поле cache_ttl_hours должно быть >= 1, получено {self.config.cache_ttl_hours}")
+                self.config.cache_ttl_hours = 24
+
+            # Проверка pause_categories
+            if not isinstance(self.config.pause_categories, dict):
+                logger.logger.warning("pause_categories должно быть словарем")
+                self.config.pause_categories = {}
+
+            # Проверка importance_weights
+            if not isinstance(self.config.importance_weights, dict):
+                logger.logger.warning("importance_weights должно быть словарем")
+                self.config.importance_weights = {}
+
+            # Проверка api_optimization
+            if not isinstance(self.config.api_optimization, dict):
+                logger.logger.warning("api_optimization должно быть словарем")
+                self.config.api_optimization = {}
+
+            logger.logger.info("Валидация конфигурации IntelligentPauseAnalysis завершена успешно")
+
+        except Exception as e:
+            logger.logger.error(f"Ошибка при валидации конфигурации: {e}")
+            # Устанавливаем безопасные значения по умолчанию
+            self.config.enabled = False
+            logger.logger.warning("Конфигурация установлена в безопасное состояние из-за ошибки валидации")
+
+    def _is_ai_ready(self) -> bool:
+        """Проверяет готовность ИИ для анализа пауз"""
+        try:
+            # Проверяем наличие модели
+            if not self.config.model or not self.config.model.strip():
+                logger.logger.warning("Модель не указана в конфигурации")
+                return False
+
+            # Проверяем допустимые значения температуры
+            if not (0.0 <= self.config.temperature <= 2.0):
+                logger.logger.warning(f"Недопустимая температура: {self.config.temperature}")
+                return False
+
+            # Проверяем максимум попыток
+            if self.config.max_attempts < 1:
+                logger.logger.warning(f"Недопустимое количество попыток: {self.config.max_attempts}")
+                return False
+
+            # Проверяем размер батча
+            if self.config.batch_size < 1:
+                logger.logger.warning(f"Недопустимый размер батча: {self.config.batch_size}")
+                return False
+
+            # Проверяем категории пауз
+            if not self.config.pause_categories:
+                logger.logger.warning("Категории пауз не определены")
+                return False
+
+            logger.logger.debug("ИИ готов к анализу пауз")
+            return True
+
+        except Exception as e:
+            logger.logger.error(f"Ошибка при проверке готовности ИИ: {e}")
+            return False
 
     def analyze_pauses_in_transcription(self, transcription_data: Dict[str, Any]) -> PauseAnalysisResult:
         """
@@ -89,9 +189,15 @@ class IntelligentPauseAnalyzer:
             analyzed_pauses = []
 
             if self.config.enabled:
-                # Используем ИИ-анализ
-                analyzed_pauses = self._analyze_pauses_with_ai(pauses, transcription_data, result)
+                # Проверяем готовность к ИИ-анализу
+                if self._is_ai_ready():
+                    logger.logger.info("Используем ИИ-анализ пауз")
+                    analyzed_pauses = self._analyze_pauses_with_ai(pauses, transcription_data, result)
+                else:
+                    logger.logger.warning("ИИ-анализ недоступен, используем легаси-метод")
+                    analyzed_pauses = self._analyze_pauses_legacy(pauses, transcription_data, result)
             else:
+                logger.logger.info("ИИ-анализ отключен в конфигурации, используем легаси-метод")
                 # Используем легаси-метод
                 analyzed_pauses = self._analyze_pauses_legacy(pauses, transcription_data, result)
 
@@ -171,14 +277,14 @@ class IntelligentPauseAnalyzer:
                 # Проверяем лимиты API
                 if self._should_apply_rate_limit():
                     import time
-                    delay = self.config.api_optimization.get('rate_limit_delay', 1.0)
+                    delay = self.api_optimization.get('rate_limit_delay', 1.0)
                     logger.logger.debug(f"Применяем задержку API: {delay}с")
                     time.sleep(delay)
 
             except Exception as e:
                 logger.logger.warning(f"Ошибка при анализе батча пауз: {e}")
                 # Откатываемся на легаси-метод для этого батча
-                if self.config.api_optimization.get('fallback_to_legacy', True):
+                if self.api_optimization.get('fallback_to_legacy', True):
                     logger.logger.info("Откатываемся на легаси-метод для батча")
                     legacy_results = self._analyze_pauses_legacy(batch, transcription_data, result)
                     analyzed_pauses.extend(legacy_results)
@@ -247,11 +353,21 @@ class IntelligentPauseAnalyzer:
             return pause_analyses
 
         except Exception as e:
-            logger.logger.warning(f"Ошибка при ИИ-анализе пауз: {e}")
+            logger.logger.error(f"Критическая ошибка при ИИ-анализе пауз: {e}")
+            logger.logger.error(f"Тип ошибки: {type(e).__name__}")
+            logger.logger.error(f"Размер батча: {len(batch)} пауз")
+            logger.logger.error(f"Модель: {self.config.model}")
+            logger.logger.error(f"Температура: {self.config.temperature}")
+            logger.logger.error(f"Максимум попыток: {self.config.max_attempts}")
+            logger.logger.error(f"Кеш включен: {self.config.cache_enabled}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.logger.warning("Откатываемся на легаси-метод из-за ошибки ИИ-анализа")
             # Откатываемся на легаси-метод
-            if self.config.api_optimization.get('fallback_to_legacy', True):
+            if self.api_optimization.get('fallback_to_legacy', True):
                 return self._analyze_pauses_legacy(batch, transcription_data, result)
             else:
+                logger.logger.warning("Откат на легаси-метод отключен в конфигурации, возвращаем пустые результаты")
                 # Возвращаем пустые результаты
                 return []
 
@@ -532,7 +648,7 @@ class IntelligentPauseAnalyzer:
         Определяет, нужно ли применять ограничение частоты запросов.
         """
         # Простая логика: применяем задержку после каждого батча
-        return self.config.api_optimization.get('use_batch_processing', True)
+        return self.api_optimization.get('use_batch_processing', True)
 
 
 # Вспомогательные функции

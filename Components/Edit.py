@@ -290,3 +290,72 @@ def create_shorts_video(
 # if __name__ == "__main__":
 #    # ... (old example usage)
 
+
+def concatenate_video_segments(input_files, output_file):
+    """
+    Объединяет несколько видеофайлов в один с помощью FFmpeg.
+    Использует `concat` для эффективного объединения без перекодирования.
+
+    Args:
+        input_files (list): Список путей к входным видеофайлам.
+        output_file (str): Путь к выходному объединенному видеофайлу.
+
+    Returns:
+        bool: True в случае успеха, иначе False.
+    """
+    try:
+        if not input_files:
+            print("Error: No input files provided for concatenation.")
+            return False
+
+        if len(input_files) == 1:
+            # If only one file, just copy it
+            import shutil
+            shutil.copy2(input_files[0], output_file)
+            print(f"Single file copied to: {output_file}")
+            return True
+
+        # Create a temporary file list for FFmpeg concat
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for input_file in input_files:
+                if not os.path.exists(input_file):
+                    print(f"Error: Input file does not exist: {input_file}")
+                    return False
+                # FFmpeg concat format: file 'path'
+                f.write(f"file '{input_file}'\n")
+            list_file = f.name
+
+        # FFmpeg command for concatenation
+        ffmpeg_command = [
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',  # Allow absolute paths
+            '-i', list_file,
+            '-c', 'copy',  # Copy streams without re-encoding
+            '-y',  # Overwrite output file
+            output_file
+        ]
+
+        print("Running FFmpeg command for video concatenation:")
+        cmd_string = ' '.join(shlex.quote(arg) for arg in ffmpeg_command)
+        print(f"Command: {cmd_string}")
+
+        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        print(f"Successfully concatenated videos to: {output_file}")
+
+        # Clean up temporary list file
+        try:
+            os.remove(list_file)
+        except Exception as e:
+            print(f"Warning: Could not remove temporary file {list_file}: {e}")
+
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running FFmpeg during concatenation: {e}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"An error occurred during video concatenation: {e}")
+        return False

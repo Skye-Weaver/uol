@@ -24,7 +24,7 @@ from Components.Transcription import prepare_words_for_segment
 from Components.Database import VideoDatabase
 from Components.config import get_config, AppConfig
 from Components.Logger import logger
-from Components.Edit import crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions
+from Components.Edit import crop_video, burn_captions, crop_bottom_video, animate_captions, get_video_dimensions, concatenate_video_segments
 from Components.FaceCrop import crop_to_70_percent_with_blur, crop_to_vertical_average_face
 from Components.Paths import build_short_output_name
 from faster_whisper import WhisperModel
@@ -86,14 +86,14 @@ class FilmAnalyzer:
 
     def analyze_film(self, url: Optional[str] = None, local_path: Optional[str] = None) -> FilmAnalysisResult:
         """
-        Основной пайплайн анализа фильма
-        1. Получение видео
-        2. Транскрибация
-        3. Анализ моментов через ИИ
-        4. Ранжирование
-        5. Обрезка скучных секунд
-        6. Генерация шортов (если включено)
-        7. Формирование результата
+        Основной пайплайн анализа фильма.
+        1. Получение видео.
+        2. Транскрибация.
+        3. Анализ моментов через ИИ.
+        4. Ранжирование.
+        5. Обрезка "скучных" секунд с использованием интеллектуального анализа пауз.
+        6. Генерация shorts с улучшенной логикой обрезки (кроп).
+        7. Формирование результата.
         """
         logger.logger.info("Начало анализа фильма в режиме 'фильм'")
 
@@ -388,7 +388,7 @@ class FilmAnalyzer:
 
             logger.logger.info("Анализ моментов через LLM (монолитный вызов)...")
             moments = self._extract_film_moments(transcription_text)
-            logger.logger.info(f"Найдено {len(mомents)} потенциальных моментов")
+            logger.logger.info(f"Найдено {len(moments)} потенциальных моментов")
             return moments
         except Exception as e:
             logger.logger.error(f"Ошибка при анализе моментов: {e}")
@@ -740,7 +740,7 @@ class FilmAnalyzer:
                     })
 
             # Если ИИ-анализ не дал результатов или отключен, используем легаси-метод
-            if not boring_segments and not getattr(self.film_config, 'intelligent_pause_analysis', {}).get('enabled', False):
+            if not boring_segments and not self.film_config.intelligent_pause_analysis.enabled:
                 logger.logger.info("ИИ-анализ пауз отключен или не дал результатов, используем легаси-метод")
                 boring_segments = self._detect_boring_segments_legacy(moment, transcription_data)
 
@@ -750,8 +750,14 @@ class FilmAnalyzer:
             return boring_segments
 
         except Exception as e:
-            logger.logger.error(f"Ошибка при интеллектуальном анализе пауз: {e}. "
-                               "Откатываемся на легаси-метод.")
+            logger.logger.error(f"Критическая ошибка при интеллектуальном анализе пауз: {e}")
+            logger.logger.error(f"Тип ошибки: {type(e).__name__}")
+            logger.logger.error(f"Момент: {moment.moment_type} {moment.start_time:.2f}s-{moment.end_time:.2f}s")
+            logger.logger.error(f"Длительность момента: {moment.end_time - moment.start_time:.2f}s")
+            logger.logger.error(f"Конфигурация ИИ-анализа: enabled={self.film_config.intelligent_pause_analysis.enabled}")
+            import traceback
+            logger.logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.logger.warning("Откатываемся на легаси-метод из-за ошибки ИИ-анализа")
             # Fallback на легаси-метод при ошибках
             return self._detect_boring_segments_legacy(moment, transcription_data)
 
@@ -1000,6 +1006,7 @@ class FilmAnalyzer:
                     'end': moment.end_time,
                     'caption_with_hashtags': f"Film Moment {rm.rank}: {moment.text[:100]}...",
                     'segment_text': moment.text,
+                    'segments': moment.segments,  # Для COMBO моментов
                     '_seq': i + 1,
                     '_total': len(top_moments)
                 }
@@ -1409,10 +1416,67 @@ class FilmAnalyzer:
             base_name = os.path.splitext(os.path.basename(ctx.video_path))[0]
             # Используем централизованную функцию для имен
             final_output, _ = build_short_output_name(base_name, seq, ctx.cfg.processing.shorts_dir)
-            
+
             output_base = f"{base_name}_film_moment_{seq}"
             temp_segment = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_temp.mp4")
             cropped_vertical = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_vertical.mp4")
+
+            # 2.5. Обработка COMBO моментов (объединение суб-сегментов)
+            sub_files = []
+            segments = highlight_item.get('segments', [])
+            if segments and len(segments) > 1:
+                logger.logger.info(f"Обработка COMBO момента {seq} с {len(segments)} суб-сегментами")
+                for i, sub_seg in enumerate(segments):
+                    try:
+                        sub_start = float(sub_seg.get('start', start))
+                        sub_end = float(sub_seg.get('end', adjusted_stop))
+                        sub_temp = os.path.join(ctx.cfg.processing.videos_dir, f"{output_base}_sub_{i}.mp4")
+
+                        logger.logger.debug(f"Извлечение суб-сегмента {i}: {sub_start:.2f}s - {sub_end:.2f}s")
+                        success = self._extract_video_segment(
+                            ctx.video_path, sub_temp, sub_start, sub_end, ctx.initial_width, ctx.initial_height
+                        )
+                        if success:
+                            sub_files.append(sub_temp)
+                            logger.logger.debug(f"Суб-сегмент {i} извлечен: {sub_temp}")
+                        else:
+                            logger.logger.error(f"Не удалось извлечь суб-сегмент {i}")
+                            self._cleanup_temp_files(sub_files, f" после неудачи суб-сегмента {i}")
+                            return None
+                    except Exception as e:
+                        logger.logger.error(f"Ошибка при обработке суб-сегмента {i}: {e}")
+                        self._cleanup_temp_files(sub_files, f" после ошибки суб-сегмента {i}")
+                        return None
+
+                # Объединение суб-сегментов
+                if sub_files:
+                    logger.logger.info(f"Объединение {len(sub_files)} суб-сегментов в {temp_segment}")
+                    concat_success = concatenate_video_segments(sub_files, temp_segment)
+                    if not concat_success:
+                        logger.logger.error(f"Не удалось объединить суб-сегменты для момента {seq}")
+                        self._cleanup_temp_files(sub_files, f" после неудачи объединения")
+                        return None
+                    logger.logger.info(f"Суб-сегменты успешно объединены в {temp_segment}")
+                else:
+                    logger.logger.error(f"Нет суб-сегментов для объединения в моменте {seq}")
+                    return None
+
+                # Очистка временных суб-файлов
+                self._cleanup_temp_files(sub_files, f" после успешного объединения суб-сегментов {seq}")
+            else:
+                # SINGLE момент: извлечение как обычно
+                logger.logger.info(f"Обработка SINGLE момента {seq}")
+
+            # --- ШАГ 1: Извлечение сегмента видео ---
+            # Для COMBO temp_segment уже создан объединением, для SINGLE - извлекаем
+            if not (segments and len(segments) > 1):
+                extract_success = self._extract_video_segment(
+                    ctx.video_path, temp_segment, start, adjusted_stop, ctx.initial_width, ctx.initial_height
+                )
+                if not extract_success:
+                    logger.logger.error(f"❌ Не удалось извлечь сегмент для момента {seq}")
+                    self._cleanup_temp_files([temp_segment], f" после неудачного извлечения сегмента {seq}")
+                    return None
 
             os.makedirs(ctx.cfg.processing.videos_dir, exist_ok=True)
             os.makedirs(ctx.cfg.processing.shorts_dir, exist_ok=True)
