@@ -6,7 +6,6 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 import json
-import re
 import hashlib
 import os
 from datetime import datetime, timedelta
@@ -56,8 +55,6 @@ class IntelligentPauseAnalyzer:
     """
 
     def __init__(self, config: IntelligentPauseAnalysisConfig):
-        if not isinstance(config, IntelligentPauseAnalysisConfig):
-            raise TypeError(f"Expected IntelligentPauseAnalysisConfig, got {type(config)}")
         self.config = config
         self.cache = {}  # Простой in-memory кеш
         self._load_cache_from_disk()
@@ -174,8 +171,7 @@ class IntelligentPauseAnalyzer:
                 # Проверяем лимиты API
                 if self._should_apply_rate_limit():
                     import time
-                    api_opt = self.config.api_optimization if isinstance(self.config.api_optimization, dict) else {}
-                    delay = api_opt.get('rate_limit_delay', 1.0)
+                    delay = self.config.api_optimization.get('rate_limit_delay', 1.0)
                     logger.logger.debug(f"Применяем задержку API: {delay}с")
                     time.sleep(delay)
 
@@ -536,8 +532,7 @@ class IntelligentPauseAnalyzer:
         Определяет, нужно ли применять ограничение частоты запросов.
         """
         # Простая логика: применяем задержку после каждого батча
-        api_opt = self.config.api_optimization if isinstance(self.config.api_optimization, dict) else {}
-        return api_opt.get('use_batch_processing', True)
+        return self.config.api_optimization.get('use_batch_processing', True)
 
 
 # Вспомогательные функции
@@ -546,10 +541,6 @@ def create_intelligent_pause_analyzer() -> IntelligentPauseAnalyzer:
     Создает экземпляр IntelligentPauseAnalyzer с настройками из конфигурации.
     """
     config = get_config()
-    if not hasattr(config, 'film_mode') or config.film_mode is None:
-        raise ValueError("Конфигурация film_mode отсутствует")
-    if not hasattr(config.film_mode, 'intelligent_pause_analysis') or config.film_mode.intelligent_pause_analysis is None:
-        raise ValueError("Конфигурация intelligent_pause_analysis отсутствует")
     return IntelligentPauseAnalyzer(config.film_mode.intelligent_pause_analysis)
 
 
